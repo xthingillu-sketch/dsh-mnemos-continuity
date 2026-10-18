@@ -42,5 +42,13 @@
     "mnemos",
     "memory",
     "cognitive-architecture"
-  ]
+  ],
+  "homepage": "https://github.com/xthingillu-sketch/dsh-mnemos-continuity#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xthingillu-sketch/dsh-mnemos-continuity.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xthingillu-sketch/dsh-mnemos-continuity/issues"
+  }
 }
