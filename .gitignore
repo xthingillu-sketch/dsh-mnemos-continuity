@@ -1,0 +1,22 @@
+# 运行数据（绝不进仓库）
+memory.json
+constitution.json
+*.lock
+memory-tombstones.json
+learner-state.json
+learner.log
+mnemos.log
+skills/
+skill-*.jsonl
+user-signals.jsonl
+validation-prune.jsonl
+secret-blocks.jsonl
+
+# 构建/临时
+node_modules/
+_sync-work/
+发行备份/
+*.tgz
+*.rar
+Thumbs.db
+desktop.ini

@@ -1,0 +1,8 @@
+# dsh-mnemos-continuity bundle patch: host-only plugin row inserted into the profile
+# roster. Applied as a profile bundle layer (`dsh.bundle.patch` manifest field).
+# Plugin config (e.g. dataFile) is set in the profile patch layer
+# (~/.dsh/profiles/<name>/cordis.patch.yml), which survives plugin updates.
+- insert:
+    - id: dsh-mnemos
+      name: dsh-mnemos-continuity
+      config: {}
