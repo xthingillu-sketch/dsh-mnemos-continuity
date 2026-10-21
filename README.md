@@ -144,6 +144,37 @@ dsh plugin --profile <你的 profile> add dsh-mnemos-continuity
 安装细节、配置、工具清单、数据位置与备份 → 全部在 [`INSTALL.md`](INSTALL.md)（含验证步骤、续接任务的做法、排错表）。
 npm 页面：<https://www.npmjs.com/package/dsh-mnemos-continuity>
 
+## 同时用桌面版和网页版（可选）
+
+默认每个 profile 各有一份数据（`<profile>/mnemos/`）。如果你希望**桌面版和网页版共用同一份记忆**：
+
+```bash
+# 1) 网页版也装一次
+dsh plugin --profile web add dsh-mnemos-continuity
+```
+
+```yaml
+# 2) 在网页版的 cordis.patch.yml 里让数据指向桌面 profile
+- id: dsh-mnemos
+  name: dsh-mnemos-continuity
+  config:
+    dataFile: C:\Users\<你>\.dsh\profiles\desktop\mnemos\memory.json
+    constitutionFile: C:\Users\<你>\.dsh\profiles\desktop\mnemos\constitution.json
+    heartbeatEnabled: false   # 后台维护只留给桌面端
+    learnerEnabled: false
+    reviewEnabled: false
+```
+
+**两条提醒（重要）**：
+
+1. **后台维护只在桌面端跑** —— 所以用网页版时，建议**让桌面版挂在后台**（窗口最小化即可），
+   归档 / 衰减 / 回收 / 技能评审才会继续；网页版关了后台，是因为双跑会重复归档、重复任务结论、
+   双倍 LLM 成本，而技能评审并发写技能文件没有跨进程锁，会损坏。
+2. **跨端可见有延迟** —— 一端写入后，另一端要等**下一次写盘**（或自己重启）才能看到。
+   这是"内存副本 + 重读合并"的设计，**不是没写进去**；想立刻看到就重启那一端。
+
+> 网页版（`dsh web`）是**独立进程**，关掉桌面程序不影响它；但它的运行时文件来自桌面版的安装目录，所以桌面版要"装着"。
+
 ## 文档地图（对外的七份）
 
 | 你想干什么 | 读哪份 |
