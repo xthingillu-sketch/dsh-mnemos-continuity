@@ -104,13 +104,26 @@ export function consolidateResult(rec, report = null) {
   return { ...out, ...protectedField }
 }
 
-/** mnemos_heartbeat：取 heartbeat.run 的 {ranAt, results}；非对象一律折成合法空形状。 */
+/** mnemos_heartbeat：取 heartbeat.run 的 {ranAt, refresh, results}；非对象一律折成合法空形状。 */
 export function heartbeatResult(run) {
   const r = run && typeof run === 'object' ? run : {}
-  return {
+  const out = {
     ranAt: Number.isFinite(r.ranAt) ? r.ranAt : Date.now(),
     results: Array.isArray(r.results) ? r.results : [],
   }
+  // ★ V6-01：心跳先刷新的回执（缺省不写，保持旧形状对老调用方兼容）
+  if (r.refresh && typeof r.refresh === 'object') {
+    const f = r.refresh
+    out.refresh = {
+      ok: f.ok !== false,
+      refreshed: !!f.refreshed,
+      added: Number.isFinite(f.added) ? f.added : 0,
+      tombstoned: Number.isFinite(f.tombstoned) ? f.tombstoned : 0,
+      total: Number.isFinite(f.total) ? f.total : 0,
+    }
+    if (typeof f.error === 'string') out.refresh.error = f.error
+  }
+  return out
 }
 
 /** mnemos_maintenance_list：数组。 */
@@ -182,6 +195,8 @@ export function taskOpenResult(r) {
   if (typeof v.graphId === 'string') out.graphId = v.graphId
   if (typeof v.ownerSession === 'string') out.ownerSession = v.ownerSession
   if (Array.isArray(v.assignments)) out.assignments = v.assignments.filter((x) => typeof x === 'string')
+  if (Array.isArray(v.links)) out.links = v.links.filter((x) => typeof x === 'string')
+  if (v.linkTruncated === true) out.linkTruncated = true
   return out
 }
 
@@ -224,6 +239,15 @@ export function taskCloseResult(r) {
         status: typeof x.status === 'string' ? x.status : '',
       }))
   }
+  // ★ V6-07：历史遗留（有 handoff 但缺 assign 标签）—— 收尾时如实列出，不阻断
+  if (Array.isArray(v.unlabeledHandoffs)) {
+    out.unlabeledHandoffs = v.unlabeledHandoffs
+      .filter((x) => x && typeof x === 'object')
+      .map((x) => ({
+        id: typeof x.id === 'string' ? x.id : '',
+        handoffId: typeof x.handoffId === 'string' ? x.handoffId : '',
+      }))
+  }
   if (v.discarded && typeof v.discarded === 'object') {
     out.discarded = {
       count: Number.isFinite(v.discarded.count) ? v.discarded.count : 0,
@@ -238,5 +262,32 @@ export function taskCloseResult(r) {
     }
   }
   if (Number.isFinite(v.keptScratch)) out.keptScratch = v.keptScratch
+  if (Number.isFinite(v.doneCount)) out.doneCount = v.doneCount
+  if (Number.isFinite(v.usesCount)) out.usesCount = v.usesCount
+  if (Number.isFinite(v.linksCount)) out.linksCount = v.linksCount
+  return out
+}
+
+/** mnemos_task_done：追加里程碑回执。 */
+export function taskDoneResult(r) {
+  const v = r && typeof r === 'object' ? r : {}
+  const out = { ok: v.ok === true }
+  if (typeof v.reason === 'string') out.reason = v.reason
+  if (typeof v.taskId === 'string') out.taskId = v.taskId
+  if (Number.isFinite(v.doneCount)) out.doneCount = v.doneCount
+  if (typeof v.truncated === 'boolean') out.truncated = v.truncated
+  return out
+}
+
+/** mnemos_task_cite：登记依赖回执。 */
+export function taskCiteResult(r) {
+  const v = r && typeof r === 'object' ? r : {}
+  const out = { ok: v.ok === true }
+  if (typeof v.reason === 'string') out.reason = v.reason
+  if (typeof v.taskId === 'string') out.taskId = v.taskId
+  if (Number.isFinite(v.added)) out.added = v.added
+  if (Number.isFinite(v.skipped)) out.skipped = v.skipped
+  if (Number.isFinite(v.usesCount)) out.usesCount = v.usesCount
+  if (typeof v.truncated === 'boolean') out.truncated = v.truncated
   return out
 }

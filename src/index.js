@@ -20,7 +20,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
 import fsp from 'node:fs/promises'
-import { MemoryStore } from './store.js'
+import { MemoryStore, TASK_DONE_TEXT_MAX, TASK_USE_WHY_MAX, TASK_USES_MAX } from './store.js'
 import { ConstitutionStore } from './constitution.js'
 import { createHeartbeat } from './heartbeat.js'
 import { createSkillProvider } from './skill-provider.js'
@@ -46,13 +46,14 @@ import {
   DEFAULT_CREATE_WRITE_BACK,
   DEFAULT_REVIEW_WRITE_BACK,
   DEFAULT_MAX_SKILLS,
+  DEFAULT_EXTERNAL_SKILL_WRITE_BACK,
 } from './skill-review.js'
 import { PROPOSE_SKILL_DESCRIPTION, renderProposeSkillResult } from './skill-propose-text.js'
 import { COUNTEREXAMPLE_PARAM_DESCRIPTION } from './skill-source-ref.js'
 import { makeUnknownToolGuide } from './tool-guidance.js'
 import { detectMissedUsage, missStateFileFor, missFileFor } from './skill-miss.js'
 import { makeStuckDetector } from './stuck-detector.js'
-import { makeCompactionSnapshot } from './compaction-snapshot.js'
+import { makeCompactionSnapshot, pruneCompactionSnapshots } from './compaction-snapshot.js'
 import { secretBlocksFileFor } from './secret-patterns.js'
 // ★ 注入消息的唯一构造点（role/id 不能靠手搓：2026-10-17 折叠提醒缺 role 把会话炸了，
 //   缺 id 又让那条会话重启后加载不了）。规则与事故记录见该文件头。
@@ -74,7 +75,7 @@ import {
   rememberResult, recallResult, validateResult, constitutionResult, deleteResult,
   deprecateResult, dormantResult, openResult, consolidateResult, heartbeatResult,
   maintenanceListResult, toggleResult, proposeSkillResult, learnerKickResult,
-  taskOpenResult, taskUpdateResult, taskCloseResult,
+  taskOpenResult, taskUpdateResult, taskCloseResult, taskDoneResult, taskCiteResult,
 } from './tool-results.js'
 
 export const name = 'dsh-mnemos'
@@ -166,10 +167,13 @@ export const Config = Schema.object({
   maxSkills: Schema.number().default(DEFAULT_MAX_SKILLS).description(
     '技能目录容量上限。达到后 mnemos_propose_skill 不再自动入目录，改为落 skill-proposals/ 并在回执里说明（不静默丢弃）'
   ),
+  externalSkillWriteBack: Schema.boolean().default(DEFAULT_EXTERNAL_SKILL_WRITE_BACK).description(
+    '外部来源技能（自己搜到 / 用户提供）是否允许自动入技能目录。默认 false：一律落 skill-proposals/，' +
+      '等用户确认后再保留。只有用户显式开启（并配合 createWriteBack）才会直接写回'
+  ),
   reviewProvider: Schema.string().default('deepseek-account').description('评审用的 LLM provider'),
   reviewModel: Schema.string().default('deepseek-flash').description('评审用的模型'),
   reviewMaxPerCycle: Schema.number().default(3).description('每个周期最多评审几个技能（其余推迟到下一轮）'),
-  reviewFreezeAfterCycles: Schema.number().default(3).description('连续几个静默周期后冻结该技能'),
 })
 
 // summarize() 已移到 src/tool-results.js（纯构造函数，单测可 import —— index.js 有宿主依赖）。
@@ -300,6 +304,12 @@ function makeRecallTool(store) {
           description: '查询策略：session=当前会话优先（引用了刚才聊的内容）；keyword=关键词优先（新话题跨会话搜，默认）。',
         },
         limit: { type: 'integer', description: '返回条数上限，默认 5。' },
+        includeArchives: {
+          type: 'boolean',
+          description:
+            '默认 false：不返回会话存档（它们很大，错召回会吃掉大量上下文）。确实要查存档时才设 true；' +
+            '更推荐直接用 mnemos_open 打开某个存档 id。',
+        },
       },
     },
     output: {
@@ -323,6 +333,8 @@ function makeRecallTool(store) {
     timeoutMs: 10000,
     async execute(args, exec) {
       const sessionId = exec?.agent?.session?.id ?? null
+      // ★ V6-01：先刷新磁盘（别的实例刚写的记录），再检索 —— 不能只靠"本端恰好写过一次盘"。
+      await store.refreshFromDisk()
       return recallResult(store.recall({ ...args, sessionId }))
     },
   }
@@ -819,6 +831,8 @@ function makeOpenTool(store) {
     },
     timeoutMs: 10000,
     async execute(args) {
+      // ★ V6-01：详情读取也先刷新（用户可能刚在另一端写入，recall 与 open 不能各看各的）。
+      await store.refreshFromDisk()
       return openResult(await store.open(args.id))
     },
   }
@@ -895,6 +909,15 @@ function makeHeartbeatTool(heartbeat, store) {
       schema: buildOutputSchema('mnemos_heartbeat'),
       render: (_args, value) => {
         const lines = [`心跳完成，运行 ${value.results.length} 个维护功能：`, '']
+        // ★ V6-01：把"开始处先刷新磁盘"这一步如实显示出来（没刷新就没刷新，不装）
+        if (value.refresh) {
+          lines.push(
+            value.refresh.refreshed
+              ? `先刷新磁盘：新增 ${value.refresh.added} 条外部记录、墓碑删除 ${value.refresh.tombstoned} 条`
+              : '先刷新磁盘：没有外部变化'
+          )
+          lines.push('')
+        }
         for (const r of value.results) {
           lines.push(r.ok ? `✓ ${r.name}: ${JSON.stringify(r.result)}` : `✗ ${r.name}: ${r.error}`)
         }
@@ -979,11 +1002,46 @@ function makeProposeSkillTool(store, skillRoot, llm, config) {
         name: { type: 'string', description: '技能名（字母数字与 . _ -；不能与现有技能重名）' },
         description: { type: 'string', description: '触发条件：写「什么时候该用它」，不是「它能做什么」' },
         body: { type: 'string', description: '正文 markdown；规则点建议编号，便于日后逐条核对' },
-        counterexample: { type: 'string', description: COUNTEREXAMPLE_PARAM_DESCRIPTION },
-        positiveCase: { type: 'string', description: '正例：有这个技能后仍然必须做对的具体场景（必填）' },
+        origin: {
+          type: 'string',
+          enum: ['failure-fixed', 'memory-recurring', 'external-rewrite'],
+          description:
+            '技能来源：failure-fixed（默认，失败→修好）/ memory-recurring（记忆里反复出现的问题）' +
+            ' / external-rewrite（外部技能改写：自己搜到或用户提供）',
+        },
+        events: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'memory-recurring 必填：至少 3 个真实事件的**记忆 id**，且至少跨 2 个会话；' +
+            '插件会按 id 解析事件并交给验证者。',
+        },
+        source: {
+          type: 'object',
+          additionalProperties: false,
+          description:
+            'external-rewrite 必填：外部来源。kind=self-found（自己搜到）/ user-provided（用户提供）；ref 写链接或文件名。',
+          properties: {
+            kind: { type: 'string', enum: ['self-found', 'user-provided'] },
+            ref: { type: 'string', description: '来源链接 / 文件名 / 用户消息位置' },
+            note: { type: 'string', description: '可选补充' },
+          },
+          required: ['kind', 'ref'],
+        },
+        counterexample: {
+          type: 'string',
+          description:
+            'failure-fixed 必填。' + COUNTEREXAMPLE_PARAM_DESCRIPTION +
+            '；memory-recurring 可用 events 代替，external-rewrite 可不填。',
+        },
+        positiveCase: {
+          type: 'string',
+          description:
+            '正例：有这个技能后仍然必须做对的具体场景。failure-fixed 必填；memory-recurring 与反例至少一个；external 可不填。',
+        },
         why: { type: 'string', description: '为什么要建它（动机，可选）' },
       },
-      required: ['name', 'description', 'body', 'counterexample', 'positiveCase'],
+      required: ['name', 'description', 'body'],
     },
     output: {
       schema: buildOutputSchema('mnemos_propose_skill'),
@@ -1005,6 +1063,9 @@ function makeProposeSkillTool(store, skillRoot, llm, config) {
           writeBack: resolveSkillWriteBacks(config).createWriteBack,
           // ★ F-11：目录容量上限（可配）
           maxSkills: config.maxSkills,
+          // ★ V6-05/06：记忆来源要解析事件；外部来源默认只暂存
+          store,
+          externalWriteBack: config.externalSkillWriteBack === true,
           // ★ F-10：把宿主 Session 交给 createSkill，才能按 seq 取反例原文核对
           //   （接口核实见 skill-source-ref.js 文件头；exec 的第二参形状见本文件其它工具）
           session: exec?.agent?.session ?? null,
@@ -1051,6 +1112,26 @@ function makeTaskOpenTool(store) {
           },
         },
         notes: { type: 'string', description: '可选备注（约束、边界、只读范围等）' },
+        links: {
+          type: 'array',
+          description:
+            '前序任务图链接（单向、不改旧图）：每项 {taskId, relation?, why}。' +
+            'why 必填（≤120 字）：写「为什么接上它」，不是旧图的内容摘要；最多 5 条。',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              taskId: { type: 'string', description: '旧任务图的 taskId' },
+              relation: {
+                type: 'string',
+                enum: ['continues', 'depends', 'supersedes', 'evidence', 'related'],
+                description: '关系类型；具体原因写 why',
+              },
+              why: { type: 'string', description: '为什么链接这张图（必填，≤120 字）' },
+            },
+            required: ['taskId', 'why'],
+          },
+        },
       },
       required: ['goal'],
     },
@@ -1064,6 +1145,7 @@ function makeTaskOpenTool(store) {
             text:
               `已开图：taskId=${v.taskId}\n记忆 id（派活时把它交给子代理）：${v.graphId}` +
               `\n分工：${(v.assignments || []).join(', ') || '（无）'}` +
+              ((v.links || []).length ? `\n前序图：${v.links.join(', ')}` : '') +
               `\n子代理写回时 tags 必须含 task=${v.taskId} 与 assign=<分工id>，并把 handoffId 回报给你。`,
           },
         ]
@@ -1077,6 +1159,7 @@ function makeTaskOpenTool(store) {
           goal: args?.goal,
           assignments: args?.assignments,
           notes: args?.notes,
+          links: args?.links,
           sessionId,
         })
       )
@@ -1089,7 +1172,8 @@ function makeTaskUpdateTool(store) {
     name: 'mnemos_task_update',
     description:
       '把某个分工的回执填进任务图（**只有创建图的会话能调**，单写者避免并发丢更新）。' +
-      'handoffId 必须是子代理写的那条**短时记忆 id**，且必须属于本任务（防串账）。' +
+      'handoffId 必须是子代理写的那条**短时记忆 id**，且必须属于本任务（防串账），' +
+      '还必须带 `assign:<分工id>` 标签（交接记录要标明属于哪个分工；同一 handoff 不能交给多个分工）。' +
       'status: pending | done | partial | blocked。',
     parameters: {
       type: 'object',
@@ -1163,11 +1247,20 @@ function makeTaskCloseTool(store) {
           lines.push(`- ${r.assign}［${r.status}］${r.handoffId ? `handoff ${r.handoffId}` : '无 handoff'}${r.note ? `（${r.note}）` : ''}`)
         }
         if ((v.missing || []).length) lines.push(`⚠ 未完成：${v.missing.map((m) => m.id).join(', ')}（如实记入长期结论）`)
+        if ((v.unlabeledHandoffs || []).length) {
+          lines.push(
+            `⚠ 交接缺 assign 标签：${v.unlabeledHandoffs.map((x) => x.id).join(', ')}` +
+              '（历史遗留；v1.6 起 task_update 会拒绝这类交接）'
+          )
+        }
         if (v.discarded && v.discarded.count > 0) {
           lines.push(`已丢弃临时中间结果 ${v.discarded.count} 条（默认丢弃；清单已写进长期结论）：`)
           for (const it of v.discarded.items || []) lines.push(`  · ${it.id}：${it.summary}`)
         }
         if (v.keptScratch) lines.push(`保留中间结果 ${v.keptScratch} 条（打了 keep）`)
+        if (v.doneCount || v.usesCount || v.linksCount) {
+          lines.push(`档案：已完成 ${v.doneCount || 0} 条 ｜ 依赖 ${v.usesCount || 0} 条 ｜ 前序 ${v.linksCount || 0} 条`)
+        }
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
@@ -1179,6 +1272,98 @@ function makeTaskCloseTool(store) {
           taskId: args?.taskId,
           conclusion: args?.conclusion,
           newSummary: args?.newSummary,
+          sessionId,
+        })
+      )
+    },
+  }
+}
+
+function makeTaskDoneTool(store) {
+  return {
+    name: 'mnemos_task_done',
+    description:
+      '记录一个**已完成的里程碑**（只追加）：任务图是任务档案，不是待办清单——未完成的步骤用宿主 todo。' +
+      `text 上限 ${TASK_DONE_TEXT_MAX} 字（超长会截断并在回执里说明）。` +
+      '有产物/证据时传 memoryId（必须带本任务 tag）。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        taskId: { type: 'string', description: '任务 id' },
+        text: { type: 'string', description: `里程碑一句话（≤${TASK_DONE_TEXT_MAX} 字）` },
+        memoryId: { type: 'string', description: '可选：该里程碑的产物/证据记忆 id' },
+      },
+      required: ['taskId', 'text'],
+    },
+    output: {
+      schema: buildOutputSchema('mnemos_task_done'),
+      render: (_args, v) => {
+        if (!v || v.ok === false) return [{ type: 'text', text: `记录里程碑失败：${v?.reason || '未知原因'}` }]
+        return [
+          {
+            type: 'text',
+            text: `已记录里程碑（共 ${v.doneCount} 条）` + (v.truncated ? `（text 已截断到 ${TASK_DONE_TEXT_MAX} 字）` : ''),
+          },
+        ]
+      },
+    },
+    timeoutMs: 15000,
+    async execute(args, exec) {
+      const sessionId = exec?.agent?.session?.id ?? null
+      return taskDoneResult(
+        await store.appendTaskDone({
+          taskId: args?.taskId,
+          text: args?.text,
+          memoryId: args?.memoryId,
+          sessionId,
+        })
+      )
+    },
+  }
+}
+
+function makeTaskCiteTool(store) {
+  return {
+    name: 'mnemos_task_cite',
+    description:
+      '登记本任务**依赖的既有记忆**（调取已有结论/外部输入）：只存 id 与一句"为什么"，不复制正文。' +
+      `ids 最多 ${TASK_USES_MAX} 条；why ≤ ${TASK_USE_WHY_MAX} 字（推荐写、非必填）。` +
+      '外部性/作废状态在 open 图时从记忆现取，不另存字段。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        taskId: { type: 'string', description: '任务 id' },
+        ids: { type: 'array', items: { type: 'string' }, description: '被依赖的记忆 id（去重）' },
+        why: { type: 'string', description: `为什么需要它（≤${TASK_USE_WHY_MAX} 字；可空）` },
+      },
+      required: ['taskId', 'ids'],
+    },
+    output: {
+      schema: buildOutputSchema('mnemos_task_cite'),
+      render: (_args, v) => {
+        if (!v || v.ok === false) return [{ type: 'text', text: `登记依赖失败：${v?.reason || '未知原因'}` }]
+        return [
+          {
+            type: 'text',
+            text:
+              `已登记依赖：新增 ${v.added} 条` +
+              (v.skipped ? `，跳过重复 ${v.skipped} 条` : '') +
+              `（共 ${v.usesCount} 条）` +
+              (v.truncated ? `（why 已截断到 ${TASK_USE_WHY_MAX} 字）` : ''),
+          },
+        ]
+      },
+    },
+    timeoutMs: 15000,
+    async execute(args, exec) {
+      const sessionId = exec?.agent?.session?.id ?? null
+      return taskCiteResult(
+        await store.citeTaskMemories({
+          taskId: args?.taskId,
+          ids: args?.ids,
+          why: args?.why,
           sessionId,
         })
       )
@@ -1414,6 +1599,10 @@ export function apply(ctx, config) {
   heartbeat.register('reclaim_tasks', '孤儿任务图回收：闲置超过保留窗口仍 open 的任务强制归档（结论写清超时未收尾）', async (s) =>
     s.reclaimStaleTasks({})
   )
+  // ★ 折叠快照（V6-16）：只做短期兜底，7 天后自动清理事实卡；原文仍在会话日志。
+  heartbeat.register('prune_compaction_snapshots', '折叠快照短期兜底：超过 7 天的事实卡自动清理（原文仍在会话日志）', async (s) =>
+    pruneCompactionSnapshots(s, {})
+  )
 
   // 第三条评审因素 · B2：该用未用判定。
   // ★ 注册在 review_skills **之前** —— 心跳按注册顺序跑，这样评审能拿到本轮的 miss。
@@ -1457,7 +1646,6 @@ export function apply(ctx, config) {
         //   →miss 驱动时只许改 description→正文凭据扫描）；实测"要人批"只造成提案墓地。
         writeBack: resolveSkillWriteBacks(resolved).reviewWriteBack,
         maxPerCycle: resolved.reviewMaxPerCycle ?? 3,
-        freezeAfterCycles: resolved.reviewFreezeAfterCycles ?? 3,
         onWarn: skillWarn,
         onInfo: (m) => console.warn('mnemos:', m),
       })
@@ -1640,6 +1828,7 @@ export function apply(ctx, config) {
   // 实测证据（会话头对照）：
   //   我这个**能联网**的会话：`"agentPreset":"standard"`（44 个工具，含 web_search / web_fetch）
   //   learner 会话：**根本没有这个字段** → 只有 18 个工具（记忆 + context7 + 两个宿主只读工具），**没有联网工具**
+  //   （v1.6 后实际是 31 个：19 个 mnemos + context7 + fs/read/write/edit + web；18 是当时基线，别当当前值）
   // 后果（用户一针见血指出的）：**不能联网的"学习"是跛脚的** —— 原先台账任务的核心步骤
   //   "用 web_search 找项目 / 用 web_fetch 读 README" 它根本做不到。
   // 所以：创建/恢复时**必须把这个 preset 带上**（宿主的 agent-preset 机制：preset = 一组子插件）。
@@ -1853,6 +2042,8 @@ export function apply(ctx, config) {
     makeTaskOpenTool(store),
     makeTaskUpdateTool(store),
     makeTaskCloseTool(store),
+    makeTaskDoneTool(store),
+    makeTaskCiteTool(store),
   ]
   // ★ 诊断/手动触发：立刻踢一次空闲学习（不等定时器）。只在 learner 启用时注册。
   //   放在数组之外用 push，是为了让它的仓库源码块保持在**工厂函数里**

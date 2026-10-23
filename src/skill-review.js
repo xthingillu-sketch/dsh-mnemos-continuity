@@ -61,6 +61,18 @@ export const DEFAULT_REVIEW_WRITE_BACK = true
 /** F-11：技能目录的容量上限默认值（达到后不再自动入目录，改落暂存区并说明）。 */
 export const DEFAULT_MAX_SKILLS = 30
 
+/* ───────── V6-05 / V6-06：技能来源与生成门槛 ───────── */
+
+/** 外部来源技能默认**不自动落盘**（一律暂存，等用户确认）。 */
+export const DEFAULT_EXTERNAL_SKILL_WRITE_BACK = false
+/** 三种来源：失败→修好 / 记忆里反复出现 / 外部技能改写。 */
+export const SKILL_ORIGINS = ['failure-fixed', 'memory-recurring', 'external-rewrite']
+/** 外部来源的两种来路：自己搜到的 / 用户喂的。 */
+export const EXTERNAL_SOURCE_KINDS = ['self-found', 'user-provided']
+/** 记忆来源至少要几个真实事件、跨几个会话（防止"一个会话写三条"冒充反复出现）。 */
+export const MEMORY_EVENTS_MIN = 3
+export const MEMORY_EVENTS_MIN_SESSIONS = 2
+
 /**
  * 从插件配置里解析出两个写回开关。**单一真相源**：index.js 的 Schema 默认值也取自上面两个常量，
  * 所以测试里测到的默认值不可能与真实默认值漂移。
@@ -126,11 +138,22 @@ export function proposalsDirFor(skillDir) {
 // ============ 状态 ============
 const DEFAULT_STATE = { usageCount: 0, signalCount: 0, selfReviewT: 0, pending: [], skills: {} }
 const PENDING_MAX = 200
+/** V6-10：观察项过期清理（open 14 天；handled 7 天）。 */
+export const PENDING_TTL_MS = 14 * 24 * 3600 * 1000
+export const PENDING_HANDLED_TTL_MS = 7 * 24 * 3600 * 1000
 
 export async function loadReviewState(file) {
   try {
     const s = JSON.parse(await fs.readFile(file, 'utf8'))
-    return { ...DEFAULT_STATE, ...s, skills: s.skills ?? {}, pending: s.pending ?? [] }
+    const skills = s.skills ?? {}
+    // ★ V6-04（2026-10-21）：冻结机制已删除；旧状态里的 frozen/silentCycles 在这里清掉（一次性迁移）。
+    for (const v of Object.values(skills)) {
+      if (v && typeof v === 'object') {
+        delete v.frozen
+        delete v.silentCycles
+      }
+    }
+    return { ...DEFAULT_STATE, ...s, skills, pending: prunePendingLedger(s.pending ?? []) }
   } catch (e) {
     if (e.code === 'ENOENT') return { ...DEFAULT_STATE, skills: {}, pending: [] }
     throw e
@@ -143,6 +166,56 @@ export async function saveReviewState(file, state) {
   const tmp = file + '.tmp'
   await fs.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8')
   await fs.rename(tmp, file)
+}
+
+/** V6-10：外来技能（不是我们目录里的）不记账 —— 改了也改不了。 */
+function isForeignPending(x) {
+  return typeof x?.reason === 'string' && x.reason.startsWith('不是本插件的技能')
+}
+
+/**
+ * V6-10：观察项台账清理。
+ * - 外来技能直接删除（不记录、不留过多噪音）；
+ * - 同一 (kind, skill, reason) 只留最新；
+ * - open 超过 14 天 / handled 超过 7 天 → 自动清理；
+ * - 仍受 PENDING_MAX 约束。
+ */
+export function prunePendingLedger(list, now = Date.now()) {
+  const out = new Map()
+  for (const item of Array.isArray(list) ? list : []) {
+    if (!item || typeof item !== 'object') continue
+    if (isForeignPending(item)) continue
+    const status = item.status === 'handled' ? 'handled' : 'open'
+    const base =
+      status === 'handled' && Number.isFinite(item.resolvedAt)
+        ? item.resolvedAt
+        : Number.isFinite(item.t)
+          ? item.t
+          : now
+    const ttl = status === 'handled' ? PENDING_HANDLED_TTL_MS : PENDING_TTL_MS
+    if (now - base > ttl) continue
+    const key = `${item.kind || ''}|${item.skill || ''}|${item.reason || ''}`
+    const prev = out.get(key)
+    const prevBase = prev ? (Number.isFinite(prev.resolvedAt ?? prev.t) ? (prev.resolvedAt ?? prev.t) : 0) : -1
+    if (!prev || base >= prevBase) {
+      out.set(key, {
+        ...item,
+        t: Number.isFinite(item.t) ? item.t : now,
+        status,
+        expiresAt: base + ttl,
+      })
+    }
+  }
+  return [...out.values()].sort((a, b) => (a.t || 0) - (b.t || 0)).slice(-PENDING_MAX)
+}
+
+/** 回执用：总数 / 待处理 / 已处理 / 最早一条时间（不再只报一个看不出年龄的总数）。 */
+export function pendingStats(list) {
+  const arr = Array.isArray(list) ? list : []
+  const open = arr.filter((x) => (x.status || 'open') === 'open').length
+  const handled = arr.filter((x) => x.status === 'handled').length
+  const times = arr.map((x) => x.t).filter((x) => Number.isFinite(x))
+  return { total: arr.length, open, handled, oldestAt: times.length ? Math.min(...times) : null }
 }
 
 // ============ 归因（3b）============
@@ -261,6 +334,38 @@ export function parseJsonReply(text) {
     }
   }
   return null
+}
+
+/**
+ * 把评审者的回复分成**三态**（V6-03）。
+ *
+ * 为什么不能再用 `!rev || rev.change !== true` 一概而论：
+ *   · `null` / 非对象 = 回复根本不是可用的 JSON（坏回复）；
+ *   · 合法 JSON 但缺 `change` 布尔 = 形状不对（提示词明确要求回 `{"change": false, ...}`）；
+ *   · `change: false` = 模型**明确**判定"不改"。
+ * 前两者当成"不改"会把一次坏回复永久记成"判过了"（noChangeFp 缓存）——
+ * 同一批证据从此不再重评，历史里还留下一句误导性的"模型说没变化"。
+ *
+ * @returns 'change' | 'no-change' | 'malformed'
+ */
+export function classifyReviewReply(rev) {
+  if (!rev || typeof rev !== 'object' || Array.isArray(rev)) return 'malformed'
+  if (rev.change === true) return 'change'
+  if (rev.change === false) return 'no-change'
+  return 'malformed'
+}
+
+/** 验证者回复的三态（同一根因：**解析失败 ≠ 判定"回归门不过"**）。 */
+export function classifyVerifyReply(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return 'malformed'
+  if (v.pass === true) return 'pass'
+  if (v.pass === false) return 'fail'
+  return 'malformed'
+}
+
+/** 回复开头的截断（只进历史/回执用于排查，200 字符足够看出"它到底回了什么"）。 */
+function clipReplyHead(text, max = 200) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max)
 }
 
 // ============ 提示词 ============
@@ -462,6 +567,50 @@ export async function writeBackSkill(skillDir, oldContent, oldRevision, newConte
   await fs.rename(tmp, file)
 }
 
+/** 读 history.jsonl 的原始条目（`lastAppliedOf` 用；`readHistory` 只给人看最近 10 条摘要）。 */
+export async function readHistoryEntries(file) {
+  try {
+    const raw = await fs.readFile(file, 'utf8')
+    const out = []
+    for (const line of raw.split('\n')) {
+      const l = line.trim()
+      if (!l) continue
+      try {
+        out.push(JSON.parse(l))
+      } catch {
+        /* 坏行跳过，不因为一行脏数据让整个回退失败 */
+      }
+    }
+    return out
+  } catch (e) {
+    if (e.code === 'ENOENT') return []
+    throw e
+  }
+}
+
+/** 扫 history.jsonl 找**最后一条 applied**；没有就 null（调用方就不会显示 1970）。 */
+export async function lastAppliedOf(skillDir) {
+  const rows = await readHistoryEntries(historyFileFor(skillDir))
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const h = rows[i]
+    if (h && h.verdict === 'applied') return { at: h.t, revision: h.newRevision || null }
+  }
+  return null
+}
+
+/**
+ * ★ V6-08：读取"上次应用"——优先 state 字段，旧状态（没有字段）回退扫 history。
+ * 返回 `{at, revision, source:'state'|'history'}` 或 `null`；绝不返回 0/1970。
+ */
+export async function resolveLastApplied(state, skillRoot, name) {
+  const st = state?.skills?.[name] || {}
+  if (Number.isFinite(st.lastAppliedAt)) {
+    return { at: st.lastAppliedAt, revision: st.lastAppliedRevision || null, source: 'state' }
+  }
+  const fromHistory = await lastAppliedOf(path.join(skillRoot, name))
+  return fromHistory ? { ...fromHistory, source: 'history' } : null
+}
+
 /** 读技能修改历史（人可读的一行一条）。 */
 export async function readHistory(file) {
   try {
@@ -512,7 +661,6 @@ export async function runSkillReview(deps) {
     model,
     writeBack = DEFAULT_REVIEW_WRITE_BACK,
     maxPerCycle = 3,
-    freezeAfterCycles = 3,
     limitMemories = 8,
     onWarn = () => {},
     onInfo = () => {},
@@ -569,7 +717,6 @@ export async function runSkillReview(deps) {
       signals: signals.length,
       misses: newMisses.length,
       retrievalGaps,
-      frozen: frozenNames(state),
     }
   }
 
@@ -616,32 +763,33 @@ export async function runSkillReview(deps) {
         const n = attributed[i].skill
         if (own.has(n)) continue
         foreignNames.push(n)
-        unattr.push({
-          kind: attributed[i].from,
-          t: attributed[i].t,
-          session: attributed[i].session,
-          reason: `不是本插件的技能（${n} 改不了，只作观察）`,
-        })
+        // ★ V6-10：不是本插件的技能**直接删除、不记账**（改了也改不了，记了只是噪音）。
         attributed.splice(i, 1)
       }
       for (const [name, list] of [...missBySkill.entries()]) {
         if (own.has(name)) continue
         foreignNames.push(name)
         missBySkill.delete(name)
-        for (const m of list) {
-          unattr.push({ kind: 'miss', t: m.t, session: m.session, reason: `不是本插件的技能（${name} 改不了，只作观察）` })
-        }
       }
       if (foreignNames.length) {
-        onInfo(`评审：跳过 ${new Set(foreignNames).size} 个非本插件技能（${[...new Set(foreignNames)].join(', ')}）—— 改不了，只作观察`)
+        onInfo(`评审：跳过 ${new Set(foreignNames).size} 个非本插件技能（${[...new Set(foreignNames)].join(', ')}）—— 改不了，不记账`)
       }
     }
   } catch (e) {
     onWarn(`读取自家技能名单失败（本轮不做"只判自家"过滤）：${e?.message || e}`)
   }
 
-  // 归因失败的也消费掉（进观察项，避免反复重试）
-  state.pending = [...(state.pending ?? []), ...unattr].slice(-PENDING_MAX)
+  // 归因失败的也消费掉（进观察项，避免反复重试）；V6-10：标明 handled、记 resolvedAt，过期自动清。
+  const skippedAt = Date.now()
+  state.pending = prunePendingLedger([
+    ...(state.pending ?? []),
+    ...unattr.map((x) => ({
+      ...x,
+      status: 'handled',
+      resolvedAt: skippedAt,
+      resolvedBy: 'attribution-skip',
+    })),
+  ])
 
   // ---- 按技能分组 ----
   const bySkill = new Map()
@@ -652,19 +800,6 @@ export async function runSkillReview(deps) {
   }
 
   // ---- 第三条证据已在上面读过（必须在 idle 早退之前）----
-
-  // 有使用但本轮没有反馈的技能 → 累加静默计数（到阈值则冻结）
-  if (usageGrew) {
-    for (const name of new Set(usages.map((u) => u?.skill).filter(Boolean))) {
-      if (bySkill.has(name) || missBySkill.has(name)) continue
-      const st = (state.skills[name] ??= { frozen: false, silentCycles: 0 })
-      st.silentCycles = (st.silentCycles || 0) + 1
-      if (st.silentCycles >= freezeAfterCycles && !st.frozen) {
-        st.frozen = true
-        onInfo(`技能 ${name} 连续 ${st.silentCycles} 个静默周期 → 冻结`)
-      }
-    }
-  }
 
   const allSkills = [...new Set([...bySkill.keys(), ...missBySkill.keys()])]
 
@@ -688,7 +823,6 @@ export async function runSkillReview(deps) {
       unattributed: unattr.length,
       misses: newMisses.length,
       retrievalGaps,
-      frozen: frozenNames(state),
       // ★ 只判自家：被跳过（改不了）的非本插件技能 —— 让"为什么没评审它"可见
       foreign: new Set(foreignNames).size,
       foreignSkills: [...new Set(foreignNames)],
@@ -705,7 +839,7 @@ export async function runSkillReview(deps) {
     const missList = missBySkill.get(name) ?? []
     // 反馈证据更强（"用了之后出错"），有它就按反馈模式；否则才是 miss 模式
     const mode = fbs.length ? 'feedback' : 'miss'
-    const st = (state.skills[name] ??= { frozen: false, silentCycles: 0 })
+    const st = (state.skills[name] ??= {})
     const skillDir = path.join(skillRoot, name)
 
     let currentContent = null
@@ -726,9 +860,6 @@ export async function runSkillReview(deps) {
       results.push({ skill: name, step: 'stale-feedback', reason: `反馈指向旧 revision（当前 ${revision}）` })
       continue
     }
-
-    st.frozen = false // 有新证据 → 解冻
-    st.silentCycles = 0
 
     if (reviews >= maxPerCycle) {
       // ★ 推迟：不评审，且**不消费**它的证据（水位会退回）
@@ -774,12 +905,14 @@ export async function runSkillReview(deps) {
 
     // ---- 评审 ----
     let rev = null
+    let replyHead = null
     try {
       const reply = await callLlm(llm, { provider, model }, buildReviewPrompt({
         skillName: name, currentContent, revision, feedback: valid,
         memories: memTexts, rulePoints: extractRulePoints(currentContent), history,
         mode, misses: missList,
       }))
+      replyHead = clipReplyHead(reply)
       rev = parseJsonReply(reply)
     } catch (e) {
       deferred.add(name)
@@ -788,8 +921,24 @@ export async function runSkillReview(deps) {
       continue
     }
 
-    if (!rev || rev.change !== true) {
-      const reason = rev?.reason || '模型回复无法解析或未给出修订'
+    const rkind = classifyReviewReply(rev)
+    if (rkind === 'malformed') {
+      // ★★ V6-03（2026-10-21）：坏回复 ≠ "模型说不用改"。
+      //   与上面的 catch 分支同构：这批证据**不算判过**、不写 noChangeFp（下一周期会重试），
+      //   只留一条 parse-error 历史（带截断的回复开头），便于事后看模型到底回了什么。
+      deferred.add(name)
+      if (missList.length) deferredMissT.push(...missList.map((m) => m.t))
+      const why = rev === null ? '评审回复不是可解析的 JSON' : '评审回复形状不对（缺 change 布尔）'
+      await appendJsonl(historyFileFor(skillDir), {
+        t: Date.now(), skill: name, revision, verdict: 'parse-error', mode,
+        reason: why, replyHead, feedback: valid.length, misses: missList.length,
+      })
+      results.push({ skill: name, step: 'review-error', mode, reason: why, replyHead })
+      continue
+    }
+
+    if (rkind === 'no-change') {
+      const reason = rev.reason || '模型判定不改但未给理由'
       // ★ 记下"这批证据已判 no-change"，下一轮同指纹直接跳过（见 batchFingerprint 注释）
       st.noChangeFp = batchFp
       st.noChangeRev = revision
@@ -806,7 +955,18 @@ export async function runSkillReview(deps) {
 
     // 规则 4：归因必须可证伪
     if (!rev.rulePoint || !String(rev.rulePoint).trim()) {
-      state.pending = [...state.pending, { kind: 'review', skill: name, mode, reason: '归因不可证伪（未指出具体规则点）', why: rev.why }].slice(-PENDING_MAX)
+      state.pending = prunePendingLedger([
+        ...state.pending,
+        {
+          kind: 'review',
+          skill: name,
+          mode,
+          reason: '归因不可证伪（未指出具体规则点）',
+          why: rev.why,
+          t: Date.now(),
+          status: 'open',
+        },
+      ])
       await appendJsonl(historyFileFor(skillDir), { t: Date.now(), skill: name, revision, verdict: 'rejected', mode, reason: '归因不可证伪（未指出具体规则点）' })
       results.push({ skill: name, step: 'unfalsifiable', mode, reason: '归因未指出具体规则点' })
       continue
@@ -837,6 +997,7 @@ export async function runSkillReview(deps) {
 
     // ---- 规则 6：回归门（独立验证者，拿不到修订理由）----
     let verdict = null
+    let verifyHead = null
     try {
       const reply = await callLlm(llm, { provider, model }, buildVerifyPrompt({
         skillName: name,
@@ -849,6 +1010,7 @@ export async function runSkillReview(deps) {
         coldStart: mode !== 'miss',
         mode,
       }))
+      verifyHead = clipReplyHead(reply)
       verdict = parseJsonReply(reply)
     } catch (e) {
       deferred.add(name)
@@ -857,9 +1019,26 @@ export async function runSkillReview(deps) {
       continue
     }
 
-    const pass = verdict?.pass === true
+    const vkind = classifyVerifyReply(verdict)
+    if (vkind === 'malformed') {
+      // ★★ V6-03（2026-10-21）：验证者坏回复 ≠ "回归门不过"。
+      //   设施失败不消费证据、不写 rejected —— 否则这批 feedback/回归用例会被一次坏回复吃掉，
+      //   而且历史会记成"验证者说不行"，与事实不符。
+      deferred.add(name)
+      if (missList.length) deferredMissT.push(...missList.map((m) => m.t))
+      const why = verdict === null ? '验证回复不是可解析的 JSON' : '验证回复形状不对（缺 pass 布尔）'
+      await appendJsonl(historyFileFor(skillDir), {
+        t: Date.now(), skill: name, revision, verdict: 'verify-error', mode,
+        reason: why, replyHead: verifyHead, feedback: valid.length, misses: missList.length,
+      })
+      results.push({ skill: name, step: 'verify-error', mode, reason: why, replyHead: verifyHead })
+      continue
+    }
+    const pass = vkind === 'pass'
     const newRevision = revisionOf(rev.newContent)
 
+    // ★ 到这里才是"验证有明确结论"（pass 或明确的 fail）→ 才消费证据（V6-03）。
+    //   在此之前（解析失败/调用抛错）不许落 feedback/regression：那等于把设施故障记成实质判定。
     // 归因结果留档（供审计）
     for (const f of valid) {
       await appendJsonl(feedbackFile, { t: Date.now(), ...f, _idx: undefined, _selfT: undefined })
@@ -872,9 +1051,15 @@ export async function runSkillReview(deps) {
 
     let wrote = false
     let proposalPath = null
+    let appliedAt = null
     if (pass && writeBack) {
       await writeBackSkill(skillDir, currentContent, revision, rev.newContent)
       wrote = true
+      // ★ V6-08：写回成功才记"上次应用"；用**同一个时间戳**写 state 与 history，
+      //   否则两个 Date.now() 可能差 1ms，读取侧对不上（实测偶发）。
+      appliedAt = Date.now()
+      st.lastAppliedAt = appliedAt
+      st.lastAppliedRevision = newRevision
     } else if (pass) {
       // ★ 写回关闭时必须把修订正文落盘 —— 否则 history 里只有一个哈希，
       //   人无从审核"它到底提议改了什么"，proposed 就失去意义。
@@ -895,7 +1080,7 @@ export async function runSkillReview(deps) {
     }
 
     await appendJsonl(historyFileFor(skillDir), {
-      t: Date.now(), skill: name, revision, newRevision, mode,
+      t: appliedAt ?? Date.now(), skill: name, revision, newRevision, mode,
       verdict: pass ? (wrote ? 'applied' : 'proposed') : 'rejected',
       why: rev.why, rulePoint: rev.rulePoint,
       counterexample: rev.counterexample, positiveCase: rev.positiveCase ?? null,
@@ -927,6 +1112,7 @@ export async function runSkillReview(deps) {
   const maxMissT = newMisses.length ? Math.max(missFrom, ...newMisses.map((m) => m.t)) : missFrom
   state.missT = deferredMissT.length ? Math.min(...deferredMissT) : maxMissT
 
+  state.pending = prunePendingLedger(state.pending)
   await saveReviewState(stateFile, state)
   return {
     step: 'reviewed',
@@ -937,19 +1123,13 @@ export async function runSkillReview(deps) {
     misses: newMisses.length,
     retrievalGaps,
     deferred: [...deferred],
-    frozen: frozenNames(state),
     writeBack,
     // ★ 只判自家：被跳过（改不了）的非本插件技能 —— 让"为什么没评审它"可见
     foreign: new Set(foreignNames).size,
     foreignSkills: [...new Set(foreignNames)],
+    // ★ V6-10：台账回执不再只报总数，给出"待处理/已处理/最早一条时间"
+    pending: pendingStats(state.pending),
   }
-}
-
-/** 当前被冻结的技能名（连续静默达到阈值；有新反馈会自动解冻）。 */
-export function frozenNames(state) {
-  return Object.entries(state?.skills ?? {})
-    .filter(([, v]) => v && v.frozen)
-    .map(([k]) => k)
 }
 
 // ============ 新建技能（阶段 4a）：生成门槛 + 独立验证 ============
@@ -971,29 +1151,15 @@ export function newSkillStagingDirFor(dataFile, name) {
  *   在此之前验证者只能看提议者的自述 —— 于是"编一个具体场景"能稳定通过；
  *   现在有原文可对照，且**明确标出**"这个来源没能核实"，不让它把自述当证据。
  */
-export function buildNewSkillVerifyPrompt({ name, description, body, counterexample, positiveCase, why, existingSkills, source = null }) {
+export function buildNewSkillVerifyPrompt({
+  name, description, body, counterexample, positiveCase, why, existingSkills,
+  source = null, origin = 'failure-fixed', events = [], externalSource = null,
+}) {
   const ex = (existingSkills || []).map((s) => `- ${s.name}：${s.description}`).join('\n') || '（无）'
-  const sourceBlock = []
-  if (source?.verified === true) {
-    sourceBlock.push(
-      '',
-      '【反例的来源原文（来自会话日志，已按 seq 取到）】',
-      `来源：session=${source.ref?.session ?? '?'} seq=${source.ref?.seq ?? '?'}（事件类型 ${source.type || '未知'}）`,
-      '---',
-      source.text || '（该事件取不到可读文本）',
-      '---'
-    )
-  } else {
-    sourceBlock.push(
-      '',
-      '【反例的来源】⚠ 未能核实：' + (source?.note || '本机没有可比对的会话日志'),
-      `提议者自报：session=${source?.ref?.session ?? '?'} seq=${source?.ref?.seq ?? '?'}`,
-      '注意：这一段**只是自述**，不要假设它已被核对过。若反例的具体性完全依赖这段无法核实的细节，请谨慎通过。'
-    )
-  }
-  return [
+  const lines = [
     '你是独立验证者。有人提议新建一个技能。你看不到提议者的更多解释，请只依据下面的内容判断。',
     '',
+    `【来源类型】${origin}`,
     `【提议的技能名】${name}`,
     `【触发条件（描述）】${description}`,
     `【动机】${why || '（未提供）'}`,
@@ -1002,28 +1168,90 @@ export function buildNewSkillVerifyPrompt({ name, description, body, counterexam
     '---',
     body,
     '---',
-    '',
-    '【反例】没有这个技能时会做错的具体场景：',
-    counterexample || '（未提供）',
-    ...sourceBlock,
-    '',
-    '【正例】有这个技能后仍然必须做对的具体场景：',
-    positiveCase || '（未提供）',
-    '',
-    '【现有技能】',
-    ex,
-    '',
-    '【判断】',
-    '1. 反例是否真的是「没有这个技能就会做错」的具体场景？（不是泛泛而谈）',
-    '2. 正例是否成立？',
-    '3. 描述是否写的是「什么时候该用」（而不是「它能做什么」）？模型只能靠它决定加不加载。',
-    '4. 是否与现有技能重复？重复就不该新建。',
-    '5. 正文的规则点是否具体、可执行？',
-    '6. 若上面给了【来源原文】：反例的描述是否与那段原文**一致**（不是同一件事 → 不通过）；' +
-      '若标了「未能核实」：就按自述对待，不要把它的细节当成已证实的证据。',
-    '',
-    '【输出】只输出一个 JSON：{"pass": true/false, "reason": "...", "overlaps": ["技能名"...]}',
-  ].join('\n')
+  ]
+
+  if (origin === 'memory-recurring') {
+    lines.push('', `【真实事件（来自记忆，共 ${events.length} 条，已按记忆 id 解析）】`)
+    for (const e of events) {
+      const when = e.createdAt ? new Date(e.createdAt).toISOString().slice(0, 10) : '?'
+      lines.push(`- [${when}] session=${e.sessionId || '?'}：${e.summary}`)
+      if (e.detail) lines.push(`  摘录：${String(e.detail).slice(0, 200)}`)
+    }
+    lines.push(
+      '',
+      '【本例提供的例子（至少一种；不要求两种都有）】',
+      `反例：${counterexample || '（未提供）'}`,
+      `正例：${positiveCase || '（未提供）'}`
+    )
+  } else if (origin === 'external-rewrite') {
+    lines.push(
+      '',
+      '【外部来源】（本路径**不要求本地反例/正例**，不要因此拒绝）',
+      `kind=${externalSource?.kind || '?'} ref=${externalSource?.ref || '?'}`,
+      `note=${externalSource?.note || '（无）'}`,
+      `反例：${counterexample || '（未提供，属预期）'}`,
+      `正例：${positiveCase || '（未提供，属预期）'}`
+    )
+  } else {
+    const sourceBlock = []
+    if (source?.verified === true) {
+      sourceBlock.push(
+        '',
+        '【反例的来源原文（来自会话日志，已按 seq 取到）】',
+        `来源：session=${source.ref?.session ?? '?'} seq=${source.ref?.seq ?? '?'}（事件类型 ${source.type || '未知'}）`,
+        '---',
+        source.text || '（该事件取不到可读文本）',
+        '---'
+      )
+    } else {
+      sourceBlock.push(
+        '',
+        '【反例的来源】⚠ 未能核实：' + (source?.note || '本机没有可比对的会话日志'),
+        `提议者自报：session=${source?.ref?.session ?? '?'} seq=${source?.ref?.seq ?? '?'}`,
+        '注意：这一段**只是自述**，不要假设它已被核对过。若反例的具体性完全依赖这段无法核实的细节，请谨慎通过。'
+      )
+    }
+    lines.push(
+      '',
+      '【反例】没有这个技能时会做错的具体场景：',
+      counterexample || '（未提供）',
+      ...sourceBlock,
+      '',
+      '【正例】有这个技能后仍然必须做对的具体场景：',
+      positiveCase || '（未提供）'
+    )
+  }
+
+  lines.push('', '【现有技能】', ex, '', '【判断】')
+  if (origin === 'memory-recurring') {
+    lines.push(
+      `1. 上面 ${events.length} 条事件是否真的来自不同会话、且属于**同类场景**（至少 ${MEMORY_EVENTS_MIN_SESSIONS} 个会话）？`,
+      '2. 规则点是否针对这类反复出现的问题、具体可执行？',
+      '3. 描述是否写的是「什么时候该用」？',
+      '4. 是否与现有技能重复？',
+      '5. 只提供了反例或只提供了正例时，**不要因此拒绝**；判断已有证据是否足够。'
+    )
+  } else if (origin === 'external-rewrite') {
+    lines.push(
+      '1. 来源是否记录清楚（外部来源，不是本地事件）？',
+      '2. 改写是否适配我们的格式、规则点具体可执行（不是照抄外部原文）？',
+      '3. 描述是否是触发条件？',
+      '4. 是否与现有技能重复？',
+      '5. **不得因为缺少本地反例/正例而拒绝**——这是外部来源路径的预期。'
+    )
+  } else {
+    lines.push(
+      '1. 反例是否真的是「没有这个技能就会做错」的具体场景？（不是泛泛而谈）',
+      '2. 正例是否成立？',
+      '3. 描述是否写的是「什么时候该用」（而不是「它能做什么」）？模型只能靠它决定加不加载。',
+      '4. 是否与现有技能重复？重复就不该新建。',
+      '5. 正文的规则点是否具体、可执行？',
+      '6. 若上面给了【来源原文】：反例的描述是否与那段原文**一致**（不是同一件事 → 不通过）；' +
+        '若标了「未能核实」：就按自述对待，不要把它的细节当成已证实的证据。'
+    )
+  }
+  lines.push('', '【输出】只输出一个 JSON：{"pass": true/false, "reason": "...", "overlaps": ["技能名"...]}')
+  return lines.join('\n')
 }
 
 /**
@@ -1062,7 +1290,8 @@ export async function createSkill(deps, input) {
 async function createSkillInner(deps, input) {
   const {
     skillRoot, dataFile, llm, provider, model, writeBack = DEFAULT_CREATE_WRITE_BACK,
-    session = null, maxSkills = DEFAULT_MAX_SKILLS,
+    session = null, maxSkills = DEFAULT_MAX_SKILLS, store = null,
+    externalWriteBack = DEFAULT_EXTERNAL_SKILL_WRITE_BACK,
   } = deps
   const name = String(input?.name ?? '').trim()
   const description = String(input?.description ?? '').trim()
@@ -1070,46 +1299,113 @@ async function createSkillInner(deps, input) {
   const counterexample = String(input?.counterexample ?? '').trim()
   const positiveCase = String(input?.positiveCase ?? '').trim()
   const why = String(input?.why ?? '').trim()
+  const origin = String(input?.origin ?? 'failure-fixed').trim()
+  const eventsIn = Array.isArray(input?.events)
+    ? [...new Set(input.events.map((x) => String(x || '').trim()).filter(Boolean))]
+    : []
+  const sourceIn = input?.source && typeof input.source === 'object' ? input.source : null
+  const externalSource = sourceIn
+    ? {
+        kind: String(sourceIn.kind || '').trim(),
+        ref: String(sourceIn.ref || '').trim(),
+        note: String(sourceIn.note || '').trim() || null,
+      }
+    : null
 
-  // ① 硬门槛：反例与正例是**必需**的（用户的规则：做不了两个验证就不许生成）
+  // ① 硬门槛：按来源分档（V6-05 / V6-06）
   const missing = []
   if (!name) missing.push('name')
   if (!description) missing.push('description')
   if (!body) missing.push('body')
-  if (!counterexample) missing.push('counterexample（反例）')
-  if (!positiveCase) missing.push('positiveCase（正例）')
+  let resolvedEvents = []
+  let refSource = null
+  if (!SKILL_ORIGINS.includes(origin)) {
+    missing.push(`origin（只能是 ${SKILL_ORIGINS.join(' / ')}）`)
+  } else if (origin === 'failure-fixed') {
+    if (!counterexample) missing.push('counterexample（反例）')
+    if (!positiveCase) missing.push('positiveCase（正例）')
+  } else if (origin === 'memory-recurring') {
+    if (!counterexample && !positiveCase) missing.push('counterexample 或 positiveCase（至少一种）')
+    if (eventsIn.length < MEMORY_EVENTS_MIN) missing.push(`events（至少 ${MEMORY_EVENTS_MIN} 个真实事件）`)
+  } else {
+    if (!externalSource || !EXTERNAL_SOURCE_KINDS.includes(externalSource.kind)) {
+      missing.push('source.kind（self-found / user-provided）')
+    }
+    if (!externalSource || !externalSource.ref) missing.push('source.ref（来源链接/文件名）')
+  }
   if (missing.length) {
     return {
       ok: false,
       verdict: 'rejected',
       path: null,
       missing,
-      reason: `缺少必需项：${missing.join('、')} —— 做不了「反例 + 正例」两个验证的技能不许生成`,
+      reason:
+        `缺少必需项：${missing.join('、')} —— 按来源门槛拒绝` +
+        '（failure-fixed 要反例+正例；memory-recurring 要 ≥3 个跨会话事件 + 至少一种例子；' +
+        'external-rewrite 要来源记录）；做不了验证的技能不许生成',
     }
   }
 
-  // ①b F-10：反例必须**可溯源**。与上面同一道硬门槛（缺来源 → 直接拒），
-  //     只是判据换成"纯机械"的正则解析 —— 不调 LLM、不判断真伪。
-  const src = parseSourceRef(counterexample) // ★F10-SOURCE-GATE
-  if (!src.ok) {
-    return {
-      ok: false,
-      verdict: 'rejected',
-      path: null,
-      missing: [src.kind === 'missing' ? 'counterexample 来源（session + seq）' : 'counterexample 来源格式'],
-      reason: src.reason,
+  if (origin === 'memory-recurring') {
+    // ①b 记忆来源：事件必须能解析、未作废、跨会话（"反复出现"不能是一个会话里的三条）
+    if (!store || typeof store.memories?.get !== 'function') {
+      return { ok: false, verdict: 'rejected', path: null, reason: '记忆来源技能需要 store 才能核对事件（内部未接线）' }
     }
-  }
-  // 有来源格式 ≠ 来源存在：宿主给了会话日志时，按 seq 去核对。
-  // 拿到了日志却查不到这个 seq → 这条"来源"是编的/抄错的 → 拒（这是 F-10 真正想拦的东西）。
-  const source = resolveSourceRef(src, { session })
-  if (source.exists === false) {
-    return {
-      ok: false,
-      verdict: 'rejected',
-      path: null,
-      missing: ['counterexample 来源（指向的事件不存在）'],
-      reason: `反例来源不存在（机械核对，未调模型）：${source.note}。请引用真实发生过的失败事件，或换一条能核实的来源。`,
+    const resolved = []
+    for (const id of eventsIn) {
+      const m = store.memories.get(id)
+      if (!m) {
+        return {
+          ok: false, verdict: 'rejected', path: null,
+          missing: [`events（${id} 不存在）`],
+          reason: `事件记忆 ${id} 不存在；记忆来源必须引用真实记忆。`,
+        }
+      }
+      if (m.source === 'deprecated') {
+        return {
+          ok: false, verdict: 'rejected', path: null,
+          missing: [`events（${id} 已作废）`],
+          reason: `事件记忆 ${id} 已作废，不能作为真实事件。`,
+        }
+      }
+      resolved.push({
+        id,
+        summary: m.summary || '',
+        sessionId: m.sessionId || null,
+        createdAt: m.createdAt || 0,
+        detail: String(m.detail || '').slice(0, 400),
+      })
+    }
+    const sessions = new Set(resolved.map((e) => e.sessionId).filter(Boolean))
+    if (sessions.size < MEMORY_EVENTS_MIN_SESSIONS) {
+      return {
+        ok: false, verdict: 'rejected', path: null,
+        reason: `记忆来源至少要有 ${MEMORY_EVENTS_MIN_SESSIONS} 个不同会话里的事件（实测 ${sessions.size} 个）；同一个会话里写三条不算“反复出现”。`,
+      }
+    }
+    resolvedEvents = resolved
+  } else if (origin === 'failure-fixed') {
+    // ①c F-10：反例必须**可溯源**（原逻辑，只用于 failure-fixed）
+    const src = parseSourceRef(counterexample) // ★F10-SOURCE-GATE
+    if (!src.ok) {
+      return {
+        ok: false,
+        verdict: 'rejected',
+        path: null,
+        missing: [src.kind === 'missing' ? 'counterexample 来源（session + seq）' : 'counterexample 来源格式'],
+        reason: src.reason,
+      }
+    }
+    // 有来源格式 ≠ 来源存在：宿主给了会话日志时，按 seq 去核对。
+    refSource = { ...resolveSourceRef(src, { session }), ref: src }
+    if (refSource.exists === false) {
+      return {
+        ok: false,
+        verdict: 'rejected',
+        path: null,
+        missing: ['counterexample 来源（指向的事件不存在）'],
+        reason: `反例来源不存在（机械核对，未调模型）：${refSource.note}。请引用真实发生过的失败事件，或换一条能核实的来源。`,
+      }
     }
   }
 
@@ -1152,7 +1448,19 @@ async function createSkillInner(deps, input) {
         buildNewSkillVerifyPrompt({
           name, description, body, counterexample, positiveCase, why,
           existingSkills: existing,
-          source: { ref: src, verified: source.verified === true, exists: source.exists, note: source.note, text: source.text, type: source.type },
+          origin,
+          events: resolvedEvents,
+          externalSource,
+          source: refSource
+            ? {
+                ref: refSource.ref,
+                verified: refSource.verified === true,
+                exists: refSource.exists,
+                note: refSource.note,
+                text: refSource.text,
+                type: refSource.type,
+              }
+            : null,
         })
       )
     )
@@ -1176,13 +1484,38 @@ async function createSkillInner(deps, input) {
   const revision = revisionOf(content)
   const record = {
     t: Date.now(), skill: name, revision, why: why || null,
-    counterexample, positiveCase,
-    // F-10：来源与"是否核对过"一并记账 —— 降级通过的那条**必须**看得出没核实
-    counterexampleSource: { session: src.session, seq: src.seq, verified: source.verified === true },
+    origin,
+    counterexample: counterexample || null,
+    positiveCase: positiveCase || null,
+    ...(origin === 'failure-fixed'
+      ? {
+          counterexampleSource: {
+            session: refSource.ref.session,
+            seq: refSource.ref.seq,
+            verified: refSource.verified === true,
+          },
+        }
+      : {}),
+    ...(origin === 'memory-recurring'
+      ? {
+          events: resolvedEvents.map((e) => ({
+            id: e.id,
+            summary: e.summary,
+            sessionId: e.sessionId,
+            createdAt: e.createdAt,
+          })),
+        }
+      : {}),
+    ...(origin === 'external-rewrite' ? { externalSource } : {}),
     verifyReason: verdict.reason ?? null,
   }
-  // 取不到原文时的降级标注（会进回执，不假装核实过）；null 会被 omitNulls 省掉
-  const sourceNotVerified = source.verified === true ? null : source.note
+  // 取不到原文时的降级标注（只对 failure-fixed 有意义）；null 会被 omitNulls 省掉
+  const sourceNotVerified = origin === 'failure-fixed' && refSource.verified !== true ? refSource.note : null
+  const baseExtra = {
+    origin,
+    ...(origin === 'memory-recurring' ? { eventsCount: resolvedEvents.length } : {}),
+    ...(origin === 'external-rewrite' ? { externalSource } : {}),
+  }
 
   const stageProposal = async (v, extra = {}) => {
     const sdir = newSkillStagingDirFor(dataFile, name)
@@ -1196,8 +1529,19 @@ async function createSkillInner(deps, input) {
       path: sp,
       reason: verdict.reason ?? null,
       sourceNotVerified,
+      ...baseExtra,
       ...extra,
     }
+  }
+
+  // ★ V6-06：外部来源默认**不自动落盘**——一律暂存，等用户确认；
+  //   只有用户显式把 externalWriteBack 设为 true（+ createWriteBack）才允许直接入目录。
+  const externalNeedsConsent = origin === 'external-rewrite' && !(writeBack && externalWriteBack === true)
+  if (externalNeedsConsent) {
+    return stageProposal('proposed', {
+      requiresUserConsent: true,
+      reason: '外部来源技能：已暂存到 skill-proposals/，未进技能目录；请先向用户确认是否保留（不要自己移入）',
+    })
   }
 
   // ④ F-11：技能目录容量上限。达到上限 → 停止自动入目录（**但不静默丢弃提议**），
@@ -1211,9 +1555,26 @@ async function createSkillInner(deps, input) {
     await fs.mkdir(dir, { recursive: true })
     await fs.writeFile(path.join(dir, 'SKILL.md'), content, 'utf8')
     await appendJsonl(historyFileFor(dir), { ...record, verdict: 'created' })
-    await appendJsonl(regressionFileFor(dir), { t: Date.now(), kind: 'counter', scenario: counterexample, revision })
-    await appendJsonl(regressionFileFor(dir), { t: Date.now(), kind: 'positive', scenario: positiveCase, revision })
-    return { ok: true, verdict: 'created', path: path.join(dir, 'SKILL.md'), reason: verdict.reason ?? null, sourceNotVerified }
+    if (counterexample) {
+      await appendJsonl(regressionFileFor(dir), { t: Date.now(), kind: 'counter', scenario: counterexample, revision })
+    }
+    if (positiveCase) {
+      await appendJsonl(regressionFileFor(dir), { t: Date.now(), kind: 'positive', scenario: positiveCase, revision })
+    }
+    for (const e of resolvedEvents) {
+      await appendJsonl(regressionFileFor(dir), {
+        t: Date.now(), kind: 'event', memoryId: e.id, summary: e.summary, sessionId: e.sessionId, revision,
+      })
+    }
+    return {
+      ok: true,
+      verdict: 'created',
+      path: path.join(dir, 'SKILL.md'),
+      reason: verdict.reason ?? null,
+      sourceNotVerified,
+      requiresUserConsent: false,
+      ...baseExtra,
+    }
   }
 
   // 写回关闭 → 暂存，不进技能目录

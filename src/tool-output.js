@@ -122,6 +122,12 @@ export const TOOL_OUTPUT_SPECS = {
         additionalProperties: true,
         properties: { name: str(), ok: bool(), result: {}, error: str() },
       }),
+      // ★ V6-01：心跳开始处的磁盘刷新回执（让"先刷新再维护"可见，而不是只有内部知道）
+      refresh: {
+        type: 'object',
+        additionalProperties: true,
+        properties: { ok: bool(), refreshed: bool(), added: num(), tombstoned: num(), total: num(), error: str() },
+      },
     },
   },
   mnemos_maintenance_list: {
@@ -167,6 +173,11 @@ export const TOOL_OUTPUT_SPECS = {
     properties: {
       ok: bool(), verdict: str(), reason: str(), path: str(), missing: arr(), overlaps: arr(),
       sourceNotVerified: str(), capLimit: num(), existingCount: num(),
+      origin: str(), requiresUserConsent: bool(), eventsCount: num(),
+      externalSource: {
+        type: 'object',
+        properties: { kind: str(), ref: str(), note: str() },
+      },
     },
   },
   // ── 任务图（多 agent 协作，2026-10-17）：开图 / 填回执 / 收尾 ──
@@ -178,6 +189,8 @@ export const TOOL_OUTPUT_SPECS = {
     properties: {
       ok: bool(), reason: str(), taskId: str(), graphId: str(), ownerSession: str(),
       assignments: arr({ type: 'string' }),
+      links: arr({ type: 'string' }),
+      linkTruncated: bool(),
     },
   },
   mnemos_task_update: {
@@ -195,11 +208,26 @@ export const TOOL_OUTPUT_SPECS = {
       ok: bool(), reason: str(), taskId: str(), longTermId: str(),
       rolled: arr({ type: 'object', properties: { assign: str(), status: str(), handoffId: str(), note: str() } }),
       missing: arr({ type: 'object', properties: { id: str(), task: str(), status: str() } }),
+      unlabeledHandoffs: arr({ type: 'object', properties: { id: str(), handoffId: str() } }),
       discarded: {
         type: 'object',
         properties: { count: num(), items: arr({ type: 'object', properties: { id: str(), summary: str() } }) },
       },
       keptScratch: num(),
+      doneCount: num(), usesCount: num(), linksCount: num(),
+    },
+  },
+  mnemos_task_done: {
+    type: 'object',
+    required: ['ok'],
+    properties: { ok: bool(), reason: str(), taskId: str(), doneCount: num(), truncated: bool() },
+  },
+  mnemos_task_cite: {
+    type: 'object',
+    required: ['ok'],
+    properties: {
+      ok: bool(), reason: str(), taskId: str(),
+      added: num(), skipped: num(), usesCount: num(), truncated: bool(),
     },
   },
 }

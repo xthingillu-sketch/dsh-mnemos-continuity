@@ -85,6 +85,8 @@ export const MAX_COLLECT_PER_CLASS = 200
 export const SNAPSHOT_TEXT_CHARS = 4000
 /** 单个会话最多写多少条折叠快照记忆（防止刷爆记忆库）。 */
 export const MAX_SNAPSHOTS_PER_SESSION = 5
+/** 折叠快照（事实卡）的保留窗口：7 天后由心跳清理。 */
+export const SNAPSHOT_TTL_MS = 7 * 24 * 3600 * 1000
 /** 元数据里最多列出多少个 shadowedSeqs。 */
 export const SHADOWED_SEQ_PREVIEW = 20
 /** 凭据打码审计的 `where` 字段值。 */
@@ -359,7 +361,7 @@ function listSection(title, total, items, limit, render) {
 /** 三段式正文：① 三类抽取 ② 保底原文 ③ 元数据。 */
 export function buildSnapshotContent({
   facts,
-  fallback,
+  fallback = null,
   range,
   shadowedSeqs,
   shadowedTokenCount,
@@ -380,8 +382,8 @@ export function buildSnapshotContent({
     listSection('用户原始请求', total.userRequests, facts?.userRequests ?? [], maxItems, (it) => `seq ${it.seq}：${it.text}`),
     listSection('负面结论', total.negatives, facts?.negatives ?? [], maxItems, (it) => `seq ${it.seq} [${it.pattern}]：${it.text}`),
     '',
-    `② 保底原文（有界 ${maxTextChars} 字符，超出保留头尾；原文未删除，仍可由日志读回）`,
-    fallback?.text || '（无可投影文本）',
+    `② 保底原文`,
+    fallback ? fallback.text : '（本版只存事实卡，不存 4K 保底原文；原文仍在会话日志里，可按 seq 读回）',
     '',
     '③ 元数据',
     `event: ${eventType}`,
@@ -437,17 +439,87 @@ async function rememberSnapshot(store, rec, { auditFile = null, onWarn = () => {
  * @returns 注入文本（不含任何正文内容，只有指针与计数）
  */
 export function buildFoldNotice(info) {
-  const { id, counts, nodeCount, tokenCount } = info || {}
+  const { id, counts, nodeCount, tokenCount, facts, noFacts } = info || {}
   const c = counts || {}
+  const neg = (facts?.negatives || []).slice(0, 3)
+  const fails = (facts?.failures || []).slice(0, 3)
   const lines = [
     '【折叠提醒】上一段上下文刚被折叠（这是宿主按位置丢最旧一段，摘要可能丢掉结论）。',
     `遮蔽规模：${nodeCount ?? '?'} 个节点 / 约 ${tokenCount ?? '?'} tokens。`,
-    `其中的原始材料已抽成一条记忆：`,
-    `· 用户原始请求 ${c.userRequests ?? 0} 条 · 工具失败 ${c.failures ?? 0} 条 · 负面结论 ${c.negatives ?? 0} 条 + 有界保底原文`,
-    id ? `· 记忆 id：${id} —— 需要原始细节时 \`mnemos_open ${id}\`；也可 \`mnemos_recall "折叠快照"\` 检索。` : '· 记忆 id 未能取到（写入回执没有 id）。',
-    '原始事件未被删除，仍在会话日志里；这条提醒只是指针，不占正文。',
   ]
+  if (noFacts) {
+    lines.push('· 本段没有抽到硬事实（工具失败/用户请求/负面结论），不单独写记忆；原文仍在会话日志里。')
+  } else {
+    lines.push(
+      '· 原始材料已抽成一张**事实卡**（不再存 4K 保底原文）：',
+      `  用户原始请求 ${c.userRequests ?? 0} 条 · 工具失败 ${c.failures ?? 0} 条 · 负面结论 ${c.negatives ?? 0} 条`
+    )
+    if (neg.length) {
+      lines.push('· 关键负面结论（最多 3 条，先看这些，别重踩）：')
+      for (const it of neg) lines.push(`  - ${clip(it.text, 160)}`)
+    }
+    if (fails.length) {
+      lines.push('· 工具失败（最多 3 条）：')
+      for (const it of fails) lines.push(`  - seq ${it.seq} · ${it.tool}：${clip(it.error, 160)}`)
+    }
+    lines.push(
+      id
+        ? `· 事实卡记忆 id：${id} —— 需要其它细节时 \`mnemos_open ${id}\`；也可 \`mnemos_recall "折叠快照"\`。`
+        : '· 事实卡记忆 id 未能取到（写入回执没有 id）。'
+    )
+  }
+  lines.push('原始事件未被删除，仍在会话日志里；这条提醒只带指针与最高价值事实，不占正文。')
   return lines.join('\n')
+}
+
+/**
+ * V6-16：清理过期折叠快照（事实卡）。
+ *
+ * 只删**纯快照**：tag 含 `compaction-snapshot`、但不是 `session-archive`、且 tags ≤ 5
+ * （有些汇总记录继承了标签，不能误删）。默认 7 天；删除走 store.delete（带墓碑）。
+ *
+ * @returns {{scanned:number, deleted:number, kept:number, ids:string[]}}
+ */
+export async function pruneCompactionSnapshots(store, {
+  maxAgeMs = SNAPSHOT_TTL_MS,
+  now = Date.now(),
+  dryRun = false,
+  onWarn = () => {},
+} = {}) {
+  if (!store?.memories || typeof store.delete !== 'function') {
+    return { scanned: 0, deleted: 0, kept: 0, ids: [] }
+  }
+  // 心跳传入的 store 可能是**懒加载**的：不先 ensureLoaded，memories 还是空 Map，会静默 0 条。
+  if (typeof store.ensureLoaded === 'function') {
+    try {
+      await store.ensureLoaded()
+    } catch (e) {
+      onWarn(`折叠快照清理前加载失败：${e?.message || e}`)
+      return { scanned: 0, deleted: 0, kept: 0, ids: [] }
+    }
+  }
+  const ids = []
+  let scanned = 0
+  for (const [id, m] of [...store.memories]) {
+    const tags = m?.tags || []
+    if (!tags.includes(COMPACTION_SNAPSHOT_TAG)) continue
+    if (tags.includes('session-archive')) continue
+    if (tags.length > 5) continue // 汇总记录继承了标签，不是纯快照
+    scanned++
+    const created = Number.isFinite(m.createdAt) ? m.createdAt : 0
+    if (!created || now - created < maxAgeMs) continue
+    ids.push(id)
+  }
+  if (!dryRun) {
+    for (const id of ids) {
+      try {
+        await store.delete(id)
+      } catch (e) {
+        onWarn(`折叠快照清理失败（${id}）：${e?.message || e}`)
+      }
+    }
+  }
+  return { scanned, deleted: dryRun ? 0 : ids.length, kept: scanned - ids.length, ids }
 }
 
 /**
@@ -528,68 +600,82 @@ export function makeCompactionSnapshot({
       // 单会话上限
       if (b.count >= maxSnapshotsPerSession) return null
 
-      if (!store || typeof store.remember !== 'function') return null
-
       const facts = extractShadowedFacts(session, seqs, { maxItemChars, maxCollectPerClass: maxItemsPerClass, patterns })
+      const hasFacts = Boolean(facts.failures.length || facts.userRequests.length || facts.negatives.length)
 
-      const fallback = buildFallbackText(facts.nodes, maxTextChars)
-      const summary = buildSnapshotSummary({
-        nodeCount: seqs.length,
-        tokenCount: Number.isFinite(data.shadowedTokenCount) ? data.shadowedTokenCount : 0,
-        facts,
-        omitted: fallback.omitted,
-      })
-      const content = buildSnapshotContent({
-        facts,
-        fallback,
-        range: data.shadowedRange,
-        shadowedSeqs: seqs,
-        shadowedTokenCount: data.shadowedTokenCount,
-        compactionId: data.compactionId,
-        eventType: event.type,
-        maxTextChars: maxTextChars,
-        maxItems: maxItemsPerClass,
-      })
+      // ★ 2026-10-21 用户拍板：折叠快照只做**短期兜底**。
+      //   · 没有硬事实 → 不写记忆（只注入一句"无硬事实"）；
+      //   · 有硬事实 → 只存**事实卡**，不再存 4K 保底原文（原文仍在会话日志）；
+      //   · 最高价值的事实直接放进注入提醒（最多 3 条负面结论 / 3 条工具失败）。
+      let wrote = null
+      let summary = null
+      if (hasFacts && store && typeof store.remember === 'function') {
+        summary = buildSnapshotSummary({
+          nodeCount: seqs.length,
+          tokenCount: Number.isFinite(data.shadowedTokenCount) ? data.shadowedTokenCount : 0,
+          facts,
+          omitted: 0,
+        })
+        const content = buildSnapshotContent({
+          facts,
+          fallback: null,
+          range: data.shadowedRange,
+          shadowedSeqs: seqs,
+          shadowedTokenCount: data.shadowedTokenCount,
+          compactionId: data.compactionId,
+          eventType: event.type,
+          maxTextChars: maxTextChars,
+          maxItems: maxItemsPerClass,
+        })
+        // ★ store.remember 会先 await ensureLoaded()，并在疑似含凭据时**抛错**（secret-patterns）。
+        //   事实卡是机械产物、模型没法重写它，所以拒写在这里等于纯损失 → 打码后只重试一次
+        //   （见 rememberSnapshot）。任何最终失败都吞掉并告警：钩子绝不中断折叠流程。
+        wrote = await rememberSnapshot(
+          store,
+          {
+            summary,
+            content,
+            tags: [COMPACTION_SNAPSHOT_TAG, 'compaction'],
+            sessionId: sid,
+            source: 'internal',
+          },
+          { auditFile, onWarn },
+        )
+        b.count += 1
+      }
 
-      // ★ store.remember 会先 await ensureLoaded()，并在疑似含凭据时**抛错**（secret-patterns）。
-      //   快照是机械产物、模型没法重写它，所以拒写在这里等于纯损失 → 打码后只重试一次
-      //   （见 rememberSnapshot）。任何最终失败都吞掉并告警：钩子绝不中断折叠流程。
-      //   source 用 'internal'：这是观察到的会话事实，不是自传体，也不是外部信息。
-      const wrote = await rememberSnapshot(
-        store,
-        {
-          summary,
-          content,
-          tags: [COMPACTION_SNAPSHOT_TAG, 'compaction'],
-          sessionId: sid,
-          source: 'internal',
-        },
-        { auditFile, onWarn },
-      )
-      b.count += 1
-
-      // ★ 折叠后**主动告诉模型一次**（2026-10-17 用户要求）：只写记忆不够 —— 生产上 32 条快照
-      //   0 条被打开过，模型根本不知道"刚才那段的原文被抢救到哪了"。注入失败不影响快照本身。
+      // ★ 折叠后**主动告诉模型一次**：即使不 open，最重要的负面结论/工具失败也已经在上下文里。
+      //   注入失败不影响事实卡本身。
       let injected = false
       let injectError = null
       if (typeof injectReminder === 'function') {
-        const record = wrote.record
+        const record = wrote?.record
         const id = record && typeof record === 'object' ? record.id : null
         const text = buildFoldNotice({
           id: typeof id === 'string' ? id : null,
           counts: facts.totals,
           nodeCount: seqs.length,
           tokenCount: Number.isFinite(data.shadowedTokenCount) ? data.shadowedTokenCount : 0,
+          facts,
+          noFacts: !hasFacts,
         })
         try {
           injected = await injectReminder(sid, text)
         } catch (e) {
           injectError = e?.message || String(e)
-          onWarn(`折叠提醒注入失败（快照已写入，不受影响）：${injectError}`)
+          onWarn(`折叠提醒注入失败（事实卡已写入，不受影响）：${injectError}`)
         }
       }
 
-      return { summary, omitted: fallback.omitted, facts, redacted: wrote.redacted, injected, injectError }
+      return {
+        summary,
+        omitted: 0,
+        facts,
+        redacted: wrote?.redacted === true,
+        injected,
+        injectError,
+        noFacts: !hasFacts,
+      }
     } catch (e) {
       onWarn(`折叠快照失败：${e?.message || e}`)
       return null

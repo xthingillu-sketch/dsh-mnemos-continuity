@@ -34,6 +34,7 @@ export const DEFAULT_LEARNER_SESSION_ID = 'mnemos-learner'
  * ★ 默认的 `agentPreset` —— **它决定这个 agent 挂哪些子插件，工具集就从这些插件来**。
  *
  * 实测：不放它时 learner agent 只有 18 个工具（记忆 + context7 + 两个宿主只读工具），**没有联网工具**；
+ * （v1.6 后实际 31 个；18 是当时基线，别当当前值。）
  * 而本会话（`agentPreset: "standard"`）有 44 个工具、含 `web_search` / `web_fetch`。
  * 后果很实在：**不能联网的"学习"是跛脚的** —— 用户当场指出了这一点。
  */
@@ -139,6 +140,7 @@ export function buildLearnerMessage(deps = {}) {
   lines.push('- 上面**有**要做的 → 就做它；')
   lines.push('- 上面**没有** → 做默认的空闲任务：学点你想弄明白的东西（最近做过的、卡过的、或纯粹好奇的都行）；')
   lines.push('- 也可以**什么都不做** —— 直接回一句「这次不学」就算处理完了，不会有人催你。')
+  lines.push('- **不要申请提权/审批**：用户不在旁边，提权请求会把这一轮卡住；需要提权的操作直接跳过，并在回报里说明原因。')
   lines.push('')
   lines.push('【结束后】用**一两句话**简短回报你做了什么、有什么结论就够了，不要长篇大论。')
   lines.push('若有值得跨会话留住的结论，用记忆工具写下来（会话本身随时可能被清掉）。')
@@ -179,12 +181,17 @@ export async function ensureLearnerAgent(agents, opts = {}) {
   // ★ 2026-10-17：换了新 id（回收/重启后重建）时**不要 resume** —— 磁盘上没有它，resume 只会白失败一次；
   //   更重要的是：resume 出来的旧会话补不上 preset（宿主锁定首轮），工具集会退化。
   //   所以 `opts.skipResume` 时直接落到 create（新会话 = created=true = 一定选 preset）。
-  // ★★ 2026-10-18 事故：resume 是"工具集再次退化"的唯一来源，默认**关掉**。
-  //   实测：早上 04:51 定时踢时没有活着的父会话（宿主代建走不通）→ 回退到这条老路 → 它 resume 了
-  //   昨天由**宿主代建**出来的子会话（UUID id）→ 那个会话在宿主 manager 之外恢复，preset 没重新挂上 →
-  //   工具集退化成"只剩 mnemos + context7"，learner 自己诊断出 `read/glob` 全是 `unknown tool`。
+  // ★★ 2026-10-18：resume 是"工具集再次退化"的高风险面（**非唯一来源**，归因见下方修正），默认**关掉**。
+  //   这里旧版写成"实测"的归因已被反证：曾说"04:51 定时踢回退老路 → resume 了**宿主代建**出来的
+  //   子会话（UUID id）→ preset 没重新挂上 → 退化成只剩 mnemos + context7"。但那次 resume 正是
+  //   kick#62 本身：该轮实测工具集**完整**（read/glob/grep/write/联网全在场，日志与源码都是它读的）。
+  //   修正：宿主代建会话的完整工具集是创建时从父 agent 带来的、不依赖 preset，resume 不会让它退化；
+  //   真实退化（10-17 第 17 轮，mnemos-learner-1）是"插件自建、工具全靠 agentPreset.select 挂上"的
+  //   命名会话跨重启被 resume —— select 只允许首轮之前调用，恢复后补不上 → 退化成最小基线。
+  //   默认关 resume 依然正确：两种形态一次封死，不必赌"这个会话是哪一种"。
   //   用户的规则一直是"会话是草稿纸，结论都在记忆里" —— 那就不需要 resume：
   //   **每一脚都用 create 起一个全新的**（created=true 才会选 preset）。要 resume 必须显式 `allowResume: true`。
+  //   修复后实测：kick#63（10-18 05:23）走 create+select 建出 mnemos-learner-9，该轮工具集实测完整。
   if (opts.allowResume === true && !opts.skipResume && typeof agents.resume === 'function') {
     try {
       const handle = await agents.resume({
@@ -668,9 +675,15 @@ export async function runLearnerKick(deps = {}) {
   // ★ 不打扰：它还在忙就跳过（宿主 `get status()` 真实返回 'idle' | 'running'）
   const status = typeof agent.status === 'string' ? agent.status : null
   if (status && status !== 'idle') {
+    // ★★ 2026-10-21 修（V6-02）：这里**不能用 noCommit**。
+    //   noCommit 是给"create 失败"用的（见上面 D-1）：那种情况换代根本没发生，必须退回旧 id。
+    //   但走到这一行时 ensure 已经成功、agent 是真的存在（只是忙），**换代已经是既成事实**；
+    //   再用 noCommit 会把已提交的新代整组写回旧代，下一 tick 就从旧 id 重新决策 ——
+    //   重复执行 create / 清旧代文件这些非幂等副作用（实测日志：同一 12→13、13→14 各出现两次）。
+    //   跳过时只该"不推进 kicks/lastKickAt"（nextState() 的默认语义），不该回滚换代字段。
     return {
       skipped: true, reason: 'busy', status, created: ensured.created, resumed: ensured.resumed,
-      recycle: recycleInfo, activeSessionId, nextState: nextState(noCommit()),
+      recycle: recycleInfo, activeSessionId, nextState: nextState(),
     }
   }
 
@@ -685,9 +698,11 @@ export async function runLearnerKick(deps = {}) {
   try {
     agent.followup(buildInjectedUserMessage(text))
   } catch (e) {
+    // ★★ 2026-10-21 修（V6-02）：与 busy 同理 —— agent 已经起来了、换代是既成事实，
+    //   只有"入队"这一步失败。这里若用 noCommit 退回旧 id，下一 tick 会再换一次代。
     return {
       skipped: true, reason: 'followup-threw: ' + (e?.message || e), created: ensured.created,
-      recycle: recycleInfo, activeSessionId, nextState: nextState(noCommit()),
+      recycle: recycleInfo, activeSessionId, nextState: nextState(),
     }
   }
   const usedId = ensured.sessionId || activeSessionId

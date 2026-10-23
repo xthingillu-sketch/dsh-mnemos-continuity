@@ -219,8 +219,8 @@ $env:ELECTRON_RUN_AS_NODE = 1
 | `mnemos_constitution` | 读宪法（只读） |
 | `mnemos_delete` | **真删除**（不可恢复） |
 | `mnemos_deprecate` / `mnemos_dormant` | 标记作废 / 标"本轮暂时无关"（可撤销） |
-| `mnemos_propose_skill` | 提议新建技能（要给反例与正例，且反例能追溯到真实失败） |
-| `mnemos_task_open` / `mnemos_task_update` / `mnemos_task_close` | 任务图：开图 / 填回执 / 收尾 —— 派活用，**自己的复杂活也能用**（判据：跨会话 / 被截断 / 有并行 / 需事后交代，任一为是） |
+| `mnemos_propose_skill` | 提议新建技能（failure-fixed 要反例+正例；memory-recurring 要 ≥3 个跨会话事件、正反例至少一种；external-rewrite 要来源记录，且默认只暂存、保留需你确认） |
+| `mnemos_task_open` / `mnemos_task_update` / `mnemos_task_close` / `mnemos_task_done` / `mnemos_task_cite` | 任务图（任务档案/寻址空间）：开图 / 填回执 / 收尾 / 记已完成里程碑 / 登记依赖 —— 派活、跨会话、或会产出多条记忆时用；未完成步骤用宿主 todo，图不复制结论正文 |
 | `mnemos_heartbeat` / `mnemos_maintenance_list` / `mnemos_heartbeat_toggle` | 手动跑一次维护 / 看维护清单 / 关心跳 |
 | `mnemos_learner_kick` | 立刻踢一轮空闲学习（诊断用，也可主动触发） |
 
@@ -277,7 +277,7 @@ $env:ELECTRON_RUN_AS_NODE = 1
 - id: dsh-mnemos
   config:
     learnerEnabled: true
-    learnerIntervalMs: 21600000          # 6 小时：一轮就约 7 万 token，频率低一点更划算
+    learnerIntervalMs: 21600000          # 6 小时；每轮 token 取决于模型自己选的任务（未测量），频率低一点更划算
     learnerProvider: aliyun              # ★ 第三方 api-key 路由（必须）
     learnerModel: qwen3.8-flash
     # 留空 = 不工作：后台没有主会话可借，也不会退回 DeepSeek 自家路由
@@ -324,7 +324,15 @@ learnerAgentPreset: standard
             name: "@deepseek-ai/dsh-tool-web"
             config:
               fetch: true
+          - id: tool-todo                # 宿主任务清单（系统提示 ㉔ 的"未完成步骤"）
+            name: "@deepseek-ai/dsh-tool-todo"
+            config:
+              allowParallelInProgress: true
 ```
+
+> `tool-todo` 是 v1.6 补上的：系统提示 ㉔ 要求未完成步骤写宿主 todo；没有它，learner 只能开图、却无法按规则记录未完成步骤。
+>
+> 另外，空闲任务的提醒会明确**禁止申请提权/审批**：用户不在旁边，提权请求会把这一轮卡住；需要提权的操作应跳过并回报。
 
 然后 `learnerAgentPreset: mnemos-learner`。**两个坑**：
 
@@ -394,13 +402,13 @@ learnerAgentPreset: standard
     validateModel: ""              # 留空 = 复用 learnerModel
     # —— 技能 ——
     createWriteBack: true          # 新建技能是否直接入目录
+    externalSkillWriteBack: false  # 外部来源技能是否允许自动入目录（默认只暂存，等你确认）
     reviewWriteBack: true          # 修改已有技能是否真的改写（false = 只出建议）
     maxSkills: 30                  # 技能目录容量上限
     reviewEnabled: true            # 是否启用技能评审
     reviewProvider: "deepseek-account"   # 必须与当前可用 provider 一致
     reviewModel: "deepseek-flash"
     reviewMaxPerCycle: 3           # 每周期最多评审几个
-    reviewFreezeAfterCycles: 3     # 连续几个静默周期后冻结
 ```
 
 **一个耦合点**：`reviewProvider` / `reviewModel` 必须与当前可用的 provider 一致，否则技能评审会**静默失败**（技能不会变差，但也不会变好）。
@@ -435,7 +443,7 @@ learnerAgentPreset: standard
 | 出现"宪法 · 未初始化"警告 | 三种原因：① 第 5 节没做；② `constitutionFile` 指错路径；③ **第 5 节做了但没再完全重启一次**（宪法只在启动时装载） |
 | 记忆"空了" | 看日志里的 `dataFile=` —— 大概率是路径指到别处，数据本身没丢 |
 | 检索明显不准 | 召回是**关键词 + 标签**匹配（不是语义检索）：换关键词试，并检查标签是否覆盖关键类别 |
-| 技能一直不变好 | `reviewProvider` 不可用 → 评审静默失败；或技能已冻结（见 `skill-review-state.json`） |
+| 技能一直不变好 | `reviewProvider` / `reviewModel` 不可用 → 评审静默失败（技能不会变差，但也不会变好）。v1.6 起**没有"冻结"这回事**了，别去 `skill-review-state.json` 里找 |
 | 子代理说"文件不存在"但明明有 | `glob` 用**绝对 Windows 路径**会静默返回 `No files found`。改用 `pwsh Get-ChildItem -File -Filter *.js` 或相对工作区根的路径。**静默假阴性比报错更危险** |
 | 任务的临时结果在收尾时没了 | 那是设计：临时的默认丢弃，要留请显式标记。交付物别同时标成临时 |
 

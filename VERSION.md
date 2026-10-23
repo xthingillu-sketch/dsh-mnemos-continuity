@@ -1,21 +1,22 @@
-# 版本标识 · Mnemos v1.5.10
+# 版本标识 · Mnemos v1.6.0
 
 | 项 | 值 |
 |---|---|
-| **版本** | **v1.5.10**（`package.json` 的 `version`）—— 见下方「版本流水」 |
+| **版本** | **v1.6.0**（`package.json` 的 `version`）—— 见下方「版本流水」 |
 | 本目录 | **当前发行副本**（可发布内容；解压后即成为 `<你的路径>\mnemos\`） |
-| 打包日期 | 2026-10-17 |
-| 构成 | `src` **26 个模块** + `scripts` 4 个 + `test` 1 个 + `docs` **9 件**（4 套 × docx/pdf + 1 份纯 md）+ 2 个示例技能 |
-| 文档 | `简介-introduction`（是什么·该不该用）· `架构总览`（部件与数据流）· `architecture-机制清单`（每个机制保证什么、边界在哪）· `设计者视角`（为什么这样设计）—— 每套 docx + pdf |
-| 对应压缩包 | 同级 `mnemos.rar`（字节数见该文件本身：`(Get-Item .\..\mnemos.rar).Length`） |
-| 压缩包摘要 | `(Get-FileHash .\..\mnemos.rar -Algorithm SHA256).Hash` |
-| 同版本存档 | `mnemos-历史版本\v1.5.10\mnemos-v1.5.10.rar`（与 `mnemos.rar` 逐字节相同） |
+| 打包日期 | 2026-10-21（**代码/文档已就位；npm 与 rar 尚未发布**） |
+| 构成 | `src` **26 个模块** + `scripts` 4 个 + `test` 1 个 + `docs` **npm 5 件 / 发行 rar 9 件**（4 套 docx，rar 另有 4 份 pdf，外加 1 份纯 md）+ 2 个示例技能；工具 **19** 个；心跳 **8** 项 |
+| 文档 | `简介-introduction`（是什么·该不该用）· `架构总览`（部件与数据流）· `architecture-机制清单`（每个机制保证什么、边界在哪）· `设计者视角`（为什么这样设计，按设计目标重写） |
+| 对应压缩包 | 本版**尚未重打**；同级 `mnemos.rar` 仍是旧包。发布前重打并更新摘要 |
+| 同版本存档 | 发布后再补 `mnemos-历史版本\v1.6.0\` |
+
 
 ## 版本流水
 
 | 版本 | 内容 | 性质 |
 |---|---|---|
-| **v1.5.10**（本版） | **改 npm 包名（项目名不变）**：`dsh-mnemos` 这个名字在 npm 上**已被另一个独立项目占用**（别人写的、思路不同、不是同一套代码，且发布时间更早）。按用户决定：**项目名仍叫 Mnemos**，npm 包名改为 **`dsh-mnemos-continuity`**（`continuity` 指"换会话、换模型之后判断还能接着用"）。同步改动：`cordis.patch.yml` 的 bundle `name`（**entry id 仍保留 `dsh-mnemos`**，故 profile 里的配置覆盖不用动）、INSTALL 五处命令、README 新增一段"名字说明"（含与同名项目的消歧）。本机 `desktop` profile 的 deps / bundles / junction 已改名并**重启实测通过**（工具正常、`profileContext` 正确）。历史存档不动（也不发布）。测试仍 **1225** | ✅ 包：`package.json` / `cordis.patch.yml`；文档：README / INSTALL |
+| **v1.6.0**（本版） | **认知架构收口（未发布）**：① 任务图升级为「任务档案/寻址空间」（done/uses/links + 读时投影 + 上限代码强制；新增 task_done/task_cite，工具 19）；② 技能体补入口与三档来源（失败→修好 / 记忆反复 / 外部改写；外部默认只暂存、保留需用户确认）；③ 评审状态记录 lastApplied、外部写入可见（refresh）、learner 不再误回滚换代、评审/验证解析失败三态；④ pending 台账（外来不记账、status、去重、过期清理）；⑤ 折叠快照改短期兜底（事实卡 + 提醒带 top3 + 7 天 TTL）；⑥ 系统提示 25 条 / 7 节（约 3.5k 字符；任务图独立成节、多模型协作必须开图；单步小事别开；workflow 交接纪律）。测试 **1330 / 0** | ✅ 代码：`store` / `index` / `skill-review` / `compaction-snapshot` / `system-prompt` 等；文档：README / INSTALL / 四份对外文档 |
+| **v1.5.10** | **改 npm 包名（项目名不变）**：`dsh-mnemos` 这个名字在 npm 上**已被另一个独立项目占用**（别人写的、思路不同、不是同一套代码，且发布时间更早）。按用户决定：**项目名仍叫 Mnemos**，npm 包名改为 **`dsh-mnemos-continuity`**（`continuity` 指"换会话、换模型之后判断还能接着用"）。同步改动：`cordis.patch.yml` 的 bundle `name`（**entry id 仍保留 `dsh-mnemos`**，故 profile 里的配置覆盖不用动）、INSTALL 五处命令、README 新增一段"名字说明"（含与同名项目的消歧）。本机 `desktop` profile 的 deps / bundles / junction 已改名并**重启实测通过**（工具正常、`profileContext` 正确）。历史存档不动（也不发布）。测试仍 **1225** | ✅ 包：`package.json` / `cordis.patch.yml`；文档：README / INSTALL |
 | v1.5.9 | **npm 包瘦身**：`files` 里的 `docs` 改为 `docs/*.docx` + `docs/*.md` —— **npm 包不再带 PDF**（本机 rar 仍保留完整 4 套 docx+pdf，因为那是给下载的发行包）。包体 **2.24 MB → 370.6 KB**、文件数 47 → **43**（docs 仍 5 件：4 份 docx + 1 份模块文档 md）。用户决定："有一份就够了，没必要提供两份占空间"。除此之外与 v1.5.8 完全相同（含 P0 数据目录修复）。测试仍 **1225** | ✅ 包：`package.json`（files） |
 | v1.5.8 | **修数据落点（P0）+ 安装审查的其余条目**：① **P0 默认数据目录解析错** —— 插件原先按 `DSH_PROFILE_DIR → DSH_HOME → cwd` 猜，而那三个在插件进程里都不可靠（`DSH_PROFILE_DIR`/`DSH_HOME` 只注入给 shell 工具不注入插件；桌面版只是碰巧靠 cwd 对）。后果：换启动方式会把记忆写进**别的 profile** 或当前目录（外部安装审查实测写进了另一个 profile）。现改为 **`config.dataFile` > `ctx.get('profileContext').dir` > 环境变量/cwd（兜底）**，启动日志第一依据改成 `profileContext=`；**已用"污染环境变量"的对照实验验证**（临时 profile + 假 DSH_PROFILE_DIR/DSH_HOME/cwd → 仍写进自己的 profile）。② **npm 包会缺全部 docs** → `files` 补 `docs`/`examples`/`VERSION.md`（发行副本 pack 47 文件 / 2.3 MB）；③ **宪法初始化要 node 而文档说不需要** → INSTALL 补 `ELECTRON_RUN_AS_NODE=1` + DSH 自带 exe 的无 Node 路径；④ P2：补 `scripts.test`、peer 告警口径改正（所有安装方式都可能出现、无害）、`link:` 路径写明"指到含 package.json 的那一层"、清掉三处"留空跟随主会话"的过时注释、加 `engines.dsh` 声明（**未能证实宿主真的检查它**）。测试仍 **1225** | ✅ 代码：`index.js` / `paths.js`；包：`package.json`；文档：INSTALL / 测试断言 |
 | v1.5.7 | **打包形态 + 文档 + 清理**，不改运行行为：① **改造成标准可安装 bundle** —— 去掉 `private`、加 `dsh.bundle.patch`、`peerDependencies` 只留 `schemastery`、`files` 补 `INSTALL.md`；`dsh plugin --profile <p> add` 实测可装（`--dump-config` 里能看到 `dsh-mnemos` 行）；② **删掉 learner 回退留下的死代码 156 行**（`makeHostLauncher` / `findLiveParentAgent` / `lastSeenAgent` / `captureSeenAgent` / `launchHostChild`）；③ **新增对外文档 `docs/模块与功能实现.md`（纯 md，不生成 docx）** —— 26 个模块逐一说"有哪些功能、怎么实现"，**附录逐字给出宪法原文与系统提示原文**；README 文档地图从六份改为七份并加指路；④ **口径对齐**：开场与 INSTALL 首段改成"不是更大的记忆库，而是换模型/换会话后还能高效用上"（不把存记忆当卖点）；⑤ **作者信息定案**：`LICENSE` 与 `package.json` 写入「七月流火 <2151926500@qq.com>」（此前发行副本是 `<YOUR NAME>` 占位符）；⑥ 内部材料（`V1.5-修复与更新记录.md`）加入同步清理清单，确保不进发行包。测试仍 **1225** | ✅ 代码：`src/index.js`；包：`package.json`、`LICENSE`；文档：README / INSTALL / 简介 / 新增模块文档 |
@@ -39,24 +40,23 @@
 
 ## 怎么确认这是我说的那一版
 
-1. `package.json` 的 `version` 应为 **1.5.10**；
-2. 本目录下跑 `npm test`（等价 `node test/store.test.js`）应为 **1225 通过 / 0 失败**；
+1. `package.json` 的 `version` 应为 **1.6.0**；
+2. 本目录下跑 `npm test`（等价 `node test/store.test.js`）应为 **1330 通过 / 0 失败**；
 3. 启动日志（`<profile>\mnemos\mnemos.log`）的「解析依据」第一段应是 **`profileContext=<该 profile 目录>`** ——
    若第一依据还是 `DSH_PROFILE_DIR`/`cwd`，说明跑的是 v1.5.8 之前的代码；
-4. `docs/` 应有 **9 件**（4 套 docx+pdf，外加一份**纯 md**：`模块与功能实现.md`）：
-   `简介-introduction`（是什么 · 该不该用）、`架构总览`（部件与数据流）、
-   `architecture-机制清单`（每个机制保证什么、边界在哪）、`设计者视角`（为什么这样设计）。
-   ⚠ 按用户决定，`architecture-实现过程完整记录` **不进发行包**（那份自己看，含较多过时内容）；
-   v1.4 里的 `architecture-实现细节` 在本版**正式改名为** `architecture-机制清单`（内容按"只讲机制"重写）。
-   这 4 套已在本版生成；v1.4 的 `architecture-实现细节` 已正式改名为 `architecture-机制清单` 并按“只讲机制”重写。
+4. 文档件数分两种形态：
+   - **npm 包 / `repo-stage/docs`：5 件**（4 套 docx + 1 份纯 md `模块与功能实现.md`，**不带 PDF**）；
+   - **发行 rar / `Selfdata/docs`：9 件**（4 套 docx + 4 份 pdf + 1 份纯 md）。
+   四套是：`简介-introduction`（是什么 · 该不该用）、`架构总览`（部件与数据流）、
+   `architecture-机制清单`（每个机制保证什么、边界在哪）、`设计者视角`（为什么这样设计，v1.6 按设计目标重写）。
 
 ## 发行方目录里各份 mnemos 是什么关系（避免拿错）
 
 | 位置 | 是什么 | 该不该拿来装 |
 |---|---|---|
-| 本目录（`mnemos\`） | **当前发行副本**（v1.5.0，代码与文档都已就位） | ✅ 要装就用这个目录，或解压同级的 `mnemos.rar` |
-| `mnemos.rar`（同级） | 本目录的压缩包（同一份内容） | ✅ 分发给别人用这个 —— **但它现在还是 v1.4.1 的旧包** |
-| `mnemos-历史版本\` | **已定版的压缩包存档**：`v0`、`v1.0.0`、`v1.1.0`、`v1.2.0`、`v1.3.0`、`v1.4.0`、`v1.4.1`（含本版 `v1.5.0`） | ⚠️ 只在回退 / 对比时用 |
+| 本目录（`mnemos\`） | **当前发行副本**（v1.6.0，代码与文档已就位；**尚未发布**） | ✅ 要装就用这个目录；npm/rar 等发布后再分发 |
+| `mnemos.rar`（同级） | 本目录的压缩包（旧版） | ⚠️ **本版尚未重打**；发布前重打并更新摘要 |
+| `mnemos-历史版本\` | 已定版的压缩包存档（含 v1.5.10 及更早） | ⚠️ 只在回退 / 对比时用；v1.6.0 发布后补存档 |
 | `mnemos.backup-before-sync\` | 最近一次同步**之前**的快照（回滚点） | ❌ 不是发行物 |
 | 备份区（`发行备份\`） | 历次同步的时点快照 + 验收日志 + `源文件-*`（可复现源） | ❌ 不是发行物 |
 

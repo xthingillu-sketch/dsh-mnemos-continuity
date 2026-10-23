@@ -2,6 +2,7 @@
 
 **A DeepSeek Harness (DSH) plugin — not a bigger memory store, but memory that stays usable after you switch sessions, directories, or models.**
 
+> **The goal**: after you have done a kind of task once, the next time it should be done right **without looking anything up**.
 > It is not about how much memory you keep. It is about: after switching to another model, does it know **which records to pull, how to use them, and how to leave a new judgement behind**?
 > Memory lives in files you can read and diff; the reasoning model is a replaceable part.
 
@@ -10,10 +11,17 @@ Mnemos is installed **into** [DeepSeek Harness](https://github.com/deepseek-ai/d
 ## What you get
 
 - **Continue a task in a new session** — new session, new working directory: say "continue with X" and it picks the relevant conclusions back up (no ids to memorize).
-- **Multi-agent handoff by memory, not by pasting transcripts** — the main agent writes a task graph; sub-agents read it by id and hand results back. One writer, nothing overwritten.
+- **Task graph as a dossier/address space** — the graph stores **pointers, not copied text**: completed milestones, dependency ids and conclusion ids, whether the work is delegated or done by the main agent. Sub-agents read it by id; one writer, nothing overwritten.
+- **Skills are compiled experience** — a reusable practice can come from a fixed failure, a recurring problem in memory (≥3 events across ≥2 sessions), or an external rewrite. External skills stay in `skill-proposals/` until you approve them.
 - **External information is auditable** — fetched content is treated as untrusted, verified in a restricted one-shot session, and stored with its provenance permanently attached.
-- **Context compaction does not silently eat conclusions** — when the host folds old context, the important facts are snapshotted into memory first, with a pointer injected back.
+- **Context compaction is a short-term fallback, not long-term memory** — the plugin writes only a fact card (no 4K raw text) plus a notice carrying the top negative conclusions/tool failures; the fact card expires after 7 days.
 - **Identity and rules live in records, not in weights** — a constitution (read-only from the model's side, editable by the owner with a password, always audited), injected every turn.
+
+## What it is not
+
+Other DSH memory plugins fall into four types: fact-citation, file/project memory, full memory-stack/shared, and protocol-enforced memory. Mnemos is a **different layer**: it makes **judgement** traceable — why a rule changed, what a task depended on, whether external information was trusted, and what a decision superseded. Memory is the substrate, not the product.
+
+This also means we do **not** offer per-fact citations back to raw log events; that is a known gap, not a claim. Citation and judgement provenance are complementary.
 
 ## Install
 

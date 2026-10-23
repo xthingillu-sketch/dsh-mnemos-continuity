@@ -50,6 +50,32 @@ export const DEFAULT_TASK_OPEN_MAX_MS = 7 * 24 * 3600 * 1000
 /** 分工允许的完成状态。 */
 export const TASK_STATUSES = ['pending', 'done', 'partial', 'blocked']
 
+/* ───────── V6-21：任务图的"任务档案"扩展（只存元数据，正文留在记忆里） ───────── */
+
+/** 已完成里程碑的文字上限（代码强制，防止图膨胀）。 */
+export const TASK_DONE_TEXT_MAX = 80
+/** 依赖项 `why` 的字数上限。 */
+export const TASK_USE_WHY_MAX = 80
+/** 前序图 `why` 的字数上限（必填）。 */
+export const TASK_LINK_WHY_MAX = 120
+/** 依赖项条数上限（结构性上限，超了直接拒绝）。 */
+export const TASK_USES_MAX = 30
+/** 前序图条数上限。 */
+export const TASK_LINKS_MAX = 5
+/** 视图里最多渲染多少条已完成里程碑。 */
+export const TASK_DONE_RENDER_MAX = 20
+/** 标"重要结论"的标签（图读时据此派生，不复制正文）。 */
+export const TASK_CONCLUSION_TAG = 'conclusion'
+/** 前序图的关系类型（具体原因放 `why`）。 */
+export const TASK_LINK_RELATIONS = ['continues', 'depends', 'supersedes', 'evidence', 'related']
+
+/** 统一裁字：折叠空白、去首尾、超长截断；回执要能看出"截过"。 */
+function clipText(value, max) {
+  const s = String(value ?? '').replace(/\s+/g, ' ').trim()
+  if (s.length <= max) return { text: s, truncated: false }
+  return { text: s.slice(0, max), truncated: true }
+}
+
 /**
  * 外部信息隔离验证记录（`source=validation`）的保留窗口 —— 超出即**销毁**（双条件都要满足）。
  * 为什么要有界：这类记录受归档闸门保护、永不进长期，不销毁就会无限堆积。
@@ -164,6 +190,9 @@ export class MemoryStore {
     //   B 一保存，按 recency 取大者反而是 B 的旧副本胜出 → **A 的作废被静默回滚**。
     //   有了基线就能判断"这一侧到底动没动过"，只有两侧都动过才需要靠 recency 裁决。
     this.baseline = new Map()    // id → JSON 串（用于判定"这一侧是否被改过"）
+    // ★ V6-01：磁盘新鲜度签名（mtimeNs:size）与刷新计数。见 refreshFromDisk()。
+    this.diskSig = null
+    this.refreshStats = { checks: 0, reads: 0, skipped: 0, errors: 0 }
     this.lockStats = { acquired: 0, stolen: 0, degraded: 0 }  // 观测用（测试断言用）
   }
 
@@ -180,21 +209,62 @@ export class MemoryStore {
     // 墓碑读不出来不阻塞 load（readTombstones 内部已兜住）。
     const tombs = await readTombstones(this.dataFile)
     this.tombstones = new Map(Object.entries(tombs))
+    // ★ V6-01：用"前后签名一致"的快照读法（文件不存在时返回空数组，不再靠 ENOENT 分支）。
+    const snap = await this._readMemorySnapshot()
+    for (const m of snap.arr) {
+      if (m && typeof m.id === 'string') this.memories.set(m.id, m)
+    }
+    // ★ 磁盘上的墓碑同样要应用（别的进程删过、但本进程的 memory.json 副本还没跟上时）
+    this.applyTombstones()
+    this.loaded = true
+    this.diskSig = snap.sig
+    this.recordBaseline()
+  }
+
+  /** 磁盘文件的新鲜度签名（mtimeNs + size）。文件不存在 → 'absent'。 */
+  async _statSig() {
     try {
-      const raw = await fs.readFile(this.dataFile, 'utf8')
-      const arr = JSON.parse(raw)
-      if (!Array.isArray(arr)) throw new Error('mnemos: memory file is not an array')
-      for (const m of arr) {
-        if (m && typeof m.id === 'string') this.memories.set(m.id, m)
-      }
-      // ★ 磁盘上的墓碑同样要应用（别的进程删过、但本进程的 memory.json 副本还没跟上时）
-      this.applyTombstones()
+      const st = await fs.stat(this.dataFile, { bigint: true })
+      return `${st.mtimeNs}:${st.size}`
     } catch (e) {
-      if (e.code === 'ENOENT') { this.loaded = true; this.recordBaseline(); return } // 无文件 = 空记忆，正常
+      if (e && e.code === 'ENOENT') return 'absent'
       throw e
     }
-    this.loaded = true
-    this.recordBaseline()
+  }
+
+  /**
+   * 读一份"前后签名一致"的磁盘快照。
+   *
+   * 为什么不是一次 readFile：读的窗口里别的实例可能刚 rename 了新文件 —— 那样读到的内容
+   * 与"记下来的签名"会错位，下一次刷新就会拿一个更新的签名去跳过本应发生的读取。
+   * 返回 { sig, arr }；文件不存在 → { sig:'absent', arr: [] }。
+   */
+  async _readMemorySnapshot() {
+    let lastErr = null
+    for (let round = 0; round < 3; round++) {
+      const sig = await this._statSig()
+      if (sig === 'absent') return { sig, arr: [] }
+      let raw = null
+      for (let attempt = 0; attempt <= READ_RETRY_MS.length; attempt++) {
+        try {
+          raw = await fs.readFile(this.dataFile, 'utf8')
+          lastErr = null
+          break
+        } catch (e) {
+          lastErr = e
+          if (e && e.code === 'ENOENT') return { sig: 'absent', arr: [] }
+          if (!RETRYABLE_READ_CODES.has(e && e.code) || attempt === READ_RETRY_MS.length) break
+          await sleepMs(READ_RETRY_MS[attempt])
+        }
+      }
+      if (lastErr) throw lastErr
+      const after = await this._statSig()
+      if (after !== sig) continue // 读的期间被改过 → 重来一轮
+      const arr = JSON.parse(raw)
+      if (!Array.isArray(arr)) throw new Error('mnemos: memory file is not an array')
+      return { sig, arr }
+    }
+    throw new Error('mnemos: memory file keeps changing while reading')
   }
 
   /** 记下"我刚从磁盘读到的原样"，供 writeToDisk 的三方合并判断哪一侧改动过。 */
@@ -228,6 +298,61 @@ export class MemoryStore {
     } finally {
       this.loading = null
     }
+  }
+
+  /**
+   * ★ V6-01：把磁盘上**别的实例**写入的变化合并进内存（只读，不写盘）。
+   *
+   * 为什么需要它：`ensureLoaded()` 只加载一次；而 `save()` 只在"本地确实有变化"时才发生。
+   * 于是桌面端空闲时，网页端写入的记录既看不到、也不会被归档（归档要先"看到"才会觉得有活干）——
+   * 形成一个环：可见性依赖写盘，写盘又依赖"觉得有活干"。
+   *
+   * 调用点（两处，都是读路径）：
+   *   · 心跳开始处：先刷新再跑维护任务（归档就能看到别的实例写的短时记录）；
+   *   · `mnemos_recall` / `mnemos_open` 工具入口：让跨端读写不依赖"本端恰好写过一次盘"。
+   *
+   * 串到 `saveChain` 上：避免与正在落盘的 save 交错（save 自己会 re-read 并三方合并）。
+   * 幂等：文件签名没变时只做一次 stat，不读文件。
+   */
+  async refreshFromDisk() {
+    await this.ensureLoaded()
+    const run = this.saveChain.then(() => this._refreshFromDiskInner())
+    this.saveChain = run.then(() => {}, () => {})
+    return run
+  }
+
+  async _refreshFromDiskInner() {
+    this.refreshStats.checks += 1
+    let snap
+    try {
+      snap = await this._readMemorySnapshot()
+    } catch (e) {
+      this.refreshStats.errors += 1
+      // 读失败**保留内存现状**（不清空、不覆盖），下次再试。
+      this.onWarn(`[mnemos-refresh] 读磁盘失败，保留内存现状：${e?.message || e}`)
+      return { ok: false, refreshed: false, error: String(e?.message || e) }
+    }
+    if (snap.sig === this.diskSig) {
+      this.refreshStats.skipped += 1
+      return { ok: true, refreshed: false }
+    }
+    this.refreshStats.reads += 1
+    const before = new Set(this.memories.keys())
+    // 墓碑与数据一起合并：别的实例删掉的记录不许被本进程的旧副本复活。
+    const diskTombs = await readTombstones(this.dataFile)
+    const union = mergeTombstones(Object.fromEntries(this.tombstones), diskTombs)
+    const capped = capTombstones(union, this.maxTombstones)
+    this.tombstones = new Map(Object.entries(capped.table))
+    const merged = mergeMemories(this.memories, snap.arr, this.baseline)
+    let tombstoned = 0
+    for (const id of this.tombstones.keys()) if (merged.delete(id)) tombstoned++
+    let added = 0
+    for (const id of merged.keys()) if (!before.has(id)) added++
+    this.memories = merged
+    // 基线更新为"刚合并进来的这份"：下一次 save 的三方合并才判断得准。
+    this.recordBaseline()
+    this.diskSig = snap.sig
+    return { ok: true, refreshed: true, added, tombstoned, total: this.memories.size }
   }
 
   /**
@@ -341,6 +466,8 @@ export class MemoryStore {
       // ── ④ 落盘：先 .tmp 再 rename（原子替换，不会留下半个文件）──
       const arr = [...this.memories.values()]
       await atomicWriteFile(this.dataFile, JSON.stringify(arr, null, 2))
+      // ★ 在**持锁期间**记签名：别的实例要写也得先拿锁，不会出现"签名其实是别人的"这种错位。
+      this.diskSig = await this._statSig().catch(() => null)
       // ★ 基线更新为"刚合并并落盘的这份"：下一次 save 才判断得准
       this.recordBaseline()
 
@@ -397,6 +524,15 @@ export class MemoryStore {
       sessionId: sessionId || null,
     }
     if (dormantUnscoped) rec.dormantUnscoped = true // 回执要如实说出来（不许静默）
+    if (taskId) {
+      // ★ V6-21：只有"存在 open 图 + 调用者就是创建者会话"时才自动补 task 标签。
+      //   `taskId` 同时是通用分组（生产里 125 条字段-only 并不是图），不能一概打标签。
+      const g = this.findOpenTask(taskId)
+      if (g && sessionId && g.sessionId === sessionId) {
+        const t = `${TASK_TAG_PREFIX}${taskId}`
+        if (!rec.tags.includes(t)) rec.tags.push(t)
+      }
+    }
     this.memories.set(id, rec)
     // 「写纠正 + 作废旧条」必须在同一个动作里完成：
     // 否则只新建一条纠正、旧结论仍以原 source 被召回，记忆库会同时存在互相矛盾的结论。
@@ -577,8 +713,8 @@ export class MemoryStore {
    *   ① 全文当检索面：summary 8.7K 字符、detail 86K、tags 440 个 → 关键词命中数天然比小记录多；
    *   ② 它的每个 tag 都同时挂在别的记录上（实测"专属 tag = 0"）→ 不提供任何新入口，只是重复占位；
    *   ③ 召回要把它 8.7K 字符的 summary 整条带进上下文 → 每次命中都白付一次钱。
-   * 所以：**不删它、不改它**，只在排序时把它降权 —— 让"精确的小记录"先说话，
-   * 而当查询确实只有它能匹配时，它照样召得回（降权不是过滤）。
+   * 所以：**不删它、不改它**，默认把它挡在召回之外（`includeArchives:true` 才放回），
+   * 需要看时用 `open(id)` 或显式标签查 —— 错召回一次就会吃掉大量上下文。
    *
    * 判定用"体积/标记"这种可机械核对的量，不靠语义：
    *   - 显式标记 `archiveOf` 或 tag `session-archive`（新归档会打）
@@ -592,10 +728,15 @@ export class MemoryStore {
     return String(m.detail || '').length >= ARCHIVE_LIKE_DETAIL_CHARS || tags.length >= ARCHIVE_LIKE_TAGS
   }
 
-  recall({ query, tags, taskId, sessionId, mode, limit }) {
+  recall({ query, tags, taskId, sessionId, mode, limit, includeArchives = false }) {
     let list = [...this.memories.values()]
     list = list.filter((m) => m.source !== 'deprecated') // 废弃的错误内容不召回
-    if (taskId) list = list.filter((m) => m.taskId === taskId)
+    // ★ V6-21 P2：会话存档默认不进召回（存档是给人回看的快照，不是模型查询入口）。
+    if (!includeArchives) list = list.filter((m) => !this.isArchiveLike(m))
+    if (taskId) {
+      const tag = `${TASK_TAG_PREFIX}${taskId}`
+      list = list.filter((m) => m.taskId === taskId || (m.tags || []).includes(tag))
+    }
     if (tags && tags.length) {
       list = list.filter((m) => tags.every((t) => (m.tags || []).includes(t)))
     }
@@ -673,6 +814,11 @@ export class MemoryStore {
     if (!m) return null
     m.recency = Date.now()
     await this.save()
+    // ★ V6-21：任务图 open 返回**读时投影**（不写回 detail，避免副本与陈旧）。
+    if ((m.tags || []).includes(TASK_GRAPH_TAG) && m.task) {
+      const brief = this.renderTaskBrief(m.task.id)
+      if (brief) return { ...m, detail: brief }
+    }
     return m
   }
 
@@ -947,19 +1093,32 @@ export class MemoryStore {
       (m) => m.layer === 'short' && (m.sessionId || '__unassigned__') === scope
     )
     const group = inScope.filter((m) => !isArchiveProtected(m, openTaskIds))
+    // ★ V6-21 P2：会话存档要"完整"到任务层面 —— 把该会话**已收尾、尚未入过档**的 task-result
+    //   作为"任务"一节收进来。只收任务结论，不复制成员正文（成员在收尾时已经转 cold）。
+    const taskResults = [...this.memories.values()].filter(
+      (m) =>
+        m.layer === 'hot' &&
+        (m.tags || []).includes(TASK_RESULT_TAG) &&
+        (m.sessionId || '__unassigned__') === scope &&
+        m.archivedIn !== scope
+    )
     if (report && typeof report === 'object') {
       report.total = inScope.length
       report.protected = inScope.length - group.length
       report.archived = group.length
+      report.tasks = taskResults.length
     }
-    if (group.length === 0) return null
+    if (group.length === 0 && taskResults.length === 0) return null
     const summary =
-      newSummary || group.map((m) => m.summary).filter(Boolean).join('；')
-    const detail = group
-      .map((m) => `[${m.id} v${m.version}] ${m.detail || ''}`)
+      newSummary ||
+      [...group, ...taskResults].map((m) => m.summary).filter(Boolean).join('；')
+    const groupDetail = group.map((m) => `[${m.id} v${m.version}] ${m.detail || ''}`).join('\n\n')
+    const taskDetail = taskResults
+      .map((m) => `[任务 ${m.taskId || '?'}] ${m.summary}\n${m.detail || ''}`)
       .join('\n\n')
-    const tags = [...new Set(group.flatMap((m) => m.tags || []))]
-    const maxWeight = group.reduce(
+    const detail = [groupDetail, taskDetail].filter(Boolean).join('\n\n')
+    const tags = [...new Set([...group, ...taskResults].flatMap((m) => m.tags || []))]
+    const maxWeight = [...group, ...taskResults].reduce(
       (a, m) => Math.max(a, SALIENCE_WEIGHT[m.salience] || 2),
       0
     )
@@ -989,6 +1148,8 @@ export class MemoryStore {
       m.layer = 'cold'
       m.version += 1
     }
+    // 任务结论只记"已入过档"（保持 hot：图/召回仍可指向它），避免下次归档重复收
+    for (const m of taskResults) m.archivedIn = scope
     this.memories.set(consolidated.id, consolidated)
     await this.save()
     return consolidated
@@ -1084,14 +1245,20 @@ export class MemoryStore {
    * 单写者是这里唯一能保证"回执不丢"的简单做法。
    */
 
-  /** 找到一张**未收尾**的任务图（按 taskId）。 */
-  findOpenTask(taskId) {
+  /** 找到一张任务图（open 或 closed 都算）。 */
+  findTaskGraph(taskId) {
     const tag = `${TASK_TAG_PREFIX}${taskId}`
     for (const m of this.memories.values()) {
       const tags = m.tags || []
-      if (tags.includes(TASK_GRAPH_TAG) && tags.includes(TASK_OPEN_TAG) && tags.includes(tag) && m.task) return m
+      if (tags.includes(TASK_GRAPH_TAG) && tags.includes(tag) && m.task) return m
     }
     return null
+  }
+
+  /** 找到一张**未收尾**的任务图（按 taskId）。 */
+  findOpenTask(taskId) {
+    const g = this.findTaskGraph(taskId)
+    return g && (g.tags || []).includes(TASK_OPEN_TAG) ? g : null
   }
 
   /** 任务图的展示文本（每次更新后重渲染，让 recall 一眼看到进度）。 */
@@ -1104,6 +1271,9 @@ export class MemoryStore {
           (a.note ? `（${a.note}）` : '')
       )
     }
+    if (task.links?.length) lines.push(`前序：${task.links.map((l) => `${l.taskId}（${l.relation}）`).join('、')}`)
+    if (task.done?.length) lines.push(`已完成：${task.done.length} 条`)
+    if (task.uses?.length) lines.push(`依赖：${task.uses.length} 条`)
     if (task.notes) lines.push(`备注：${task.notes}`)
     lines.push(`任务 id：${task.id}（未收尾）`)
     return lines.join('\n')
@@ -1113,7 +1283,7 @@ export class MemoryStore {
    * 开一张任务图。**只该由主模型调用。**
    * @returns `{ok:true, taskId, graphId, assignments}` 或 `{ok:false, reason}`
    */
-  async openTask({ goal, assignments = [], notes = '', sessionId = null } = {}) {
+  async openTask({ goal, assignments = [], notes = '', links = [], sessionId = null } = {}) {
     await this.ensureLoaded()
     const g = String(goal || '').trim()
     if (!g) return { ok: false, reason: 'goal 不能为空' }
@@ -1128,7 +1298,46 @@ export class MemoryStore {
     const newId = `t-${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`
     const now = Date.now()
     const tag = `${TASK_TAG_PREFIX}${newId}`
-    const task = { id: newId, goal: g, notes: String(notes || ''), assignments: cleaned, openedAt: now, lastActivityAt: now }
+
+    // ★ V6-21：前序图链接（单向；不改旧图）。`why` 必填 —— 链接要写"为什么接上它"，
+    //   不是旧图的内容摘要（旧图本身就是结论）。
+    const cleanedLinks = []
+    let linkTruncated = false
+    for (const l of Array.isArray(links) ? links : []) {
+      const targetId = String(l?.taskId || '').trim()
+      if (!targetId) return { ok: false, reason: 'links 每项都要有 taskId' }
+      if (targetId === newId) return { ok: false, reason: '不能链接自己' }
+      if (cleanedLinks.some((x) => x.taskId === targetId)) {
+        return { ok: false, reason: `links 里重复链接 ${targetId}` }
+      }
+      const target = this.findTaskGraph(targetId)
+      if (!target) {
+        return { ok: false, reason: `links 指向的 ${targetId} 不是任务图` }
+      }
+      const relation = String(l?.relation || 'related').trim()
+      if (!TASK_LINK_RELATIONS.includes(relation)) {
+        return { ok: false, reason: `links 的 relation 只能是 ${TASK_LINK_RELATIONS.join(' / ')}` }
+      }
+      const why = clipText(l?.why, TASK_LINK_WHY_MAX)
+      if (!why.text) return { ok: false, reason: 'links 的 why 必填（为什么链接这张图）' }
+      if (why.truncated) linkTruncated = true
+      cleanedLinks.push({ taskId: targetId, relation, why: why.text })
+    }
+    if (cleanedLinks.length > TASK_LINKS_MAX) {
+      return { ok: false, reason: `links 最多 ${TASK_LINKS_MAX} 条` }
+    }
+
+    const task = {
+      id: newId,
+      goal: g,
+      notes: String(notes || ''),
+      assignments: cleaned,
+      done: [],
+      uses: [],
+      links: cleanedLinks,
+      openedAt: now,
+      lastActivityAt: now,
+    }
     const rec = {
       id: randomUUID(),
       taskId: null,
@@ -1146,7 +1355,15 @@ export class MemoryStore {
     }
     this.memories.set(rec.id, rec)
     await this.save()
-    return { ok: true, taskId: newId, graphId: rec.id, assignments: cleaned.map((a) => a.id), ownerSession: rec.sessionId }
+    return {
+      ok: true,
+      taskId: newId,
+      graphId: rec.id,
+      assignments: cleaned.map((a) => a.id),
+      links: cleanedLinks.map((x) => x.taskId),
+      linkTruncated,
+      ownerSession: rec.sessionId,
+    }
   }
 
   /**
@@ -1170,6 +1387,18 @@ export class MemoryStore {
       if (!(h.tags || []).includes(`${TASK_TAG_PREFIX}${taskId}`)) {
         return { ok: false, reason: `handoffId ${handoffId} 不属于任务 ${taskId}` }
       }
+      // ★ V6-07（2026-10-21）：交接记录必须**标明属于哪个分工**。
+      //   只校验"属于本图"时，同一个 handoff 能同时交给 p1/p2/p3 ——
+      //   "谁交付了什么"就只剩正文里的手写说明，机械层面无法核对。
+      const assignTag = `assign:${a.id}`
+      if (!(h.tags || []).includes(assignTag)) {
+        return {
+          ok: false,
+          reason:
+            `handoffId ${handoffId} 缺 ${assignTag} 标签（交接记录必须标明属于哪个分工；` +
+            `同一 handoff 不能交给多个分工）`,
+        }
+      }
       a.handoffId = String(handoffId)
     }
     a.status = st
@@ -1180,6 +1409,181 @@ export class MemoryStore {
     graph.detail = this.renderTaskGraph(graph.task)
     await this.save()
     return { ok: true, taskId, assign: a.id, status: a.status, handoffId: a.handoffId, graphVersion: graph.version }
+  }
+
+  /**
+   * ★ V6-21：追加一条**已完成里程碑**（只追加，不整表替换）。
+   * `memoryId` 可选：有产物/证据时指向那条记忆（它必须带本任务的 tag）。
+   */
+  async appendTaskDone({ taskId, text, memoryId = null, sessionId = null } = {}) {
+    await this.ensureLoaded()
+    const graph = this.findOpenTask(taskId)
+    if (!graph) return { ok: false, reason: `找不到未收尾的任务 ${taskId}` }
+    if (graph.sessionId && sessionId && graph.sessionId !== sessionId) {
+      return { ok: false, reason: '只有创建这张任务图的会话能更新它（单写者）' }
+    }
+    const clipped = clipText(text, TASK_DONE_TEXT_MAX)
+    if (!clipped.text) return { ok: false, reason: 'text 不能为空' }
+    let id = null
+    if (memoryId) {
+      const m = this.memories.get(String(memoryId))
+      if (!m) return { ok: false, reason: `memoryId ${memoryId} 不存在` }
+      if (!(m.tags || []).includes(`${TASK_TAG_PREFIX}${taskId}`)) {
+        return { ok: false, reason: `memoryId ${memoryId} 不属于任务 ${taskId}` }
+      }
+      id = m.id
+    }
+    const now = Date.now()
+    graph.task.done = Array.isArray(graph.task.done) ? graph.task.done : []
+    graph.task.done.push({ text: clipped.text, at: now, ...(id ? { id } : {}) })
+    graph.version += 1
+    graph.recency = now
+    graph.task.lastActivityAt = now
+    graph.detail = this.renderTaskGraph(graph.task)
+    await this.save()
+    return { ok: true, taskId, doneCount: graph.task.done.length, truncated: clipped.truncated }
+  }
+
+  /**
+   * ★ V6-21：登记"本任务依赖的既有记忆"（调取已有结论/外部输入）。
+   * 只存 `{id, why?}`：外部性/作废状态读时从记忆现取，**不复制**。
+   */
+  async citeTaskMemories({ taskId, ids = [], why = '', sessionId = null } = {}) {
+    await this.ensureLoaded()
+    const graph = this.findOpenTask(taskId)
+    if (!graph) return { ok: false, reason: `找不到未收尾的任务 ${taskId}` }
+    if (graph.sessionId && sessionId && graph.sessionId !== sessionId) {
+      return { ok: false, reason: '只有创建这张任务图的会话能更新它（单写者）' }
+    }
+    const list = [...new Set((Array.isArray(ids) ? ids : []).map((x) => String(x || '').trim()).filter(Boolean))]
+    if (!list.length) return { ok: false, reason: 'ids 不能为空' }
+    for (const id of list) {
+      const m = this.memories.get(id)
+      if (!m) return { ok: false, reason: `记忆 ${id} 不存在` }
+      if ((m.tags || []).includes(TASK_GRAPH_TAG)) {
+        return { ok: false, reason: `${id} 是任务图；任务图请用 links 链接，不要放进 uses` }
+      }
+    }
+    const clipped = clipText(why, TASK_USE_WHY_MAX)
+    graph.task.uses = Array.isArray(graph.task.uses) ? graph.task.uses : []
+    const existing = new Set(graph.task.uses.map((u) => u.id))
+    const fresh = list.filter((id) => !existing.has(id))
+    const skipped = list.length - fresh.length
+    if (graph.task.uses.length + fresh.length > TASK_USES_MAX) {
+      return { ok: false, reason: `uses 最多 ${TASK_USES_MAX} 条（已有 ${graph.task.uses.length}）` }
+    }
+    for (const id of fresh) graph.task.uses.push({ id, ...(clipped.text ? { why: clipped.text } : {}) })
+    if (fresh.length) {
+      const now = Date.now()
+      graph.version += 1
+      graph.recency = now
+      graph.task.lastActivityAt = now
+      graph.detail = this.renderTaskGraph(graph.task)
+      await this.save()
+    }
+    return { ok: true, taskId, added: fresh.length, skipped, usesCount: graph.task.uses.length, truncated: clipped.truncated }
+  }
+
+  /**
+   * ★ V6-21：`open(图)` 的**读时投影**：目标/前序/已完成/依赖/重要结论/其他引用/分工。
+   * 不复制结论正文 —— 结论就是带 `task:<id>` 标签的记忆，这里只列 id + summary。
+   */
+  renderTaskBrief(taskId) {
+    const graph = this.findTaskGraph(taskId)
+    if (!graph) return null
+    const task = graph.task || {}
+    const isOpen = (graph.tags || []).includes(TASK_OPEN_TAG)
+    const lines = [`任务 ${taskId}［${isOpen ? 'open' : 'closed'}］`, `目标：${task.goal || ''}`]
+
+    if (Array.isArray(task.links) && task.links.length) {
+      lines.push('', `前序（${task.links.length}）：`)
+      for (const l of task.links) {
+        const old = this.findTaskGraph(l.taskId)
+        const state = old ? ((old.tags || []).includes(TASK_OPEN_TAG) ? 'open' : 'closed') : '已删除'
+        const when = old ? new Date(old.createdAt).toISOString().slice(0, 10) : '?'
+        lines.push(`- ${l.taskId}［${state} ${when}］— ${l.relation} — 为什么：${l.why}`)
+      }
+    }
+
+    if (Array.isArray(task.done) && task.done.length) {
+      const shown = task.done.slice(-TASK_DONE_RENDER_MAX)
+      lines.push('', `已完成（${task.done.length}）：`)
+      for (const d of shown) {
+        const when = new Date(d.at).toISOString().slice(0, 10)
+        lines.push(`- ${when} ${d.text}` + (d.id ? `（${d.id}）` : ''))
+      }
+      if (task.done.length > shown.length) lines.push(`- …另有 ${task.done.length - shown.length} 条`)
+    }
+
+    if (Array.isArray(task.uses) && task.uses.length) {
+      lines.push('', `依赖（${task.uses.length}）：`)
+      for (const u of task.uses) {
+        const m = this.memories.get(u.id)
+        const src = m ? (m.source === 'external' ? '外部' : '内部') : '已删除'
+        const dead = !m ? '（已删除）' : m.source === 'deprecated' ? '（已作废）' : ''
+        const cross = m && m.taskId && m.taskId !== taskId ? `［来自任务 ${m.taskId}］` : ''
+        lines.push(`- ［${src}］${u.why || '（未注明）'}（${u.id}）${cross}${dead}`)
+      }
+    }
+
+    const members = [...this.memories.values()].filter(
+      (m) => m.id !== graph.id && (m.tags || []).includes(`${TASK_TAG_PREFIX}${taskId}`)
+    )
+    const isArchive = (m) => Boolean(m.archiveOf) || (m.tags || []).includes('session-archive')
+    const archives = members.filter(isArchive)
+    const live = members.filter((m) => !isArchive(m))
+    const doneIds = new Set((task.done || []).map((d) => d.id).filter(Boolean))
+    const handoffIds = new Set((task.assignments || []).map((a) => a.handoffId).filter(Boolean))
+    const conclusions = live
+      .filter((m) => (m.tags || []).includes(TASK_CONCLUSION_TAG))
+      .sort((a, b) => a.createdAt - b.createdAt)
+    const results = live.filter((m) => (m.tags || []).includes(TASK_RESULT_TAG))
+    const others = live.filter(
+      (m) =>
+        !(m.tags || []).includes(TASK_CONCLUSION_TAG) &&
+        !(m.tags || []).includes(TASK_RESULT_TAG) &&
+        !handoffIds.has(m.id) &&
+        !doneIds.has(m.id)
+    )
+
+    if (conclusions.length) {
+      lines.push('', `重要结论（${conclusions.length}）：`)
+      for (const m of conclusions) {
+        const dead = m.source === 'deprecated' ? '（已作废）' : m.supersededBy ? '（已被取代）' : ''
+        lines.push(`- [${new Date(m.createdAt).toISOString().slice(0, 10)}] ${m.summary}（${m.id}）${dead}`)
+      }
+    }
+    if (results.length) {
+      lines.push('', `收尾结论（${results.length}）：`)
+      for (const m of results) lines.push(`- ${m.summary}（${m.id}）`)
+    }
+    if (others.length) {
+      const shown = others.slice(0, 8)
+      lines.push('', `其他引用（${others.length}）：`)
+      for (const m of shown) {
+        const dead = m.source === 'deprecated' ? '（已作废）' : ''
+        lines.push(`- ${m.summary}（${m.id}）${dead}`)
+      }
+      if (others.length > shown.length) {
+        lines.push(`- …另有 ${others.length - shown.length} 条（用 recall taskId 取全）`)
+      }
+    }
+    if (archives.length) {
+      lines.push('', `会话存档（${archives.length}）：${archives.map((a) => a.id).join('、')}`)
+    }
+
+    if (Array.isArray(task.assignments) && task.assignments.length) {
+      lines.push('', '分工：')
+      for (const a of task.assignments) {
+        lines.push(
+          `- ${a.id}［${a.status}］${a.task}` +
+            (a.handoffId ? ` → handoff ${a.handoffId}` : '') +
+            (a.note ? `（${a.note}）` : '')
+        )
+      }
+    }
+    if (task.notes) lines.push('', `备注：${task.notes}`)
+    return lines.join('\n')
   }
 
   /**
@@ -1223,6 +1627,16 @@ export class MemoryStore {
       .filter((a) => a.status === 'pending' || !a.handoffId)
       .map((a) => ({ id: a.id, task: a.task, status: a.status }))
 
+    // ★ V6-07：有 handoff 但缺 assign 标签的分工 —— 历史用法会在这里现形。
+    //   不阻断收尾（否则那 5 张旧图永远收不了），列为警告写进结论。
+    const unlabeledHandoffs = (task.assignments || [])
+      .filter((a) => {
+        if (!a.handoffId) return false
+        const h = this.memories.get(a.handoffId)
+        return !h || !(h.tags || []).includes(`assign:${a.id}`)
+      })
+      .map((a) => ({ id: a.id, handoffId: a.handoffId }))
+
     const rolled = (task.assignments || []).map((a) => ({
       assign: a.id,
       status: a.status,
@@ -1253,6 +1667,20 @@ export class MemoryStore {
         ? `■ 未完成（${missing.length}）：${missing.map((m) => m.id).join(', ')}`
         : '■ 每个分工都有回执',
       '',
+      ...(unlabeledHandoffs.length
+        ? [
+            `■ 交接缺 assign 标签（${unlabeledHandoffs.length}）：${unlabeledHandoffs.map((x) => x.id).join(', ')}`,
+            '  （历史遗留；v1.6 起 task_update 会拒绝这类交接——同一个 handoff 不能交给多个分工）',
+            '',
+          ]
+        : []),
+      ...(task.links?.length
+        ? ['', `■ 前序图（${task.links.length}）：${task.links.map((l) => `${l.taskId}（${l.relation}）`).join('、')}`, '']
+        : []),
+      ...(task.uses?.length
+        ? ['', `■ 依赖（${task.uses.length}）：${task.uses.map((u) => u.id).join(', ')}`, '']
+        : []),
+      ...(task.done?.length ? ['', `■ 已完成里程碑（${task.done.length}）`, ''] : []),
       keptScratch.length
         ? `■ 保留的中间结果（${keptScratch.length}）：\n${keptScratch.map((m) => `- ${m.id}：${String(m.summary || '').slice(0, 80)}`).join('\n')}`
         : '■ 无保留的中间结果',
@@ -1286,7 +1714,10 @@ export class MemoryStore {
     if (expired && !graph.tags.includes(TASK_EXPIRED_TAG)) graph.tags.push(TASK_EXPIRED_TAG)
     graph.version += 1
     graph.recency = now
-    for (const m of [graph, ...handoffs, ...keptScratch]) {
+    // ★ V6-21：收尾即把**全部成员**转冷（permanent 除外）——任务档案不再属于会话短时工作集。
+    //   archiveSession 只收 short，所以不会把任务成员吞进会话存档，id 保持个体可寻址。
+    for (const m of [graph, ...members]) {
+      if (m.layer === 'permanent') continue
       m.layer = 'cold'
       m.version += 1
     }
@@ -1300,11 +1731,15 @@ export class MemoryStore {
       longTermId: consolidated.id,
       rolled,
       missing,
+      unlabeledHandoffs,
       discarded: {
         count: discarded.length,
         items: discarded.slice(0, 5).map((m) => ({ id: m.id, summary: String(m.summary || '').slice(0, 60) })),
       },
       keptScratch: keptScratch.length,
+      doneCount: (task.done || []).length,
+      usesCount: (task.uses || []).length,
+      linksCount: (task.links || []).length,
       ...(expired ? { expired: true, idleHours } : {}),
     }
   }
