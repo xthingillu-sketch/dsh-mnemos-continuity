@@ -5,7 +5,7 @@
 import {
   MemoryStore, isArchiveProtected, collectOpenTaskIds,
   TASK_TAG_PREFIX, TASK_GRAPH_TAG, TASK_OPEN_TAG, TASK_CLOSED_TAG,
-  TASK_RESULT_TAG, TASK_SCRATCH_TAG, TASK_KEEP_TAG, TASK_EXPIRED_TAG, DEFAULT_TASK_OPEN_MAX_MS,
+  TASK_RESULT_TAG, TASK_SUMMARY_TAG, TASK_SCRATCH_TAG, TASK_KEEP_TAG, TASK_EXPIRED_TAG, DEFAULT_TASK_OPEN_MAX_MS,
   TASK_DONE_TEXT_MAX, TASK_USES_MAX,
 } from '../src/store.js'
 import { ConstitutionStore } from '../src/constitution.js'
@@ -54,7 +54,7 @@ import {
   normalizeToolValue, withToolOutputGate,
 } from '../src/tool-output.js'
 import {
-  rememberResult, recallResult, validateResult, constitutionResult, deleteResult,
+  rememberResult, recallResult, validateResult, curationResult, constitutionResult, deleteResult,
   deprecateResult, dormantResult, openResult, consolidateResult, heartbeatResult, learnerKickResult,
   maintenanceListResult, toggleResult, proposeSkillResult,
   taskOpenResult, taskUpdateResult, taskCloseResult, taskDoneResult, taskCiteResult,
@@ -532,6 +532,36 @@ console.log('== 11c. 空闲学习：那一脚怎么被送进专用会话（假 a
     assert(s1.lastKickAt === 123456 && s1.kicks === 7, '状态可写可读（重启后不会立刻再踢）')
   }
 
+  // ⑧b 并发保存 / 旧 tick 回写：不许 ENOENT，也不许把 lastKickAt 回滚
+  {
+    const sf = learnerStateFileFor(path.join(dir, 'ls-race', 'memory.json'))
+    await Promise.all(Array.from({ length: 20 }, (_, i) => saveLearnerState(sf, {
+      lastKickAt: 1000 + i,
+      kicks: i,
+      activeSessionId: 'mnemos-learner',
+      recycled: 0,
+      retired: [],
+      kicksSinceRecycle: i,
+    })))
+    const s = await loadLearnerState(sf)
+    assert(s.lastKickAt === 1019 && s.kicks === 19,
+      `★★ 并发保存不互相踩（20 次并发后 lastKickAt=${s.lastKickAt} / kicks=${s.kicks}）`)
+    await saveLearnerState(sf, {
+      lastKickAt: 500, kicks: 2, activeSessionId: 'mnemos-learner',
+      recycled: 0, retired: [], kicksSinceRecycle: 2,
+    })
+    const s2 = await loadLearnerState(sf)
+    assert(s2.lastKickAt === 1019 && s2.kicks === 19,
+      `★★ 旧 tick 的晚到回写不得把 lastKickAt 回滚（实测 ${s2.lastKickAt} / ${s2.kicks}）`)
+  }
+
+  // ⑧c tick 串行：setInterval 5min + waitIdle 10min 会重叠，必须看到 in-flight 闸门
+  {
+    const idxLearner = await fs.readFile(path.join(pluginRoot, 'src', 'index.js'), 'utf8')
+    assert(idxLearner.includes('let tickInFlight = false') && idxLearner.includes('if (tickInFlight) return'),
+      '★★ learner tick 必须有 in-flight 串行闸门（否则 10 分钟等待会叠出并发 tick）')
+  }
+
   // ⑨ 默认值自洽
   assert(DEFAULT_LEARNER_SESSION_ID === 'mnemos-learner', '专用会话默认 id 固定为 mnemos-learner（便于代码定位）')
   assert(DEFAULT_LEARNER_INTERVAL_MS === 60 * 60 * 1000, '默认间隔 1 小时（与 INSTALL/profile 一致；曾是 30 分钟，已纠正漂移）')
@@ -890,6 +920,105 @@ const compact = store.autobiographyCompact({ budget: 100 })
 assert(compact.entries[0].category === 'decision', '紧凑版决策排最前')
 const cats = compact.entries.map((e) => e.category)
 assert(cats.indexOf('ability') < cats.indexOf('event'), '能力排在事件前')
+
+console.log('== 26b. 自传体身份两段 / candidate 隔离 / 事件时间 / recall 过滤 ==')
+{
+  const s = new MemoryStore(path.join(dir, 'auto-v2.json'))
+  await s.load()
+  const core = await s.remember({
+    content: '身份核心',
+    summary: '身'.repeat(700),
+    category: 'identity',
+    source: 'autobiography',
+  })
+  assert(core.category === 'identity' && core.identityStatus === 'core', '800 预算内身份直接进 core')
+  const candidate = await s.remember({
+    content: '身份候选',
+    summary: '份'.repeat(150),
+    category: 'identity',
+    source: 'autobiography',
+  })
+  assert(candidate.identityStatus === 'candidate', '超出 800 预算的身份进 candidate')
+  const visible = s.recall({ query: '', source: 'autobiography' })
+  assert(!visible.some((m) => m.id === candidate.id), 'candidate 不进入普通召回')
+  const curation = s.recall({ query: '', source: 'autobiography', includeCandidates: true })
+  assert(curation.some((m) => m.id === candidate.id), '身份整理入口能读到 candidate')
+
+  const event = await s.remember({
+    content: '事件正文',
+    summary: '事件卡',
+    category: 'event',
+    occurredAt: '2026-10-23T20:33:00+08:00',
+    source: 'autobiography',
+  })
+  assert(event.category === 'event' && typeof event.occurredAt === 'number', 'event 保留 occurredAt')
+  const freeDecision = await s.remember({
+    content: '无图决策', summary: '无图决策', category: 'decision', source: 'autobiography',
+  })
+  assert(freeDecision.origin?.kind === 'session' && freeDecision.origin?.pending === true, '无任务图时自传体 origin 记 session pending')
+  s.memories.set('legacy-auto', {
+    id: 'legacy-auto', tags: ['decision'], summary: '旧数据决策', detail: '',
+    layer: 'permanent', salience: 'normal', recency: Date.now(), createdAt: Date.now(),
+    version: 1, source: 'autobiography', category: 'decision', sessionId: null,
+  })
+  const legacyHit = s.recall({ query: '旧数据决策', limit: 50 }).find((m) => m.id === 'legacy-auto')
+  assert(legacyHit?.originKind === 'legacy', '旧数据缺 origin 时读侧回退 legacy')
+  const timeline = s.selfTimelineRecord()
+  assert(timeline && timeline.tags.includes('self-timeline'), 'event 写入后生成 self-timeline 索引')
+  assert(timeline.detail.includes(event.id) && timeline.detail.includes('2026-10-23'), 'timeline 行含事件 id 与时间')
+  const timelineHits = s.recall({ query: '', tags: ['self-timeline'], limit: 5 })
+  assert(timelineHits.some((m) => m.id === timeline.id), 'self-timeline 可按标签召回')
+  await s.delete(event.id)
+  assert(!s.selfTimelineRecord().detail.includes(event.id), '删除 event 后 timeline 同步移除')
+  // 反例：普通记忆也可以带 self-timeline 标签，但不能被误当索引覆盖。
+  const decoy = await s.remember({ content: '普通记忆', summary: '干扰项', tags: ['self-timeline'] })
+  const event2 = await s.remember({
+    content: '第二个事件', summary: '第二事件卡', category: 'event',
+    occurredAt: '2026-10-24T09:00:00+08:00', source: 'autobiography',
+  })
+  assert(s.selfTimelineRecord().id === timeline.id, '重建只更新带 self-timeline-index 的索引')
+  assert(s.memories.get(decoy.id).summary === '干扰项', '带 self-timeline 的普通记忆不被覆盖')
+  assert(s.selfTimelineRecord().detail.includes(event2.id), '新 event 进入同一个索引')
+  // 事件有真实任务图时，timeline 优先指向任务图 taskId；没有图才退回 event id。
+  s.memories.set('graph-test', {
+    id: 'graph-test', tags: ['task-graph', 'task:t-test', 'open'],
+    task: { id: 't-test', goal: '测试图', assignments: [] },
+    summary: '任务图', detail: '', source: 'internal', layer: 'short',
+    createdAt: Date.now(), recency: Date.now(), version: 1,
+  })
+  const event3 = await s.remember({
+    content: '任务内事件', summary: '任务内事件卡', taskId: 't-test',
+    category: 'event', occurredAt: '2026-10-24T10:00:00+08:00', source: 'autobiography',
+  })
+  assert(event3.ref === 't-test', 'event.ref 优先任务图 id')
+  assert(s.selfTimelineRecord().detail.includes('t-test'), 'timeline 行优先使用任务图 id')
+
+  for (let i = 0; i < 5; i++) {
+    await s.remember({
+      content: `决策 ${i}`, summary: `决策 ${i}`,
+      category: 'decision', source: 'autobiography',
+    })
+  }
+  const page1 = s.recall({ query: '', category: 'decision', limit: 2, offset: 0 })
+  const page2 = s.recall({ query: '', category: 'decision', limit: 2, offset: 2 })
+  assert(page1.length === 2 && page2.length === 2 && page1[0].id !== page2[0].id, 'recall category + offset 可分页')
+
+  for (let i = 0; i < 5; i++) {
+    await s.remember({
+      content: `经验 ${i}`, summary: `经验 ${i}`,
+      tags: ['important-experience'],
+      category: 'experience', source: 'autobiography',
+    })
+  }
+  const shadow = s.autobiographyCompactV2()
+  const shadowCats = shadow.entries.map((e) => e.category)
+  assert(shadowCats.filter((c) => c === 'identity').length === 1, 'V2：identity core 注入，candidate 不注入')
+  assert(shadowCats.filter((c) => c === 'decision').length === 3, 'V2：只取最近 3 条 decision')
+  assert(shadowCats.filter((c) => c === 'experience').length === 5, 'V2：重要经验最多 5 条')
+  assert(!shadowCats.includes('event'), 'V2：event 不固定注入')
+  assert(shadow.unselectedByCategory.decision >= 2, 'V2：未注入的 decision 计入 unselected')
+  assert(shadow.candidates === 1, 'V2：candidate 单独计数且不参与注入')
+}
 
 console.log('== 27. 宪法（初始化 + 密码 + 审计日志）==')
 const con = new ConstitutionStore(path.join(dir, 'constitution.json'))
@@ -3818,39 +3947,35 @@ console.log('== 92. ★★ F-7 决策占满预算时，ability/event 仍有保�
   )
 }
 
-console.log('== 93. ★ F-12 自传体段：有未注入 → 一行实数提示；全部注入 → 不出现 ==')
+console.log('== 93. ★ F-12 V2 自传体段：有未注入 → 一行实数提示；全部注入 → 不出现 ==')
 {
   const budget93 = 150
   const f12 = new MemoryStore(path.join(dir, 'x93', 'memory.json'))
-  // 6 条 × 60 字 = 360 字，预算 150 → 必然装不下（都是「其他」类，不带三类 tag）
-  for (let i = 0; i < 6; i++) {
-    await f12.remember({ content: 'e', summary: 'S' + i + '：' + 'x'.repeat(57), tags: [], source: 'autobiography' })
+  // V2 固定最近 3 条 decision；第 4 条进 unselected。
+  for (let i = 0; i < 4; i++) {
+    await f12.remember({ content: 'e', summary: 'S' + i + '：' + 'x'.repeat(57), category: 'decision', source: 'autobiography' })
   }
   const con93 = new ConstitutionStore(path.join(dir, 'x93-constitution', 'constitution.json'))
   const text93 = buildSelfText(con93, f12, budget93)
-  const compact93 = f12.autobiographyCompact({ budget: budget93 })
+  const compact93 = f12.autobiographyCompactV2()
   const marker93 = '【自传体 · 尚未注入】'
-  // 预算 150 / floor = min(200, 22, 37) = 22 → other 类拿到 22 保底，能装 1 条 60 字？不能（60>22）→ 0 条。
-  // 若一条都装不下，自传体段整段不出现 —— 那种情况 F-12 就无从提示。所以这里断言"必须有条目进来"，
-  // 这是提示行能出现的前提（也是"预算太小时应该报错/调大"的真实边界）。
   const anyIn = compact93.entries.length > 0
-  assert(anyIn, `★ F-12 前置：预算 ${budget93} 下至少注入了 1 条（实测 ${compact93.entries.length} 条，否则整段不出现、提示行无处可挂）`)
+  assert(anyIn, `★ F-12 前置：V2 至少注入了 1 条（实测 ${compact93.entries.length} 条）`)
   assert(text93.includes(marker93), `★★ [F12] 有未注入条目时必须出现提示行（实测 ${text93.includes(marker93)}）`)
   const realN93 = compact93.unselected
   assert(realN93 > 0 && text93.includes(`另有 ${realN93} 条自传体`), `★★ F-12：N 是**实数**（store 实测 ${realN93}；文本里是 ${text93.includes('另有 ' + realN93 + ' 条') ? '同一个数' : '（不一致！）'}）`)
-  assert(text93.includes(`本段只受 ${budget93} 字符预算约束`), `★ F-12：提示里的预算是**真实生效值** ${budget93}（不是写死的占位）`)
+  assert(!text93.includes('本段只受'), '★ F-12：V2 不再声称固定总量预算（分项约束）')
   const line93 = text93.split('\n').find((l) => l.includes(marker93)) || ''
   assert(
     line93.includes('mnemos_recall') && line93.includes('不要凭印象认为没记过'),
     `★ F-12：提示同时给出召回指引（实测行：${line93.slice(0, 80)}…）`
   )
   assert(line93.indexOf('**') === -1, '★★ F-12：提示行是纯文本，不含字面星号')
-  // 反例核对：这条断言本身有判别力（把提示行从文本里删掉就必须不通过）
   assert(!text93.replace(marker93, '').includes(marker93), '★ F-12 反例核对：去掉标记后检测不到（断言不是恒真）')
 
   // ── 全部注入 → 提示行**不出现** ──
   const fit93 = new MemoryStore(path.join(dir, 'x93fit', 'memory.json'))
-  await fit93.remember({ content: 'e', summary: '短的', tags: [], source: 'autobiography' })
+  await fit93.remember({ content: 'e', summary: '短的', category: 'decision', source: 'autobiography' })
   const con93b = new ConstitutionStore(path.join(dir, 'x93fit-constitution', 'constitution.json'))
   const text93b = buildSelfText(con93b, fit93, budget93)
   assert(
@@ -3858,7 +3983,7 @@ console.log('== 93. ★ F-12 自传体段：有未注入 → 一行实数提示�
     '★ F-12 前置：全部装得下时自传体段照常注入'
   )
   assert(!text93b.includes(marker93), '★★ F-12：全部注入时**不出现**那一行（不许永远挂着一句吓人的提示）')
-  assert(fit93.autobiographyCompact({ budget: budget93 }).unselected === 0, '★ F-12：该场景下未注入实数确实是 0')
+  assert(fit93.autobiographyCompactV2().unselected === 0, '★ F-12：该场景下未注入实数确实是 0')
 }
 
 console.log('== 94. ★ F-5 无 sessionId：archiveSession(null) 归入 __unassigned__（不再谎报）==')
@@ -4058,16 +4183,22 @@ console.log('== 94d. 任务图（多 agent 协作）：开图 / 填回执 / 收�
   // closeTask：b 没有回执 → 如实标未完成；scratch 默认丢弃、keep 的保留
   const closed = await t.closeTask({ taskId: opened.taskId, conclusion: '资料一可信、资料二待补', sessionId: SID })
   assert(closed.ok === true && closed.longTermId, '★ 收尾成功并给出长期结论 id')
+  assert(closed.graphId === opened.graphId, '★★ 收尾回执带任务图 graphId')
   assert(closed.missing.length === 1 && closed.missing[0].id === 'b', `★★ 没有回执的分工如实标未完成（实测 ${JSON.stringify(closed.missing.map((m) => m.id))}）`)
   assert(closed.discarded.count === 1 && closed.discarded.items[0].id === scratch1.id, '★★ scratch 默认丢弃，并在回执里点名')
   assert(closed.keptScratch === 1, '★ 打了 keep 标签的 scratch 保留')
   assert(!t.memories.has(scratch1.id), '★★ 被丢弃的 scratch 真的删掉了')
   const lt = t.memories.get(closed.longTermId)
-  assert(lt.tags.includes(tag) && lt.tags.includes(TASK_RESULT_TAG) && lt.layer === 'hot', '★ 长期结论带 task 标签与 task-result 标记')
+  assert(lt.tags.includes(tag) && lt.tags.includes(TASK_RESULT_TAG) && lt.category === 'event' && lt.source === 'autobiography' && lt.layer === 'permanent', '★ 收尾摘要进自传体 event（task-result 标记保留）')
+  assert(lt.graphId === opened.graphId && lt.tags.includes(TASK_SUMMARY_TAG), '★★ 任务摘要记忆关联 graphId 且带 task-summary')
+  const summaryHit = t.recall({ query: 'V621 收尾', limit: 50 }).find((m) => m.id === closed.longTermId)
+    || t.recall({ taskId: opened.taskId, limit: 50 }).find((m) => m.id === closed.longTermId)
+  assert(summaryHit?.graphId === opened.graphId && summaryHit?.taskSummary === true, '★★ recall 命中任务摘要时返回 graphId')
   assert(lt.detail.includes('资料一可信、资料二待补') && lt.detail.includes('未完成'), '★★ 结论与未完成清单都进了长期记录')
   assert(lt.detail.includes('已丢弃的临时中间结果'), '★★ 丢弃清单也留档（不可逆操作不许悄悄发生）')
   const graph3 = t.memories.get(opened.graphId)
   assert(graph3.tags.includes(TASK_CLOSED_TAG) && !graph3.tags.includes(TASK_OPEN_TAG), '★★ 图已 open→closed')
+  assert(Number.isFinite(graph3.task.closedAt), '★ 关闭图记录 closedAt（链接显示关闭日期，不是创建日期）')
   assert(t.memories.get(h1.id).layer === 'cold' && t.memories.get(scratchKeep.id).layer === 'cold',
     '★ 交接与保留的中间结果降为冷存（可查，但不再占短时层）')
 
@@ -4206,6 +4337,18 @@ console.log('== 94f. V6-21 任务档案/寻址空间：done / uses / links / 投
   assert(u1.ok === true && u1.added === 2, '★★ cite 批量登记依赖')
   const u2 = await st.citeTaskMemories({ taskId: g.taskId, ids: [c2.id], sessionId: SID })
   assert(u2.ok === true && u2.added === 0 && u2.skipped === 1, '★ 依赖去重')
+  const autoDec = await st.remember({
+    content: '自传体决策', summary: 'V621-自传体决策', category: 'decision',
+    source: 'autobiography', taskId: g.taskId, sessionId: SID,
+  })
+  assert(autoDec.origin?.kind === 'task' && autoDec.origin?.graphId === g.graphId, '★★ 有任务图时自传体 origin 指向 graphId')
+  const u3 = await st.citeTaskMemories({ taskId: g.taskId, ids: [autoDec.id, 'skill:demo-skill'], why: '自传体+技能', sessionId: SID })
+  assert(u3.ok === true && u3.added === 2, '★★ cite 支持自传体记忆与 skill:<name>')
+  const usesNow = st.memories.get(g.graphId).task.uses
+  assert(usesNow.find((u) => u.id === autoDec.id)?.kind === 'autobiography:decision', '★★ 自传体依赖边标 kind')
+  assert(usesNow.find((u) => u.id === 'skill:demo-skill')?.kind === 'skill', '★★ 技能依赖边标 kind=skill')
+  const briefUses = await st.open(g.graphId)
+  assert(briefUses.detail.includes('自传体·决策') && briefUses.detail.includes('［技能］'), '★★ 图视图显示自传体/技能来源记号')
   const ug = await st.citeTaskMemories({ taskId: g.taskId, ids: [oldG.graphId], sessionId: SID })
   assert(ug.ok === false && String(ug.reason).includes('links'), '★ 任务图不能放进 uses（用 links）')
 
@@ -4240,10 +4383,10 @@ console.log('== 94f. V6-21 任务档案/寻址空间：done / uses / links / 投
 
   // 收尾：全部成员 cold（含 conclusion），task-result hot；再归档不吞任务成员
   const closed = await st.closeTask({ taskId: g.taskId, conclusion: 'V621 收尾', sessionId: SID })
-  assert(closed.ok === true && closed.doneCount === 2 && closed.usesCount === 2 && closed.linksCount === 1,
+  assert(closed.ok === true && closed.doneCount === 2 && closed.usesCount === 4 && closed.linksCount === 1,
     '★★ 收尾回执带 done/uses/links 计数')
   assert(st.memories.get(c1.id).layer === 'cold', '★★ 收尾把普通成员转 cold')
-  assert(st.memories.get(closed.longTermId).layer === 'hot', '★ task-result 保持 hot')
+  assert(st.memories.get(closed.longTermId).layer === 'permanent', '★ 收尾事件保持 permanent（可长期召回）')
   const rep = {}
   const arch = await st.archiveSession(SID, undefined, rep)
   assert(arch !== null && rep.tasks >= 1, '★★ 会话存档把已收尾任务作为任务节收进来（收 task-result）')
@@ -4254,6 +4397,53 @@ console.log('== 94f. V6-21 任务档案/寻址空间：done / uses / links / 投
   assert(!hitDefault.some((m) => m.id === arch?.id), '★★ 默认召回不返回会话存档（防止吃上下文）')
   const hitArchive = st.recall({ query: 'V621 收尾', includeArchives: true })
   assert(hitArchive.some((m) => m.id === arch?.id), '★ includeArchives:true 才返回存档')
+}
+
+console.log('== 94g. task_close 优先把收尾补进已有自传体事件 ==')
+{
+  const te = new MemoryStore(path.join(dir, 'x94g', 'memory.json'))
+  await te.load()
+  const sid = 'sid-94g'
+  const task = await te.openTask({ goal: '验证收尾挂事件', assignments: [], sessionId: sid })
+  const event = await te.remember({
+    content: '任务开始事件', summary: '开始：验证收尾挂事件',
+    category: 'event', source: 'autobiography', taskId: task.taskId,
+    occurredAt: '2026-10-27T10:00:00+08:00', sessionId: sid,
+  })
+  const closed = await te.closeTask({ taskId: task.taskId, conclusion: '收尾补进原事件', sessionId: sid })
+  assert(closed.ok === true && closed.longTermId === event.id, '★★ 有事件时 longTermId 指回原事件，不新建摘要')
+  const ev = te.memories.get(event.id)
+  assert(ev.endedAt && ev.closedAt && ev.graphId === task.graphId, '★★ 原事件补 endedAt/closedAt/graphId')
+  assert(ev.tags.includes(TASK_RESULT_TAG) && ev.tags.includes(TASK_SUMMARY_TAG), '★★ 原事件带 task-result/task-summary')
+  assert(ev.detail.includes('收尾补进原事件') && ev.detail.includes('任务图：'), '★★ 收尾段追加到原事件 detail，不覆盖原文')
+  const resultRecords = [...te.memories.values()].filter((m) => (m.tags || []).includes(TASK_RESULT_TAG))
+  assert(resultRecords.length === 1 && resultRecords[0].id === event.id, '★★ 不额外造第二条 task-result')
+}
+
+console.log('== 94h. applyCurationProposal：身份应用 + 历史 revision ==')
+{
+  const ta = new MemoryStore(path.join(dir, 'x94h', 'memory.json'))
+  await ta.load()
+  const keep = await ta.remember({ content: 'keep', summary: '保留身份', category: 'identity', source: 'autobiography' })
+  const repl = await ta.remember({ content: 'old', summary: '旧身份待替换', category: 'identity', source: 'autobiography' })
+  const proposal = await ta.remember({
+    content: JSON.stringify({
+      action: 'identity', keep: [keep.id],
+      replace: [{ id: repl.id, summary: '新身份', why: '测试替换', evidenceIds: [repl.id] }],
+      merge: [], add: [], remove: [],
+    }),
+    summary: '身份测试提案', tags: ['curation-proposal', 'curation:identity'], source: 'internal',
+  })
+  const applied = await ta.applyCurationProposal(proposal.id)
+  assert(applied.ok === true && applied.revisionId, '★★ applyCurationProposal 成功并产出 revision')
+  assert(ta.memories.get(repl.id).source === 'deprecated', '★★ 被替换的旧身份保留为 deprecated 历史，不删除')
+  assert(ta.memories.get(proposal.id).tags.includes('curation-applied'), '★★ proposal 标记已应用')
+  const rev = ta.memories.get(applied.revisionId)
+  assert(rev.tags.includes('identity-revision') && rev.tags.includes('curation-revision'), '★★ revision 记录身份/整理历史')
+  const revData = JSON.parse(rev.detail)
+  assert(revData.before.some((x) => x.summary === '旧身份待替换' && x.detail === 'old'), '★★ revision 保存旧身份全文，供审阅读取')
+  const active = [...ta.memories.values()].filter((m) => m.source === 'autobiography' && m.category === 'identity')
+  assert(active.length === 2 && active.some((m) => m.summary === '新身份'), '★★ 应用后身份为 keep + replace 新条')
 }
 
 console.log('== 95. ★ F-5 无 sessionId：remember({source:dormant}) 必须明确回执，不许静默回「已写入」==')
@@ -4450,7 +4640,8 @@ console.log('== 97. ★ F-4 规则⑧补全三类 + 全部提示行不含字面�
   assert(rule8.length === 1, `★ F-4 前置：规则 ⑧ 唯一可定位（实测 ${rule8.length} 行）`)
   const t8 = rule8[0] || ''
   assert(t8.includes('decision'), '★ F-4：规则 ⑧ 仍说明 decision（原有语义没被弄坏）')
-  assert(t8.includes('ability'), '★★ F-4：规则 ⑧ 含 ability（学会的能力/做法）')
+  assert(t8.includes('identity') && t8.includes('experience'), '★★ F-4：规则 ⑧ 含新五类 identity/experience')
+  assert(t8.includes('ability'), '★★ F-4：规则 ⑧ 兼容旧 ability 标签（迁移不丢）')
   assert(t8.includes('event'), '★★ F-4：规则 ⑧ 含 event（值得记的事件）')
   assert(t8.includes('其他'), '★★ F-4：规则 ⑧ 说明未分类会进「其他」类目（兜底口径写进提示词）')
   assert(t8.indexOf('**') === -1, '★ F-4：⑧ 这一条里没有字面星号')
@@ -4509,6 +4700,8 @@ console.log('== 97. ★ F-4 规则⑧补全三类 + 全部提示行不含字面�
   assert(rule24.includes('档案') || rule24.includes('寻址'), '★★ ㉔ 把图定位为任务档案/寻址空间（不是待办清单）')
   assert(rule24.includes('派活') && rule24.includes('跨会话'), '★★ ㉔ 的触发条件：派活 / 跨会话 / 多条记忆（可判定）')
   assert(rule24.includes('todo') && rule24.includes('已完成'), '★★ ㉔ 与 todo 的分工：未完成在 todo，图只记已完成里程碑')
+  assert(rule24.includes('宿主 todo') && rule24.includes('必须同时开图') && rule24.includes('开图不亏'),
+    '★★ 用到宿主 todo 就必须同时开任务图；能用 todo 的场景开图不亏')
   assert(rule24.includes('conclusion') && rule24.includes('不复制'), '★★ ㉔ 重要结论用标签标注，正文不复制进图')
   assert(rule24.includes('links') && rule24.includes('不改旧图'), '★★ ㉔ 跨会话开新图 + links，不改旧图')
   assert(rule24.includes('单步小事') && rule24.includes('别开'),
@@ -4535,7 +4728,9 @@ console.log('== 97. ★ F-4 规则⑧补全三类 + 全部提示行不含字面�
   //     合计 +211 字符。抬上限时必须在这里写明原因，否则这条断言会退化成"随加随抬"。
   //   ★ 2026-10-23 抬到 3600：任务图章节重写，补「多模型/子代理协作必须开图」、自己干的 done/cite/todo 纪律、
   //     workflow 子代理 handoff 与 null 判定；同时保留短时层/自传体/不许默认成功等旧约束。实测 3559。
-  assert(one.length < 3600, `★ 提示词预算（实测 ${one.length} 字符 / 上限 3600；去重前 3062）`)
+  //   ★ 2026-10-24 抬到 3800：自传体改为五类（identity/decision/experience/event/other），
+  //     ⑧ 补 identity/experience/occurredAt；不再为旧四类口径硬压字数。实测 3638。
+  assert(one.length < 3800, `★ 提示词预算（实测 ${one.length} 字符 / 上限 3800；去重前 3062）`)
   const taskRule = lines97.filter((l) => l.startsWith('㉔'))
   assert(taskRule.length === 1 &&
     taskRule[0].includes('多个模型或子代理协作') &&
@@ -5302,11 +5497,11 @@ if (process.env.MNEMOS_F3_NO_PERTURB === '1') {
   )
 }
 
-console.log('== 104. ★ F-15 结构性修复：19 个工具的"声明 vs 实际"共用一份形状表，且被测试盯住 ==')
+console.log('== 104. ★ F-15 结构性修复：20 个工具的"声明 vs 实际"共用一份形状表，且被测试盯住 ==')
 {
-  // ── ① 表本身：19 个工具一个不少 ──
+  // ── ① 表本身：20 个工具一个不少 ──
   const EXPECTED_TOOLS = [
-    'mnemos_remember', 'mnemos_recall', 'mnemos_validate', 'mnemos_constitution', 'mnemos_delete',
+    'mnemos_remember', 'mnemos_recall', 'mnemos_validate', 'mnemos_curate', 'mnemos_constitution', 'mnemos_delete',
     'mnemos_deprecate', 'mnemos_dormant', 'mnemos_open', 'mnemos_consolidate', 'mnemos_heartbeat',
     'mnemos_maintenance_list', 'mnemos_heartbeat_toggle', 'mnemos_propose_skill',
     // ★ 新增工具必须同时进**三处**：TOOL_OUTPUT_SPECS（形状）、index.js 的注册、以及这份清单
@@ -5316,7 +5511,7 @@ console.log('== 104. ★ F-15 结构性修复：19 个工具的"声明 vs 实际
     'mnemos_task_open', 'mnemos_task_update', 'mnemos_task_close', 'mnemos_task_done', 'mnemos_task_cite',
     'mnemos_learner_kick',
   ]
-  assert(TOOL_NAMES.length === 19, `★★ [F15] 形状表覆盖 19 个工具（实测 ${TOOL_NAMES.length}：${TOOL_NAMES.join(',')}）`)
+  assert(TOOL_NAMES.length === 20, `★★ [F15] 形状表覆盖 20 个工具（实测 ${TOOL_NAMES.length}：${TOOL_NAMES.join(',')}）`)
   assert(
     EXPECTED_TOOLS.every((t) => TOOL_NAMES.includes(t)) && TOOL_NAMES.every((t) => EXPECTED_TOOLS.includes(t)),
     '★★ [F15] 表的键集合 == 实际注册的工具集合（多一个/少一个都挂 —— 新增工具必须同时声明形状）'
@@ -5399,6 +5594,7 @@ console.log('== 104. ★ F-15 结构性修复：19 个工具的"声明 vs 实际
     mnemos_remember: rememberResult(rA, { superseded: [{ id: 'x', ok: true }], possibleSupersedes: [] }),
     mnemos_recall: recallResult(recalled),
     mnemos_validate: validateResult(false, 'subagents 服务不可用'),
+    mnemos_curate: curationResult({ ok: false, action: 'identity', reason: 'subagents 服务不可用' }),
     mnemos_constitution: constitutionResult(c104.read()),
     mnemos_delete: deleteResult(delRes),
     mnemos_deprecate: deprecateResult(depRes),
@@ -5522,13 +5718,13 @@ console.log('== 104. ★ F-15 结构性修复：19 个工具的"声明 vs 实际
     .replace(/\r\n/g, '\n')
   assert(!/schema:\s*\{/.test(idxSrc104), '★★ [F15] index.js 里**没有**任何手写的 output.schema 字面量（形状只能来自 buildOutputSchema）')
   const missingDecl = EXPECTED_TOOLS.filter((t) => !idxSrc104.includes(`buildOutputSchema('${t}')`))
-  assert(missingDecl.length === 0, `★★ [F15] 19 个工具的 output.schema 全部取自形状表（缺：${missingDecl.join(',') || '无'}）`)
+  assert(missingDecl.length === 0, `★★ [F15] 20 个工具的 output.schema 全部取自形状表（缺：${missingDecl.join(',') || '无'}）`)
   // ★ 2026-10-17：断言从"字面完全相等"放宽成"必须以闸门包裹"（允许追加选项，例如 onExecute 钩子）。
   //   本意是**不许绕过闸门**，不是不许加选项 —— 写死字面量会让合法改动误报。
   assert(
     /registerTool\(withToolOutputGate\(tool, \{ onWarn: skillWarn[,\s}]/.test(idxSrc104) &&
       !/registerTool\(make/.test(idxSrc104),
-    '★★ [F15] 19 个工具都过统一出口闸门（不许有绕过闸门的 registerTool(makeXxx(…)) 直连）'
+    '★★ [F15] 20 个工具都过统一出口闸门（不许有绕过闸门的 registerTool(makeXxx(…)) 直连）'
   )
 
   // ★ 每个工具一段块：execute 只许 return <xxx>Result(...)；render 只许读**声明过**的字段。

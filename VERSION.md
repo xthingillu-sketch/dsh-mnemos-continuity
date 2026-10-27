@@ -1,21 +1,22 @@
-# 版本标识 · Mnemos v1.6.1
+# 版本标识 · Mnemos v1.6.2
 
 | 项 | 值 |
 |---|---|
-| **版本** | **v1.6.1**（`package.json` 的 `version`）—— 见下方「版本流水」 |
+| **版本** | **v1.6.2**（`package.json` 的 `version`）—— 见下方「版本流水」 |
 | 本目录 | **当前发行副本**（可发布内容；解压后即成为 `<你的路径>\mnemos\`） |
-| 打包日期 | 2026-10-23（**npm 1.6.1 已发布；rar 本日重打**） |
-| 构成 | `src` **26 个模块** + `scripts` 4 个 + `test` 1 个 + `docs` **npm 5 件 / 发行 rar 9 件**（4 套 docx，rar 另有 4 份 pdf，外加 1 份纯 md）+ 2 个示例技能；工具 **19** 个；心跳 **8** 项 |
+| 打包日期 | 2026-10-27（**本版不发布**；只同步发行副本/网页端，未发 npm，未重打 rar） |
+| 构成 | `src` **26 个模块** + `scripts` 4 个 + `test` 1 个 + `docs` **npm 5 件 / 发行 rar 9 件**（4 套 docx，rar 另有 4 份 pdf，外加 1 份纯 md）+ 2 个示例技能；工具 **20** 个；心跳 **8** 项 |
 | 文档 | `简介-introduction`（是什么·该不该用）· `架构总览`（部件与数据流）· `architecture-机制清单`（每个机制保证什么、边界在哪）· `设计者视角`（为什么这样设计，按设计目标重写） |
-| 对应压缩包 | 本版已重打：`发行备份\current\mnemos.rar`（2026-10-23） |
-| 同版本存档 | `历史版本\v1.6.1\`（rar + VERSION） |
+| 对应压缩包 | 本版不发布，未重打 rar；如需本地归档另做 |
+| 同版本存档 | 暂不建（本版不发布） |
 
 
 ## 版本流水
 
 | 版本 | 内容 | 性质 |
 |---|---|---|
-| **v1.6.1**（本版） | **元数据修正版**：npm 1.6.0 的 `VERSION.md` 仍是发布前“未发布”文本（先 publish 后改 VERSION 的发布顺序错误）；本版只修正 `VERSION.md` 与 `package.json` 版本号，**无代码/行为变化**。测试仍 **1330 / 0** | ✅ 包：`package.json` / `VERSION.md`；文档：VERSION |
+| **v1.6.2**（本版，未发布） | **自传体 v2 + 任务图溯源 + 独立 curation**：五类自传体/身份 800 候选、V2 固定注入（身份+3决策+最多5经验）、self-timeline、任务图 task-result graphId/uses.kind/origin、收尾摘要进事件；独立 context `mnemos_curate` 自动应用并保留 revision 历史；**本版不发布**，未发 npm/rar。测试 **1379 / 0**；工具 **20**；提示词约 **3784** 字符 | ✅ 代码：`store` / `index` / `self-text` / `system-prompt` / `tool-results` / `tool-output` / `test`；文档：VERSION |
+| **v1.6.1**（历史） | **元数据修正版**：npm 1.6.0 的 `VERSION.md` 仍是发布前“未发布”文本（先 publish 后改 VERSION 的发布顺序错误）；本版只修正 `VERSION.md` 与 `package.json` 版本号，**无代码/行为变化**。测试仍 **1330 / 0** | ✅ 包：`package.json` / `VERSION.md`；文档：VERSION |
 | **v1.6.0**（历史） | **认知架构收口（已发布 2026-10-23）**：① 任务图升级为「任务档案/寻址空间」（done/uses/links + 读时投影 + 上限代码强制；新增 task_done/task_cite，工具 19）；② 技能体补入口与三档来源（失败→修好 / 记忆反复 / 外部改写；外部默认只暂存、保留需用户确认）；③ 评审状态记录 lastApplied、外部写入可见（refresh）、learner 不再误回滚换代、评审/验证解析失败三态；④ pending 台账（外来不记账、status、去重、过期清理）；⑤ 折叠快照改短期兜底（事实卡 + 提醒带 top3 + 7 天 TTL）；⑥ 系统提示 25 条 / 7 节（约 3.5k 字符；任务图独立成节、多模型协作必须开图；单步小事别开；workflow 交接纪律）。测试 **1330 / 0** | ✅ 代码：`store` / `index` / `skill-review` / `compaction-snapshot` / `system-prompt` 等；文档：README / INSTALL / 四份对外文档 |
 | **v1.5.10** | **改 npm 包名（项目名不变）**：`dsh-mnemos` 这个名字在 npm 上**已被另一个独立项目占用**（别人写的、思路不同、不是同一套代码，且发布时间更早）。按用户决定：**项目名仍叫 Mnemos**，npm 包名改为 **`dsh-mnemos-continuity`**（`continuity` 指"换会话、换模型之后判断还能接着用"）。同步改动：`cordis.patch.yml` 的 bundle `name`（**entry id 仍保留 `dsh-mnemos`**，故 profile 里的配置覆盖不用动）、INSTALL 五处命令、README 新增一段"名字说明"（含与同名项目的消歧）。本机 `desktop` profile 的 deps / bundles / junction 已改名并**重启实测通过**（工具正常、`profileContext` 正确）。历史存档不动（也不发布）。测试仍 **1225** | ✅ 包：`package.json` / `cordis.patch.yml`；文档：README / INSTALL |
 | v1.5.9 | **npm 包瘦身**：`files` 里的 `docs` 改为 `docs/*.docx` + `docs/*.md` —— **npm 包不再带 PDF**（本机 rar 仍保留完整 4 套 docx+pdf，因为那是给下载的发行包）。包体 **2.24 MB → 370.6 KB**、文件数 47 → **43**（docs 仍 5 件：4 份 docx + 1 份模块文档 md）。用户决定："有一份就够了，没必要提供两份占空间"。除此之外与 v1.5.8 完全相同（含 P0 数据目录修复）。测试仍 **1225** | ✅ 包：`package.json`（files） |
@@ -41,8 +42,8 @@
 
 ## 怎么确认这是我说的那一版
 
-1. `package.json` 的 `version` 应为 **1.6.1**；
-2. 本目录下跑 `npm test`（等价 `node test/store.test.js`）应为 **1330 通过 / 0 失败**；
+1. `package.json` 的 `version` 应为 **1.6.2**；
+2. 本目录下跑 `npm test`（等价 `node test/store.test.js`）应为 **1379 通过 / 0 失败**；
 3. 启动日志（`<profile>\mnemos\mnemos.log`）的「解析依据」第一段应是 **`profileContext=<该 profile 目录>`** ——
    若第一依据还是 `DSH_PROFILE_DIR`/`cwd`，说明跑的是 v1.5.8 之前的代码；
 4. 文档件数分两种形态：
@@ -55,8 +56,8 @@
 
 | 位置 | 是什么 | 该不该拿来装 |
 |---|---|---|
-| 本目录（`mnemos\`） | **当前发行副本**（v1.6.1，代码与文档已就位；**已发布**） | ✅ 要装就用这个目录；npm/rar 已发布 |
-| `mnemos.rar`（同级） | 本目录的压缩包 | ✅ 当前版，已重打 |
+| 本目录（`mnemos\`） | **当前发行副本**（v1.6.2，代码与文档已就位；**未发布**） | ✅ 本地安装/网页端使用；npm/rar 未发布 |
+| `mnemos.rar`（同级） | 本目录的压缩包 | ⚠️ 本版未重打 |
 | `mnemos-历史版本\` | 已定版的压缩包存档（含 v1.6.1 及更早） | ⚠️ 只在回退 / 对比时用；v1.6.1 已补存档 |
 | `mnemos.backup-before-sync\` | 最近一次同步**之前**的快照（回滚点） | ❌ 不是发行物 |
 | 备份区（`发行备份\`） | 历次同步的时点快照 + 验收日志 + `源文件-*`（可复现源） | ❌ 不是发行物 |

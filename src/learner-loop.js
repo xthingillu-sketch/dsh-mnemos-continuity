@@ -21,6 +21,7 @@
 
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 // ★ 注入消息的唯一构造点（role/id 一起补齐）。详见 host-message.js 文件头的事故记录。
 import { buildInjectedUserMessage } from './host-message.js'
 
@@ -304,11 +305,60 @@ export async function loadLearnerState(file) {
   }
 }
 
+/**
+ * 合并两版 learner 状态，保证状态**单调前进**：
+ *   - `lastKickAt` / `kicks` 取较大值（旧 tick 不得把新踢回滚）；
+ *   - `recycled` 取较大值，代数更高的一版决定 `activeSessionId`；
+ *   - `retired` 取并集（保留最近 MAX_RETIRED_IDS 个）。
+ *
+ * 为什么需要：timer 的 tick 读状态后会 await（等 fetch/等空闲），
+ * 期间另一次 tick（或工具调用）可能已经提交了更新的 lastKickAt / 换代。
+ * 旧 tick 收尾时若直接覆盖，就会把状态写回过去，下一 tick 就会“没到点也再踢”。
+ */
+export function mergeLearnerState(current, next) {
+  const a = normalizeLearnerState(current)
+  const b = normalizeLearnerState(next)
+  const newerKick = b.lastKickAt >= a.lastKickAt
+  const newerRecycle = b.recycled > a.recycled
+  const takeNewer = newerRecycle || (b.recycled === a.recycled && newerKick)
+  const retired = [...new Set([...a.retired, ...b.retired])].slice(-MAX_RETIRED_IDS)
+  return normalizeLearnerState({
+    lastKickAt: Math.max(a.lastKickAt, b.lastKickAt),
+    kicks: Math.max(a.kicks, b.kicks),
+    activeSessionId: newerRecycle
+      ? b.activeSessionId
+      : (a.activeSessionId || b.activeSessionId),
+    recycled: Math.max(a.recycled, b.recycled),
+    retired,
+    kicksSinceRecycle: takeNewer ? b.kicksSinceRecycle : a.kicksSinceRecycle,
+  })
+}
+
+// learner 状态写入串行化：同一进程内不并发写；tmp 再带唯一后缀，避免跨进程/旧版本残留互相踩。
+let stateWriteChain = Promise.resolve()
+
 export async function saveLearnerState(file, state) {
-  await fs.mkdir(path.dirname(file), { recursive: true })
-  const tmp = file + '.tmp'
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8')
-  await fs.rename(tmp, file)
+  const job = async () => {
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    let current = null
+    try {
+      current = await loadLearnerState(file)
+    } catch {
+      current = null // 读不到/损坏：以入参为准，下一次 load 会回落默认
+    }
+    const merged = mergeLearnerState(current, state)
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`
+    try {
+      await fs.writeFile(tmp, JSON.stringify(merged, null, 2), 'utf8')
+      await fs.rename(tmp, file)
+    } catch (e) {
+      try { await fs.unlink(tmp) } catch { /* 临时文件可能已被 rename 或从未创建 */ }
+      throw e
+    }
+  }
+  const next = stateWriteChain.then(job, job)
+  stateWriteChain = next.catch(() => {})
+  return next
 }
 
 /** 诊断日志（与 memory.json 同级）：**面向使用者排错** —— console.warn 看不到，必须落盘。 */

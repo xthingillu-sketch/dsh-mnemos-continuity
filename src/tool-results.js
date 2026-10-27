@@ -26,6 +26,12 @@ export function summarize(rec) {
   //   降权**没有发生**，回执必须明说，不许照旧回一句"已写入"。
   if (rec.dormantUnscoped) out.dormantUnscoped = true
   if (rec.scope) out.scope = rec.scope
+  // V6-29：自传体类目/身份状态；普通记忆不写这两个字段。
+  if (rec.source === 'autobiography') {
+    if (rec.category) out.category = rec.category
+    if (rec.identityStatus) out.identityStatus = rec.identityStatus
+    if (rec.occurredAt) out.occurredAt = rec.occurredAt
+  }
   return out
 }
 
@@ -51,6 +57,19 @@ export function recallResult(list) {
 /** mnemos_validate：两个字段都强制成声明的类型（summary 缺失时给空串而不是 null）。 */
 export function validateResult(validated, summary) {
   return { validated: !!validated, summary: String(summary ?? '') }
+}
+
+/** mnemos_curate：独立子会话只产出提案，不直接应用变更。 */
+export function curationResult(v) {
+  const x = v && typeof v === 'object' ? v : {}
+  const out = { ok: x.ok === true }
+  if (typeof x.action === 'string') out.action = x.action
+  if (typeof x.proposalId === 'string') out.proposalId = x.proposalId
+  if (typeof x.summary === 'string') out.summary = x.summary
+  if (typeof x.reason === 'string') out.reason = x.reason
+  if (x.applied === true || x.applied === false) out.applied = x.applied
+  if (typeof x.revisionId === 'string') out.revisionId = x.revisionId
+  return out
 }
 
 /** mnemos_constitution：字符串（未初始化时空串 → 由 self-text 的警告负责可见性）。 */
@@ -219,6 +238,7 @@ export function taskCloseResult(r) {
   const out = { ok: v.ok === true }
   if (typeof v.reason === 'string') out.reason = v.reason
   if (typeof v.taskId === 'string') out.taskId = v.taskId
+  if (typeof v.graphId === 'string') out.graphId = v.graphId
   if (typeof v.longTermId === 'string') out.longTermId = v.longTermId
   if (Array.isArray(v.rolled)) {
     out.rolled = v.rolled

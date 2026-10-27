@@ -62,17 +62,19 @@ export function buildSelfText(constitution, store, budget) {
     // 未初始化（或文件存在但正文为空）→ 必须说出去，不能整段消失
     parts.push(constitutionMissingWarning(constitution.dataFile || ''))
   }
-  const auto = store.autobiographyCompact({ budget })
+  // V6-29：固定注入切到 V2（identity 全部 + 最近 3 决策 + 最多 5 重要经验）。
+  // fake store / 旧同形对象没有 V2 时退回旧 compact，单测仍可用。
+  const auto = typeof store.autobiographyCompactV2 === 'function'
+    ? store.autobiographyCompactV2()
+    : store.autobiographyCompact({ budget })
   if (auto.entries.length) {
     const lines = auto.entries.map((e) => `[${e.label}] ${e.summary}`)
     // 实数（store 如实统计；缺省视为 0 —— 同形 stub 也不该凭空吓人）
     const n = Number(auto.unselected) || 0
-    // 预算用**实际生效**的值（store 回传的），拿不到才退回入参
-    const b = Number(auto.budget) || budget
     if (n > 0) {
       lines.push(
-        `【自传体 · 尚未注入】另有 ${n} 条自传体（能力/事件/其他类目）未进本段：` +
-          `本段只受 ${b} 字符预算约束。需要时用 mnemos_recall 检索（不要凭印象认为没记过）。`
+        `【自传体 · 尚未注入】另有 ${n} 条自传体（含决策/经验/事件/其他）未进本段：` +
+          `需要时用 mnemos_recall 检索（不要凭印象认为没记过）。`
       )
     }
     parts.push('【自传体 · 自我历史（紧凑版，按需召回详情）】\n' + lines.join('\n'))

@@ -45,6 +45,7 @@ export const TOOL_OUTPUT_SPECS = {
     properties: {
       id: str(), summary: str(), tags: arr({ type: 'string' }), layer: str(), salience: str(),
       superseded: arr(), possibleSupersedes: arr(), dormantUnscoped: bool(), scope: str(),
+      category: str(), identityStatus: str(), occurredAt: num(),
     },
   },
   mnemos_recall: {
@@ -57,6 +58,7 @@ export const TOOL_OUTPUT_SPECS = {
       properties: {
         id: str(), summary: str(), tags: arr({ type: 'string' }), taskId: str(), salience: str(),
         layer: str(), source: str(), dormantHere: bool(), sessionId: str(), createdAt: num(),
+        graphId: str(), taskSummary: bool(), origin: { type: 'object', additionalProperties: true }, originKind: str(),
       },
     },
   },
@@ -64,6 +66,11 @@ export const TOOL_OUTPUT_SPECS = {
     type: 'object',
     required: ['validated'],
     properties: { validated: bool(), summary: str() },
+  },
+  mnemos_curate: {
+    type: 'object',
+    required: ['ok'],
+    properties: { ok: bool(), action: str(), proposalId: str(), summary: str(), reason: str(), applied: bool(), revisionId: str() },
   },
   mnemos_constitution: { type: 'string' },
   mnemos_delete: {
@@ -205,7 +212,7 @@ export const TOOL_OUTPUT_SPECS = {
     type: 'object',
     required: ['ok'],
     properties: {
-      ok: bool(), reason: str(), taskId: str(), longTermId: str(),
+      ok: bool(), reason: str(), taskId: str(), graphId: str(), longTermId: str(),
       rolled: arr({ type: 'object', properties: { assign: str(), status: str(), handoffId: str(), note: str() } }),
       missing: arr({ type: 'object', properties: { id: str(), task: str(), status: str() } }),
       unlabeledHandoffs: arr({ type: 'object', properties: { id: str(), handoffId: str() } }),

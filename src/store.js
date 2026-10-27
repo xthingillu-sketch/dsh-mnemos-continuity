@@ -23,6 +23,33 @@ export const LAYERS = ['short', 'hot', 'cold', 'permanent']
 export const SOURCES = ['internal', 'external', 'deprecated', 'dormant', 'validation', 'autobiography']
 export const SALIENCES = ['low', 'normal', 'high']
 
+/* ───────── V6-29：自传体五类 / 身份两段（草案落地的第一切片） ───────── */
+
+export const AUTOBIOGRAPHY_CATEGORIES = ['identity', 'decision', 'experience', 'event', 'other']
+export const DEFAULT_IDENTITY_BUDGET = 800
+export const DEFAULT_RECENT_DECISION_COUNT = 3
+export const DEFAULT_IMPORTANT_EXPERIENCE_COUNT = 5
+
+/**
+ * 自传体主类目推断：显式 `category` 优先，否则按旧 tags 兼容。
+ * 只给 source=autobiography 用；普通记忆没有类目。
+ */
+export function autobiographyCategoryOf(m) {
+  const c = m && m.category
+  if (AUTOBIOGRAPHY_CATEGORIES.includes(c)) return c
+  const tags = new Set((m && m.tags) || [])
+  if (tags.has('identity')) return 'identity'
+  if (tags.has('decision')) return 'decision'
+  if (tags.has('experience') || tags.has('ability')) return 'experience'
+  if (tags.has('event')) return 'event'
+  return 'other'
+}
+
+/** 是否身份候选（candidate 不注入、不召回；只给 curation 用）。 */
+export function isIdentityCandidate(m) {
+  return m && m.source === 'autobiography' && m.identityStatus === 'candidate'
+}
+
 /** 任务图的标签前缀（`task:<taskId>`）。**与归档闸门共用这一处**，别在别处硬编码字符串。 */
 export const TASK_TAG_PREFIX = 'task:'
 /** 标记"这是任务图本身"的标签。 */
@@ -32,6 +59,8 @@ export const TASK_OPEN_TAG = 'open'
 export const TASK_CLOSED_TAG = 'closed'
 /** 收尾时写出的"任务结论"记录的标签。 */
 export const TASK_RESULT_TAG = 'task-result'
+/** 收尾摘要记忆的标签（与 task-result 同一份，不另写第二份正文）。 */
+export const TASK_SUMMARY_TAG = 'task-summary'
 /** 任务过程中的临时中间结果（`scratch`）—— 收尾时**默认丢弃**。 */
 export const TASK_SCRATCH_TAG = 'scratch'
 /** 打了这个标签的 scratch 才在收尾时保留（并进长期结论）。 */
@@ -74,6 +103,29 @@ function clipText(value, max) {
   const s = String(value ?? '').replace(/\s+/g, ' ').trim()
   if (s.length <= max) return { text: s, truncated: false }
   return { text: s.slice(0, max), truncated: true }
+}
+
+/** 任务依赖边的来源类型；旧边没有 kind 时从目标记忆/技能前缀推断。 */
+export function taskUseKindOf(use, target = null) {
+  if (use && typeof use.kind === 'string' && use.kind) return use.kind
+  const id = String(use?.id || '')
+  if (id.startsWith('skill:')) return 'skill'
+  if (target?.source === 'autobiography') return `autobiography:${autobiographyCategoryOf(target)}`
+  if (target) return 'memory'
+  return 'unknown'
+}
+
+/** 任务依赖边的展示标签。 */
+export function taskUseLabel(kind) {
+  if (kind === 'skill' || String(kind).startsWith('skill:')) return '技能'
+  if (kind === 'autobiography:identity') return '自传体·身份'
+  if (kind === 'autobiography:decision') return '自传体·决策'
+  if (kind === 'autobiography:experience') return '自传体·经验'
+  if (kind === 'autobiography:event') return '自传体·事件'
+  if (kind === 'autobiography:other') return '自传体·其他'
+  if (kind === 'autobiography') return '自传体'
+  if (kind === 'memory') return '记忆'
+  return '未知来源'
 }
 
 /**
@@ -480,7 +532,10 @@ export class MemoryStore {
     }
   }
 
-  async remember({ content, summary, tags, taskId, salience, source, sessionId, supersedes }) {
+  async remember({
+    content, summary, tags, taskId, salience, source, sessionId, supersedes,
+    category, identityStatus, occurredAt,
+  }) {
     await this.ensureLoaded()
     // ★ 凭据卡口（写入收口）：记忆是**跨会话共享 + 会被反复召回**的明文文件，
     //   一个 key 进了记忆会在每次相关会话里被注入上下文，比一次性泄露更糟。
@@ -495,6 +550,37 @@ export class MemoryStore {
     }
     const id = randomUUID()
     const now = Date.now()
+    const recTags = Array.isArray(tags) ? tags.map(String) : []
+    const wantAuto = source === 'autobiography'
+    const autoCategory = wantAuto
+      ? (AUTOBIOGRAPHY_CATEGORIES.includes(category) ? category : autobiographyCategoryOf({ tags: recTags }))
+      : undefined
+    if (wantAuto && autoCategory && autoCategory !== 'other' && !recTags.includes(autoCategory)) {
+      // 旧 ability 条目统一归 experience 类目，但保留旧 tag；不要同时加 experience，
+      // 否则旧 compact 的 ability/experience 两个类目会把同一条注入两次。
+      if (!(autoCategory === 'experience' && recTags.includes('ability'))) recTags.push(autoCategory)
+    }
+    const wantIdentity = wantAuto && autoCategory === 'identity'
+    // 身份两段：core 预算满 → candidate；user-important 必须先走 candidate + 独立验证，
+    // 即使预算未满也不能直接写 core。
+    let identityStatusFinal
+    if (wantIdentity) {
+      const supersededIds = new Set(Array.isArray(supersedes) ? supersedes.map(String) : [])
+      const currentIdentityChars = [...this.memories.values()]
+        .filter((m) => m.source === 'autobiography' &&
+          m.identityStatus !== 'candidate' &&
+          autobiographyCategoryOf(m) === 'identity' &&
+          !supersededIds.has(m.id))
+        .reduce((sum, m) => sum + String(m.summary || '').length, 0)
+      const newChars = String(summary || '').length
+      const forceCandidate = identityStatus === 'candidate'
+      identityStatusFinal = forceCandidate || currentIdentityChars + newChars > DEFAULT_IDENTITY_BUDGET
+        ? 'candidate'
+        : 'core'
+    }
+    const occurredAtMs = occurredAt == null
+      ? null
+      : (Number.isFinite(Number(occurredAt)) ? Number(occurredAt) : (Date.parse(String(occurredAt)) || null))
     // 「暂时无关」是**会话级判断**，不是记忆的来源，因此不写进 source：
     // source 只表示真实来源（internal/external/validation/autobiography）。
     // 若把它写成 source='dormant'，标记会随一次次记录永久累积，
@@ -511,7 +597,7 @@ export class MemoryStore {
     const rec = {
       id,
       taskId: taskId || null,
-      tags: Array.isArray(tags) ? tags.map(String) : [],
+      tags: recTags,
       summary: summary || '',
       detail: content || '',
       layer: source === 'autobiography' ? 'permanent' : 'short',
@@ -522,6 +608,20 @@ export class MemoryStore {
       source: SOURCES.includes(source) && source !== 'dormant' ? source : 'internal',
       dormIn: wantDormant && sessionId ? [sessionId] : [],
       sessionId: sessionId || null,
+    }
+    if (wantAuto) {
+      rec.category = autoCategory
+      if (autoCategory === 'identity') rec.identityStatus = identityStatusFinal
+      if (occurredAtMs !== null) rec.occurredAt = occurredAtMs
+      if (autoCategory === 'event') {
+        rec.ref = taskId && this.findTaskGraph(taskId) ? taskId : id
+      }
+      // 自传体溯源：有真实任务图 → origin.task；没有图先记 session pending，
+      // 不伪造任务图；旧数据缺 origin 时由读取侧视为 legacy。
+      const graph = taskId ? this.findTaskGraph(taskId) : null
+      rec.origin = graph
+        ? { kind: 'task', taskId, graphId: graph.id }
+        : { kind: 'session', sessionId: rec.sessionId || null, pending: true }
     }
     if (dormantUnscoped) rec.dormantUnscoped = true // 回执要如实说出来（不许静默）
     if (taskId) {
@@ -538,6 +638,8 @@ export class MemoryStore {
     // 否则只新建一条纠正、旧结论仍以原 source 被召回，记忆库会同时存在互相矛盾的结论。
     const superseded = supersedes ? this.applyDeprecation(supersedes, id) : []
     if (superseded.length) rec.superseded = superseded
+    // event 写入后刷新派生时间索引（同一个 save 落盘；事件是真相，索引可重建）
+    if (wantAuto && autoCategory === 'event') this.rebuildSelfTimeline()
     await this.save()
     return rec
   }
@@ -728,9 +830,13 @@ export class MemoryStore {
     return String(m.detail || '').length >= ARCHIVE_LIKE_DETAIL_CHARS || tags.length >= ARCHIVE_LIKE_TAGS
   }
 
-  recall({ query, tags, taskId, sessionId, mode, limit, includeArchives = false }) {
+  recall({ query, tags, taskId, sessionId, mode, limit, includeArchives = false, source, category, offset = 0, includeCandidates = false }) {
     let list = [...this.memories.values()]
     list = list.filter((m) => m.source !== 'deprecated') // 废弃的错误内容不召回
+    // 身份候选默认不可见：只有身份整理入口显式 includeCandidates 才读。
+    if (!includeCandidates) list = list.filter((m) => !isIdentityCandidate(m))
+    if (source) list = list.filter((m) => m.source === source)
+    if (category) list = list.filter((m) => m.source === 'autobiography' && autobiographyCategoryOf(m) === category)
     // ★ V6-21 P2：会话存档默认不进召回（存档是给人回看的快照，不是模型查询入口）。
     if (!includeArchives) list = list.filter((m) => !this.isArchiveLike(m))
     if (taskId) {
@@ -794,19 +900,30 @@ export class MemoryStore {
     })
 
     const n = Math.max(1, Math.min(limit || 5, 50))
+    const off = Math.max(0, Number(offset) || 0)
     // 召回阶段只返回摘要，不返回 detail（两段式第一段）
-    return filtered.slice(0, n).map((x) => x.m).map((m) => ({
-      id: m.id,
-      summary: m.summary,
-      tags: m.tags,
-      taskId: m.taskId,
-      salience: m.salience,
-      layer: m.layer,
-      source: m.source,
-      dormantHere: !!(sessionId && Array.isArray(m.dormIn) && m.dormIn.includes(sessionId)),
-      sessionId: m.sessionId ?? null,
-      createdAt: m.createdAt,
-    }))
+    return filtered.slice(off, off + n).map((x) => x.m).map((m) => {
+      const out = {
+        id: m.id,
+        summary: m.summary,
+        tags: m.tags,
+        taskId: m.taskId,
+        salience: m.salience,
+        layer: m.layer,
+        source: m.source,
+        category: m.source === 'autobiography' ? autobiographyCategoryOf(m) : null,
+        identityStatus: m.identityStatus || null,
+        occurredAt: m.occurredAt || null,
+        taskSummary: (m.tags || []).includes(TASK_RESULT_TAG) && (m.tags || []).includes(TASK_SUMMARY_TAG),
+        dormantHere: !!(sessionId && Array.isArray(m.dormIn) && m.dormIn.includes(sessionId)),
+        sessionId: m.sessionId ?? null,
+        createdAt: m.createdAt,
+      }
+      if (m.graphId) out.graphId = m.graphId
+      if (m.origin) out.origin = m.origin
+      if (m.source === 'autobiography') out.originKind = m.origin?.kind || 'legacy'
+      return out
+    })
   }
 
   async open(id) {
@@ -828,6 +945,10 @@ export class MemoryStore {
     const m = this.memories.get(id)
     if (!m) return null
     this.memories.delete(id)
+    // 删掉 event 后，派生时间索引也要同步；索引本身可重建。
+    if (m.source === 'autobiography' && autobiographyCategoryOf(m) === 'event') {
+      this.rebuildSelfTimeline()
+    }
     // ★ 墓碑（跨进程必需）：delete 是**硬删除**，磁盘上那条记录的消失本身不是"信息" ——
     //   别的进程内存里仍留着它的旧副本，下次保存时会连同它一起全量重写回来（"复活"）。
     //   墓碑就是这次删除的**事实**：合并时按墓碑过滤，旧副本就复活不了。
@@ -897,6 +1018,69 @@ export class MemoryStore {
     return [...this.memories.values()].filter((m) => m.source === 'autobiography')
   }
 
+  /**
+   * V6-29：event 的派生时间索引。source=内部记忆，不自动注入/不自动召回；
+   * 模型问“最近”时自己 recall tags:['self-timeline']（必要时 open 看 detail）。
+   * 事件是真相，索引可重建；删除/新增 event 后同步刷新。
+   */
+  selfTimelineRecord() {
+    return [...this.memories.values()].find((m) =>
+      m.source !== 'deprecated' && Array.isArray(m.tags) && m.tags.includes('self-timeline-index')
+    ) || null
+  }
+
+  /** 事件索引的指针：优先指向真实任务图 taskId；没有图时退回 event 记忆 id。 */
+  eventRef(m) {
+    if (m && m.taskId && this.findTaskGraph(m.taskId)) return m.taskId
+    return m ? m.id : ''
+  }
+
+  rebuildSelfTimeline() {
+    const events = this.autobiographyEntries()
+      .filter((m) => autobiographyCategoryOf(m) === 'event')
+      .sort((a, b) => (Number(b.occurredAt || b.createdAt) || 0) - (Number(a.occurredAt || a.createdAt) || 0))
+    const fmt = (ms) => {
+      const d = new Date((Number(ms) || 0) + 8 * 3600_000)
+      return d.toISOString().replace('T', ' ').slice(0, 16)
+    }
+    const lines = events.map((m) => {
+      const start = fmt(m.occurredAt || m.createdAt)
+      const end = m.endedAt ? fmt(m.endedAt) : ''
+      const when = end && end !== start ? `${start}→${end}` : start
+      return `${when} | ${this.eventRef(m)} | ${String(m.summary || '').replace(/\s+/g, ' ').trim()}`
+    })
+    const now = Date.now()
+    const summary = `自传体时间索引：${events.length} 条事件（${fmt(now)} 更新）`
+    const detail = lines.length ? lines.join('\n') : '（暂无事件）'
+    let rec = this.selfTimelineRecord()
+    if (!rec) {
+      rec = {
+        id: randomUUID(),
+        taskId: null,
+        tags: ['self-timeline', 'self-timeline-index'],
+        summary,
+        detail,
+        layer: 'permanent',
+        salience: 'normal',
+        recency: now,
+        createdAt: now,
+        version: 1,
+        source: 'internal',
+        dormIn: [],
+        sessionId: null,
+      }
+      this.memories.set(rec.id, rec)
+    } else {
+      rec.summary = summary
+      rec.detail = detail
+      rec.recency = now
+      if (!Array.isArray(rec.tags)) rec.tags = []
+      if (!rec.tags.includes('self-timeline')) rec.tags.push('self-timeline')
+      if (!rec.tags.includes('self-timeline-index')) rec.tags.push('self-timeline-index')
+    }
+    return rec
+  }
+
   /** 取某个隔离验证会话写过的那条验证结论（最新一条；没有就 null）。
    *
    * 为什么需要它：新宿主（0.2.x）把 subagents 的"一次调用拿结果"改成了异步激活 ——
@@ -911,6 +1095,173 @@ export class MemoryStore {
       if (!best || (m.createdAt || 0) > (best.createdAt || 0)) best = m
     }
     return best
+  }
+
+  /** 独立 curation 子会话写回的提案（只读；不应用身份/经验变更）。 */
+  curationProposalBySession(sessionId, action = null) {
+    if (!sessionId) return null
+    let best = null
+    for (const m of this.memories.values()) {
+      if (m.sessionId !== sessionId) continue
+      if (!(m.tags || []).includes('curation-proposal')) continue
+      if (action && !(m.tags || []).includes(`curation:${action}`)) continue
+      if (!best || (m.createdAt || 0) > (best.createdAt || 0)) best = m
+    }
+    return best
+  }
+
+  /**
+   * 应用独立 curation proposal：身份/经验按提案变更，旧条目保留为历史版本。
+   * 只做数据变更；不调用模型。proposal 必须带 curation:identity|experience。
+   */
+  async applyCurationProposal(proposalId, { taskId = null } = {}) {
+    await this.ensureLoaded()
+    const proposal = this.memories.get(String(proposalId))
+    if (!proposal) return { ok: false, reason: `proposal ${proposalId} 不存在` }
+    if ((proposal.tags || []).includes('curation-applied')) {
+      return { ok: false, reason: '该 proposal 已应用（idempotent guard）', revisionId: proposal.revisionId || null }
+    }
+    const action = (proposal.tags || []).includes('curation:identity')
+      ? 'identity'
+      : (proposal.tags || []).includes('curation:experience') ? 'experience' : null
+    if (!action) return { ok: false, reason: 'proposal 缺少 curation:identity/experience 标签' }
+    let data
+    try { data = JSON.parse(String(proposal.detail || '')) } catch { return { ok: false, reason: 'proposal detail 不是合法 JSON' } }
+    const now = Date.now()
+    const originGraph = taskId ? this.findTaskGraph(taskId) : null
+    const origin = originGraph
+      ? { kind: 'task', taskId, graphId: originGraph.id }
+      : { kind: 'curation', proposalId }
+    const taskTags = originGraph ? [`${TASK_TAG_PREFIX}${taskId}`, 'task'] : []
+    const active = (cat) => [...this.memories.values()].filter((m) =>
+      m.source === 'autobiography' && autobiographyCategoryOf(m) === cat &&
+      m.identityStatus !== 'candidate' && m.identityStatus !== 'archived'
+    )
+    const old = new Map(active(action).map((m) => [m.id, m]))
+    const snapshotOf = (m) => ({
+      id: m.id, summary: m.summary, detail: m.detail || '',
+      tags: [...(m.tags || [])], category: m.category || null, source: m.source,
+      version: m.version || 1, salience: m.salience || 'normal',
+      pinned: m.pinned === true, rank: m.rank ?? null,
+    })
+    const beforeSnapshot = new Map([...old].map(([id, m]) => [id, snapshotOf(m)]))
+    const retired = new Set()
+    const newRecords = []
+    const makeRecord = (summary, why, evidenceIds = []) => {
+      const rec = {
+        id: randomUUID(),
+        taskId: originGraph ? taskId : null,
+        tags: [action, 'curated', ...taskTags, ...(action === 'experience' ? ['important-experience'] : [])],
+        summary: String(summary || '').trim(),
+        detail: `由 curation proposal ${proposalId} 生成。\nwhy：${why || '（未注明）'}\n证据：${(evidenceIds || []).join(', ') || '（未注明）'}`,
+        layer: 'permanent',
+        salience: 'high',
+        recency: now,
+        createdAt: now,
+        version: 1,
+        source: 'autobiography',
+        category: action,
+        identityStatus: action === 'identity' ? 'core' : undefined,
+        pinned: action === 'experience' ? true : undefined,
+        rank: action === 'experience' ? 5 : undefined,
+        origin,
+        dormIn: [],
+        sessionId: proposal.sessionId || null,
+      }
+      this.memories.set(rec.id, rec)
+      newRecords.push(rec)
+      return rec
+    }
+    // 先做预算/上限预检（不产生半提交）
+    const planned = []
+    const affected = new Set()
+    const removed = new Set((data.remove || []).map(String))
+    for (const x of data.replace || []) {
+      if (x && x.id) { affected.add(String(x.id)); planned.push(String(x.summary || '').trim()) }
+    }
+    for (const x of data.merge || []) {
+      for (const id of x.from || []) affected.add(String(id))
+      planned.push(String(x.summary || '').trim())
+    }
+    for (const x of data.add || []) planned.push(String(x.summary || '').trim())
+    const unaffected = [...old.values()].filter((m) => !affected.has(m.id) && !removed.has(m.id))
+    const finalCount = unaffected.length + planned.length
+    if (action === 'identity') {
+      const chars = unaffected.reduce((n, m) => n + String(m.summary || '').length, 0) +
+        planned.reduce((n, s) => n + s.length, 0)
+      if (chars > DEFAULT_IDENTITY_BUDGET) {
+        return { ok: false, reason: `identity 预算超限：${chars} > ${DEFAULT_IDENTITY_BUDGET}` }
+      }
+    }
+    if (action === 'experience' && finalCount > DEFAULT_IMPORTANT_EXPERIENCE_COUNT) {
+      return { ok: false, reason: `experience 超过上限：${finalCount} > ${DEFAULT_IMPORTANT_EXPERIENCE_COUNT}` }
+    }
+    const retire = (m, newId = null, asOrdinary = false) => {
+      if (!m) return
+      retired.add(m.id)
+      m.version = (m.version || 1) + 1
+      m.recency = now
+      if (asOrdinary) {
+        m.source = 'internal'
+        delete m.category
+        delete m.identityStatus
+        delete m.pinned
+        delete m.rank
+        m.tags = (m.tags || []).filter((t) => !['identity', 'experience', 'important-experience', 'important'].includes(t))
+        if (!m.tags.includes(`${action}-history`)) m.tags.push(`${action}-history`)
+      } else {
+        m.source = 'deprecated'
+        if (newId) m.supersededBy = newId
+        if (!m.tags.includes(`${action}-history`)) m.tags.push(`${action}-history`)
+      }
+    }
+    for (const x of data.replace || []) {
+      if (!x || !x.id) continue
+      const oldRec = old.get(String(x.id))
+      const rec = makeRecord(x.summary, x.why, x.evidenceIds)
+      retire(oldRec, rec.id)
+    }
+    for (const x of data.merge || []) {
+      if (!x) continue
+      const rec = makeRecord(x.summary, x.why, [])
+      for (const id of x.from || []) retire(old.get(String(id)), rec.id)
+    }
+    for (const x of data.add || []) {
+      if (!x) continue
+      makeRecord(x.summary, x.why, x.evidenceIds)
+    }
+    for (const id of data.remove || []) {
+      retire(old.get(String(id)), null, action === 'experience')
+    }
+    const revision = {
+      id: randomUUID(),
+      taskId: null,
+      tags: [`${action}-revision`, 'curation-revision', `curation:${action}`],
+      summary: `${action} 整理 revision：${String(proposal.summary || '').slice(0, 60)}`,
+      detail: JSON.stringify({
+        proposalId, at: new Date(now).toISOString(), action,
+        before: [...beforeSnapshot.values()],
+        after: newRecords.map(snapshotOf),
+        retired: [...retired],
+        operations: { keep: data.keep || [], replace: data.replace || [], merge: data.merge || [], add: data.add || [], remove: data.remove || [] },
+      }, null, 2),
+      layer: 'permanent',
+      salience: 'high',
+      recency: now,
+      createdAt: now,
+      version: 1,
+      source: 'internal',
+      sessionId: proposal.sessionId || null,
+    }
+    this.memories.set(revision.id, revision)
+    proposal.tags = [...new Set([...(proposal.tags || []), 'curation-applied'])];
+    proposal.appliedAt = now
+    proposal.revisionId = revision.id
+    proposal.version = (proposal.version || 1) + 1
+    proposal.recency = now
+    this.rebuildSelfTimeline()
+    await this.save()
+    return { ok: true, action, proposalId: proposal.id, revisionId: revision.id, before: old.size, after: newRecords.length, retired: [...retired] }
   }
 
   /**
@@ -944,17 +1295,19 @@ export class MemoryStore {
   autobiographyCompact({ budget = 2000, floorRatio = 0.15, floorMin = 200 } = {}) {
     // 类目定义。`other` 是兜底类目：只要带了三类标签里**任意一个**就不算其他。
     const CATS = [
+      { key: 'identity', label: '身份', tag: 'identity' },
       { key: 'decision', label: '决策', tag: 'decision' },
       { key: 'ability', label: '能力', tag: 'ability' },
+      { key: 'experience', label: '经验', tag: 'experience' },
       { key: 'event', label: '事件', tag: 'event' },
       { key: 'other', label: '其他', tag: null },
     ]
-    const TAGGED = ['decision', 'ability', 'event']
+    const TAGGED = ['identity', 'decision', 'ability', 'experience', 'event']
     const cap = Math.max(0, Number(budget) || 0)
 
     /** 某个类目的条目，按 recency 从新到旧。 */
     const entriesFor = (cat) => {
-      const list = [...this.autobiographyEntries()]
+      const list = [...this.autobiographyEntries()].filter((m) => !isIdentityCandidate(m))
       if (cat.tag) {
         return list
           .filter((m) => (m.tags || []).includes(cat.tag))
@@ -1039,7 +1392,7 @@ export class MemoryStore {
             continue // ★F6-KEEP
           }
           list.splice(at, 1)
-          result.push({ category: c.key, label: c.label, summary: text })
+          result.push({ category: c.key, label: c.label, summary: text, id: m.id })
           usedIds.add(m.id)
           used += text.length
           progressed = true
@@ -1057,17 +1410,93 @@ export class MemoryStore {
 
     // ── 未注入的**实数**（F-12 那一行要用）：按类目统计，用**对象身份**判定 ──
     // 不用"比对摘要文本"：两条摘要恰好相同（"无。"这类）时文本比对会数错，身份不会。
-    const unselectedByCategory = { ability: 0, event: 0, other: 0 }
+    // ★ V6-29：decision 也计入；身份候选不参与（它们本来就不该注入/召回）。
+    const unselectedByCategory = { identity: 0, decision: 0, ability: 0, experience: 0, event: 0, other: 0 }
     for (const m of this.autobiographyEntries()) {
       if (usedIds.has(m.id)) continue
+      if (isIdentityCandidate(m)) continue
       const tags = m.tags || []
-      if (tags.includes('decision')) continue // 决策类目不进 F-12 那句话（它只点能力/事件/其他）
-      const key = tags.includes('ability') ? 'ability' : tags.includes('event') ? 'event' : 'other'
+      const key = tags.includes('identity')
+        ? 'identity'
+        : tags.includes('decision')
+          ? 'decision'
+          : tags.includes('experience')
+            ? 'experience'
+            : tags.includes('ability')
+              ? 'ability'
+              : tags.includes('event') ? 'event' : 'other'
       unselectedByCategory[key]++
     }
-    const unselected =
-      unselectedByCategory.ability + unselectedByCategory.event + unselectedByCategory.other
+    const unselected = Object.values(unselectedByCategory).reduce((a, b) => a + b, 0)
     return { entries: result, used, budget: cap, unselected, unselectedByCategory }
+  }
+
+  /**
+   * V6-29 影子版：新固定注入算法（尚未接入 buildSelfText）。
+   * 目的：先与旧 compact 并存、用测试/影子比较验证，确认后再切换。
+   * - identity-core：800 内全部；candidate 不参与
+   * - 最近 3 条 decision：按 createdAt
+   * - 最多 5 条 important experience：pinned / important-experience tag
+   * - event/other 不固定；unselected 计入全部类目
+   */
+  autobiographyCompactV2({
+    identityBudget = DEFAULT_IDENTITY_BUDGET,
+    recentDecisions = DEFAULT_RECENT_DECISION_COUNT,
+    maxExperiences = DEFAULT_IMPORTANT_EXPERIENCE_COUNT,
+  } = {}) {
+    const identityCap = Math.max(0, Number(identityBudget) || 0)
+    const all = this.autobiographyEntries().filter((m) =>
+      m.source === 'autobiography' && !isIdentityCandidate(m) && m.source !== 'deprecated'
+    )
+    const catOf = (m) => autobiographyCategoryOf(m)
+    const labelOf = { identity: '身份', decision: '决策', experience: '经验', event: '事件', other: '其他' }
+    const entries = []
+    const selected = new Set()
+    let identityUsed = 0
+
+    const identity = all.filter((m) => catOf(m) === 'identity')
+      .sort((a, b) => ((b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)) || ((a.createdAt || 0) - (b.createdAt || 0)))
+    for (const m of identity) {
+      const text = String(m.summary || '')
+      if (identityUsed + text.length > identityCap) continue
+      identityUsed += text.length
+      entries.push({ category: 'identity', label: labelOf.identity, summary: text, id: m.id })
+      selected.add(m.id)
+    }
+
+    const decisions = all.filter((m) => catOf(m) === 'decision')
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .slice(0, Math.max(0, Number(recentDecisions) || 0))
+    for (const m of decisions) {
+      entries.push({ category: 'decision', label: labelOf.decision, summary: String(m.summary || ''), id: m.id })
+      selected.add(m.id)
+    }
+
+    const experiences = all.filter((m) => catOf(m) === 'experience')
+      .filter((m) => m.pinned === true || (m.tags || []).includes('important-experience') || Number(m.rank) > 0)
+      .sort((a, b) => ((b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)) ||
+        (Number(b.rank) || 0) - (Number(a.rank) || 0) ||
+        (b.createdAt || 0) - (a.createdAt || 0))
+      .slice(0, Math.max(0, Number(maxExperiences) || 0))
+    for (const m of experiences) {
+      entries.push({ category: 'experience', label: labelOf.experience, summary: String(m.summary || ''), id: m.id })
+      selected.add(m.id)
+    }
+
+    const unselectedByCategory = { identity: 0, decision: 0, experience: 0, event: 0, other: 0 }
+    for (const m of all) {
+      if (!selected.has(m.id)) unselectedByCategory[catOf(m)] += 1
+    }
+    const unselected = Object.values(unselectedByCategory).reduce((a, b) => a + b, 0)
+    return {
+      entries,
+      used: entries.reduce((n, e) => n + e.summary.length, 0),
+      identityUsed,
+      identityBudget: identityCap,
+      unselected,
+      unselectedByCategory,
+      candidates: this.autobiographyEntries().filter((m) => isIdentityCandidate(m)).length,
+    }
   }
 
   /**
@@ -1097,7 +1526,7 @@ export class MemoryStore {
     //   作为"任务"一节收进来。只收任务结论，不复制成员正文（成员在收尾时已经转 cold）。
     const taskResults = [...this.memories.values()].filter(
       (m) =>
-        m.layer === 'hot' &&
+        (m.layer === 'hot' || m.layer === 'permanent') &&
         (m.tags || []).includes(TASK_RESULT_TAG) &&
         (m.sessionId || '__unassigned__') === scope &&
         m.archivedIn !== scope
@@ -1259,6 +1688,17 @@ export class MemoryStore {
   findOpenTask(taskId) {
     const g = this.findTaskGraph(taskId)
     return g && (g.tags || []).includes(TASK_OPEN_TAG) ? g : null
+  }
+
+  /** 当前会话的未收尾任务图（用于 curation 自动绑 origin）。 */
+  findOpenTaskBySession(sessionId) {
+    if (!sessionId) return null
+    for (const m of this.memories.values()) {
+      const tags = m.tags || []
+      if (!tags.includes(TASK_GRAPH_TAG) || !tags.includes(TASK_OPEN_TAG) || !m.task) continue
+      if (m.sessionId === sessionId) return m
+    }
+    return null
   }
 
   /** 任务图的展示文本（每次更新后重渲染，让 recall 一眼看到进度）。 */
@@ -1457,12 +1897,18 @@ export class MemoryStore {
     }
     const list = [...new Set((Array.isArray(ids) ? ids : []).map((x) => String(x || '').trim()).filter(Boolean))]
     if (!list.length) return { ok: false, reason: 'ids 不能为空' }
+    const kinds = new Map()
     for (const id of list) {
+      if (id.startsWith('skill:')) {
+        kinds.set(id, 'skill')
+        continue
+      }
       const m = this.memories.get(id)
       if (!m) return { ok: false, reason: `记忆 ${id} 不存在` }
       if ((m.tags || []).includes(TASK_GRAPH_TAG)) {
         return { ok: false, reason: `${id} 是任务图；任务图请用 links 链接，不要放进 uses` }
       }
+      kinds.set(id, taskUseKindOf({ id }, m))
     }
     const clipped = clipText(why, TASK_USE_WHY_MAX)
     graph.task.uses = Array.isArray(graph.task.uses) ? graph.task.uses : []
@@ -1472,7 +1918,9 @@ export class MemoryStore {
     if (graph.task.uses.length + fresh.length > TASK_USES_MAX) {
       return { ok: false, reason: `uses 最多 ${TASK_USES_MAX} 条（已有 ${graph.task.uses.length}）` }
     }
-    for (const id of fresh) graph.task.uses.push({ id, ...(clipped.text ? { why: clipped.text } : {}) })
+    for (const id of fresh) {
+      graph.task.uses.push({ id, kind: kinds.get(id), ...(clipped.text ? { why: clipped.text } : {}) })
+    }
     if (fresh.length) {
       const now = Date.now()
       graph.version += 1
@@ -1500,7 +1948,9 @@ export class MemoryStore {
       for (const l of task.links) {
         const old = this.findTaskGraph(l.taskId)
         const state = old ? ((old.tags || []).includes(TASK_OPEN_TAG) ? 'open' : 'closed') : '已删除'
-        const when = old ? new Date(old.createdAt).toISOString().slice(0, 10) : '?'
+        const isOldOpen = old && (old.tags || []).includes(TASK_OPEN_TAG)
+        const whenMs = !old ? 0 : isOldOpen ? old.createdAt : (old.task?.closedAt || old.task?.completedAt || old.createdAt)
+        const when = old ? new Date(whenMs).toISOString().slice(0, 10) : '?'
         lines.push(`- ${l.taskId}［${state} ${when}］— ${l.relation} — 为什么：${l.why}`)
       }
     }
@@ -1519,10 +1969,13 @@ export class MemoryStore {
       lines.push('', `依赖（${task.uses.length}）：`)
       for (const u of task.uses) {
         const m = this.memories.get(u.id)
-        const src = m ? (m.source === 'external' ? '外部' : '内部') : '已删除'
-        const dead = !m ? '（已删除）' : m.source === 'deprecated' ? '（已作废）' : ''
+        const kind = taskUseKindOf(u, m)
+        const baseLabel = taskUseLabel(kind)
+        const label = kind === 'memory' && m?.source === 'external' ? '外部' : baseLabel
+        const src = !m || label === '外部' ? '' : (m.source === 'external' ? '·外部' : '·内部')
+        const dead = !m ? (kind === 'skill' ? '' : '（已删除）') : m.source === 'deprecated' ? '（已作废）' : ''
         const cross = m && m.taskId && m.taskId !== taskId ? `［来自任务 ${m.taskId}］` : ''
-        lines.push(`- ［${src}］${u.why || '（未注明）'}（${u.id}）${cross}${dead}`)
+        lines.push(`- ［${label}${src}］${u.why || '（未注明）'}（${u.id}）${cross}${dead}`)
       }
     }
 
@@ -1600,7 +2053,7 @@ export class MemoryStore {
    *   · `expire` —— 超时强制归档：**跳过所有者校验**（它不是"谁在收尾"，而是机制在回收孤儿图），
    *     并在长期结论里明确写清"超时未收尾"，绝不假装它完成了。
    */
-  async _archiveTask({ taskId, conclusion = '', newSummary = '', sessionId = null, mode = 'close' } = {}) {
+  async _archiveTask({ taskId, conclusion = '', newSummary = '', sessionId = null, mode = 'close', eventId = null } = {}) {
     await this.ensureLoaded()
     const graph = this.findOpenTask(taskId)
     if (!graph) return { ok: false, reason: `找不到未收尾的任务 ${taskId}（可能已收尾或不存在）` }
@@ -1610,8 +2063,24 @@ export class MemoryStore {
     const expired = mode === 'expire'
     const now = Date.now()
     const task = graph.task
-    const idleHours = Math.round((now - (task?.lastActivityAt || graph.createdAt || now)) / 3600000)
     const tag = `${TASK_TAG_PREFIX}${taskId}`
+    // 任务收尾优先挂在任务已有的事件下；没有事件才新建。
+    const isTaskEvent = (m) =>
+      m && m.source === 'autobiography' && autobiographyCategoryOf(m) === 'event' &&
+      (m.taskId === taskId || (m.tags || []).includes(tag) || m.origin?.taskId === taskId)
+    const taskEvents = [...this.memories.values()].filter(isTaskEvent)
+      .sort((a, b) => (Number(b.occurredAt || b.createdAt) || 0) - (Number(a.occurredAt || a.createdAt) || 0))
+    let targetEvent = null
+    if (eventId) {
+      const candidate = this.memories.get(String(eventId))
+      if (!candidate || !isTaskEvent(candidate)) {
+        return { ok: false, reason: `eventId=${eventId} 不属于任务 ${taskId} 或不是自传体事件` }
+      }
+      targetEvent = candidate
+    } else {
+      targetEvent = taskEvents[0] || null
+    }
+    const idleHours = Math.round((now - (task?.lastActivityAt || graph.createdAt || now)) / 3600000)
     const members = [...this.memories.values()].filter((m) => m.id !== graph.id && (m.tags || []).includes(tag))
     const handoffIds = new Set((task.assignments || []).map((a) => a.handoffId).filter(Boolean))
     const handoffs = members.filter(
@@ -1648,87 +2117,96 @@ export class MemoryStore {
       ? (String(conclusion || '').trim() ||
          `（超时未收尾：超过保留窗口，闲置 ${idleHours} 小时没有任何进展，被机制强制归档）`)
       : (String(conclusion || '').trim() || '（未填）')
-    const detailLines = [
+    const fmtClose = (ms) => new Date((Number(ms) || 0) + 8 * 3600_000).toISOString().replace('T', ' ').slice(0, 16)
+    const closureLines = [
+      `--- 任务收尾（${fmtClose(now)}）---`,
       `结论：${effConclusion}`,
-      ...(expired ? ['', `■ 归档方式：过期强制归档（图仍处于 open 且闲置 ${idleHours} 小时）`] : []),
-      '',
+      ...(expired ? [`■ 归档方式：过期强制归档（图仍 open 且闲置 ${idleHours} 小时）`] : []),
       `任务 id：${taskId}`,
       `目标：${task.goal}`,
-      '',
-      '■ 分工完成情况',
-      ...(task.assignments || []).map(
-        (a) =>
-          `- ${a.id}［${a.status}］${a.task}` +
-          (a.handoffId ? ` → handoff ${a.handoffId}` : '') +
-          (a.note ? `（${a.note}）` : '')
-      ),
-      '',
-      missing.length
-        ? `■ 未完成（${missing.length}）：${missing.map((m) => m.id).join(', ')}`
-        : '■ 每个分工都有回执',
-      '',
+      `任务图：${graph.id}`,
+      `已完成 ${(task.done || []).length} 条 / 依赖 ${(task.uses || []).length} 条 / 链接 ${(task.links || []).length} 条`,
+      ...(missing.length ? [`未完成（${missing.length}）：${missing.map((m) => m.id).join(', ')}`] : ['每个分工都有回执']),
       ...(unlabeledHandoffs.length
-        ? [
-            `■ 交接缺 assign 标签（${unlabeledHandoffs.length}）：${unlabeledHandoffs.map((x) => x.id).join(', ')}`,
-            '  （历史遗留；v1.6 起 task_update 会拒绝这类交接——同一个 handoff 不能交给多个分工）',
-            '',
-          ]
+        ? [`交接缺 assign 标签（${unlabeledHandoffs.length}）：${unlabeledHandoffs.map((x) => x.id).join(', ')}`]
         : []),
-      ...(task.links?.length
-        ? ['', `■ 前序图（${task.links.length}）：${task.links.map((l) => `${l.taskId}（${l.relation}）`).join('、')}`, '']
-        : []),
-      ...(task.uses?.length
-        ? ['', `■ 依赖（${task.uses.length}）：${task.uses.map((u) => u.id).join(', ')}`, '']
-        : []),
-      ...(task.done?.length ? ['', `■ 已完成里程碑（${task.done.length}）`, ''] : []),
-      keptScratch.length
-        ? `■ 保留的中间结果（${keptScratch.length}）：\n${keptScratch.map((m) => `- ${m.id}：${String(m.summary || '').slice(0, 80)}`).join('\n')}`
-        : '■ 无保留的中间结果',
-      '',
-      discarded.length
-        ? `■ 已丢弃的临时中间结果（${discarded.length}，默认丢弃；要留请打 ${TASK_KEEP_TAG} 标签）：\n${discarded
-            .slice(0, 10)
-            .map((m) => `- ${m.id}：${String(m.summary || '').slice(0, 80)}`)
-            .join('\n')}`
-        : '■ 无丢弃的临时中间结果',
+      ...(discarded.length
+        ? [`已丢弃的临时中间结果（${discarded.length}）：${discarded.slice(0, 10).map((m) => m.id).join(', ')}`]
+        : ['无丢弃的临时中间结果']),
     ]
-    const consolidated = {
-      id: randomUUID(),
-      taskId,
-      tags: [tag, TASK_RESULT_TAG, 'task', ...(expired ? [TASK_EXPIRED_TAG] : [])],
-      summary:
-        newSummary ||
-        `任务 ${taskId} ${expired ? '超时强制归档' : '结论'}：${effConclusion.slice(0, 60)}`,
-      detail: detailLines.join('\n'),
-      layer: 'hot',
-      salience: missing.length ? 'normal' : 'high',
-      recency: now,
-      createdAt: now,
-      version: 1,
-      source: 'internal',
-      sessionId: graph.sessionId || null,
-      scope: graph.sessionId || '__unassigned__',
+    const closureText = closureLines.join('\n')
+    const closureSummary = newSummary || `${expired ? '超时强制归档' : '收尾'}：${effConclusion.slice(0, 60)}`
+    const resultTags = [
+      tag, TASK_RESULT_TAG, TASK_SUMMARY_TAG, 'task', 'event', 'event:task-summary',
+      ...(expired ? [TASK_EXPIRED_TAG] : []),
+    ]
+    let resultRecord
+    if (targetEvent) {
+      // 有事件：追加收尾段，不另造 task-result；longTermId 指向这条事件。
+      targetEvent.detail = String(targetEvent.detail || '').trim()
+        ? `${String(targetEvent.detail).trim()}\n\n${closureText}`
+        : closureText
+      targetEvent.summary = `${String(targetEvent.summary || '').trim()}；${closureSummary}`
+      targetEvent.category = 'event'
+      targetEvent.source = 'autobiography'
+      targetEvent.layer = 'permanent'
+      targetEvent.taskId = taskId
+      targetEvent.graphId = graph.id
+      targetEvent.origin = { kind: 'task', taskId, graphId: graph.id }
+      targetEvent.ref = taskId
+      targetEvent.endedAt = now
+      targetEvent.closedAt = now
+      targetEvent.salience = missing.length ? 'normal' : 'high'
+      targetEvent.version = (targetEvent.version || 1) + 1
+      targetEvent.recency = now
+      targetEvent.tags = [...new Set([...(targetEvent.tags || []), ...resultTags])]
+      resultRecord = targetEvent
+    } else {
+      // 没有任何事件：新建一条自传体 event 作为任务收尾。
+      resultRecord = {
+        id: randomUUID(),
+        taskId,
+        graphId: graph.id,
+        tags: [...new Set(['event', ...resultTags])],
+        summary: newSummary || `任务 ${taskId} ${expired ? '超时强制归档' : '收尾'}：${effConclusion.slice(0, 60)}`,
+        detail: closureText,
+        category: 'event',
+        occurredAt: now,
+        endedAt: now,
+        closedAt: now,
+        ref: taskId,
+        origin: { kind: 'task', taskId, graphId: graph.id },
+        layer: 'permanent',
+        salience: missing.length ? 'normal' : 'high',
+        recency: now,
+        createdAt: now,
+        version: 1,
+        source: 'autobiography',
+        dormIn: [],
+        sessionId: graph.sessionId || null,
+      }
+      this.memories.set(resultRecord.id, resultRecord)
     }
-    // 图收尾：open → closed（闸门据此解除对这批判记录的保护）
+    // 图收尾：open→closed；成员转冷（permanent 除外）；closedAt 记录真实关闭时间。
     graph.tags = (graph.tags || []).map((t) => (t === TASK_OPEN_TAG ? TASK_CLOSED_TAG : t))
     if (expired && !graph.tags.includes(TASK_EXPIRED_TAG)) graph.tags.push(TASK_EXPIRED_TAG)
     graph.version += 1
     graph.recency = now
-    // ★ V6-21：收尾即把**全部成员**转冷（permanent 除外）——任务档案不再属于会话短时工作集。
-    //   archiveSession 只收 short，所以不会把任务成员吞进会话存档，id 保持个体可寻址。
+    if (graph.task) graph.task.closedAt = now
     for (const m of [graph, ...members]) {
       if (m.layer === 'permanent') continue
       m.layer = 'cold'
       m.version += 1
     }
-    this.memories.set(consolidated.id, consolidated)
+    this.rebuildSelfTimeline()
     // ★ 默认丢弃 scratch：不可逆，所以在长期结论里**留了清单**（不是悄悄消失）
     for (const m of discarded) await this.delete(m.id)
     await this.save()
     return {
       ok: true,
       taskId,
-      longTermId: consolidated.id,
+      graphId: graph.id,
+      longTermId: resultRecord.id,
       rolled,
       missing,
       unlabeledHandoffs,

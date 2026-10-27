@@ -72,7 +72,7 @@ import {
 //   无依赖的模块里，否则"声明 vs 实际"永远没法被测试抓住。
 import { buildOutputSchema, withToolOutputGate } from './tool-output.js'
 import {
-  rememberResult, recallResult, validateResult, constitutionResult, deleteResult,
+  rememberResult, recallResult, validateResult, curationResult, constitutionResult, deleteResult,
   deprecateResult, dormantResult, openResult, consolidateResult, heartbeatResult,
   maintenanceListResult, toggleResult, proposeSkillResult, learnerKickResult,
   taskOpenResult, taskUpdateResult, taskCloseResult, taskDoneResult, taskCiteResult,
@@ -211,6 +211,24 @@ function makeRememberTool(store) {
             '注意：若你想表达「某条旧记忆已被证伪」，不要用 deprecated（那会让本条自己也被召回过滤掉），' +
             '而应把旧记忆的 id 填进 supersedes。',
         },
+        category: {
+          type: 'string',
+          enum: ['identity', 'decision', 'experience', 'event', 'other'],
+          description:
+            '仅 source=autobiography 时使用：identity=身份、decision=决策、experience=经验、event=事件、other=兜底。' +
+            '未填时按 tags 兼容推断。',
+        },
+        identityStatus: {
+          type: 'string',
+          enum: ['core', 'candidate'],
+          description:
+            '仅 identity 类使用。core=固定注入；candidate=不注入不召回，只进独立身份整理。' +
+            '身份由模型自己维护，用户影响通过长期证据/说服，不设用户直接指定通道。',
+        },
+        occurredAt: {
+          type: 'string',
+          description: 'event 类的事件时间（ISO 时间或毫秒时间戳）；不填时用 createdAt。',
+        },
         supersedes: {
           type: 'array',
           items: { type: 'string' },
@@ -227,6 +245,9 @@ function makeRememberTool(store) {
       schema: buildOutputSchema('mnemos_remember'),
       render: (_args, value) => {
         const lines = [`已写入记忆 ${value.id}`, `摘要：${value.summary}`]
+        if (value.identityStatus === 'candidate') {
+          lines.push('身份候选：不注入、不召回；等身份整理（预算已满/用户重要信息触发）再裁决。')
+        }
         // ★ F-5：dormant 无 sessionId 时**必须明说**（最隐蔽的一处谎报：
         //   dormIn 是空数组、降权根本没发生，回执照旧说"已写入"）。
         if (value.dormantUnscoped) {
@@ -310,6 +331,20 @@ function makeRecallTool(store) {
             '默认 false：不返回会话存档（它们很大，错召回会吃掉大量上下文）。确实要查存档时才设 true；' +
             '更推荐直接用 mnemos_open 打开某个存档 id。',
         },
+        source: {
+          type: 'string',
+          enum: ['internal', 'external', 'validation', 'autobiography'],
+          description: '按来源过滤；查自传体用 autobiography。',
+        },
+        category: {
+          type: 'string',
+          enum: ['identity', 'decision', 'experience', 'event', 'other'],
+          description: '仅 source=autobiography 时按主类目过滤。',
+        },
+        offset: {
+          type: 'integer',
+          description: '分页偏移，默认 0；limit 上限仍为 50。',
+        },
       },
     },
     output: {
@@ -317,13 +352,20 @@ function makeRecallTool(store) {
       render: (_args, value) => {
         if (!value.length) return [{ type: 'text', text: '没有找到相关记忆。' }]
         const lines = [`找到 ${value.length} 条相关记忆：`, '']
+        const autoLabel = { identity: '身份', decision: '决策', experience: '经验', event: '事件', other: '其他' }
         value.forEach((m, i) => {
+          const auto = m.source === 'autobiography'
+            ? `[自传体·${autoLabel[m.category] || '其他'}] ` : ''
+          const task = m.taskSummary ? '[任务摘要] ' : ''
           lines.push(
-            `${i + 1}. [${m.id}] (${m.salience}/${m.layer})` +
-              `${m.dormantHere ? '（本会话已标为暂时无关·降权中，仍可召回）' : ''} ${m.summary}`
+            `${i + 1}. [${m.id}] (${m.salience}/${m.layer}) ` +
+              `${task}${auto}${m.dormantHere ? '（本会话已标为暂时无关·降权中，仍可召回）' : ''} ${m.summary}`
           )
           if (m.tags && m.tags.length) lines.push(`   标签：${m.tags.join(', ')}`)
           if (m.taskId) lines.push(`   任务：${m.taskId}`)
+          if (m.graphId) lines.push(`   任务图：${m.graphId}`)
+          if (m.origin?.graphId && m.origin.graphId !== m.graphId) lines.push(`   来源图：${m.origin.graphId}`)
+          if (m.originKind === 'legacy') lines.push('   来源：legacy（旧数据未迁移）')
           lines.push('')
         })
         lines.push('需要完整详情时，用 mnemos_open 传入对应 id。')
@@ -361,8 +403,39 @@ function buildValidationPrompt(info) {
   ].join('\n')
 }
 
+function buildCurationPrompt(action) {
+  const label = action === 'identity' ? '身份' : '经验'
+  return [
+    `你是 Mnemos 的独立${label}整理模型。你在独立上下文里工作，不继承当前任务上下文，也不应被当前对话情境带偏。`,
+    `任务：审阅自传体中的${label}记忆，产出**提案**；不要直接修改身份或经验，不要写身份/经验正文。`,
+    '',
+    '读取方式（用 mnemos 工具）：',
+    "- mnemos_recall({ source: 'autobiography', category: 'identity', limit: 50 })",
+    "- mnemos_recall({ source: 'autobiography', category: 'experience', limit: 50 })",
+    '- 需要更多时用 offset 翻页；需要全文用 mnemos_open。',
+    action === 'identity'
+      ? "- 身份审阅材料：mnemos_recall({ tags: ['identity-revision'], limit: 50 })，再 open 读 before/after 全文；历史只作审阅材料，不自动恢复。"
+      : "- 经验审阅材料：mnemos_recall({ tags: ['experience-revision'], limit: 50 })，再 open 读 before/after 全文；历史只作审阅材料，不自动恢复。",
+    '- 也读取与判断相关的 decision/event，但提案只针对目标类目。',
+    '',
+    '判断要求：',
+    '- 身份：自我模型、偏好/好恶、目标、做事倾向、边界；稳定、第一人称、可合并。',
+    '- 经验：最多 5 条；按跨任务复用、改变过判断、有证据、仍有效排序；允许合并同类。',
+    '- 用户影响通过长期证据/说服，不把单次用户指定当身份。',
+    '- 不覆盖宪法红线；没有证据的偏好/目标不要编造。',
+    '',
+    '完成后只写一条提案记忆：',
+    `mnemos_remember({ source:'internal', tags:['curation-proposal','curation:${action}'], summary:'${label}整理提案', content:'JSON...' })`,
+    'JSON 至少包含：',
+    `{ action:'${action}', keep:[ids], add:[{summary, why, evidenceIds}], replace:[{id, summary, why, evidenceIds}], remove:[ids], merge:[{from:[ids], summary, why}], notes }`,
+    '',
+    '不要写 identity/experience 记忆；不要调用删除工具。写完后回复一行提案摘要。',
+  ].join('\n')
+}
+
 /** 隔离验证专用 preset 的 id。 */
 const VALIDATOR_PRESET_ID = 'mnemos-validator'
+const CURATOR_PRESET_ID = 'mnemos-curator'
 
 /**
  * 注册「只挂 persona」的最小 preset，供隔离验证子会话使用。
@@ -400,6 +473,52 @@ async function startHostValidationChild(subagents, exec, prompt) {
   })
   const childId = activation && (activation.childId || activation.id)
   return typeof childId === 'string' && childId ? childId : null
+}
+
+async function startHostCurationChild(subagents, exec, prompt) {
+  if (!subagents || typeof subagents.startActivation !== 'function') return null
+  if (!exec || !exec.agent) return null
+  const providers = typeof subagents.list === 'function' ? subagents.list() : []
+  const providerName = Array.isArray(providers) && providers.length ? providers[0] : null
+  if (!providerName) return null
+  const activation = await subagents.startActivation({
+    provider: providerName,
+    label: 'mnemos-curator',
+    request: {
+      parent: exec.agent,
+      prompt: [{ type: 'text', text: prompt }],
+      agentPreset: CURATOR_PRESET_ID,
+    },
+    signal: exec.signal,
+    delivery: 'parent',
+  })
+  const childId = activation && (activation.childId || activation.id)
+  return typeof childId === 'string' && childId ? childId : null
+}
+
+async function ensureCurationPreset(ctx) {
+  const presets = ctx.get('agentPresets')
+  if (!presets || typeof presets.register !== 'function') return null
+  try {
+    return await presets.register({
+      id: CURATOR_PRESET_ID,
+      name: 'Mnemos 独立整理',
+      description: '独立 context；只挂 persona + 插件级 mnemos_*，没有文件/联网/shell',
+      plugins: [
+        {
+          id: 'persona',
+          name: '@deepseek-ai/dsh-persona',
+          config: {
+            prefix: 'You are an independent Mnemos curator. You have no filesystem, network, or shell tools; use mnemos_* to read memories and write only a proposal.',
+            suffix: 'Do not modify identity/experience directly. Write one curation-proposal memory, then reply with one line.',
+          },
+        },
+      ],
+    })
+  } catch (e) {
+    if (/Duplicate agent preset/i.test(String((e && e.message) || e))) return null
+    throw e
+  }
 }
 
 async function ensureValidatorPreset(ctx) {
@@ -638,6 +757,83 @@ export function logResolvedPaths(ctx, { dataFile, constitutionFile, logFile, pro
   return text
 }
 
+function makeCurateTool(ctx, store) {
+  return {
+    name: 'mnemos_curate',
+    description:
+      '在独立上下文的子代理中整理身份或经验：读取记忆、产出 curation proposal，并**直接应用**，' +
+      '旧身份/经验保留为历史 revision（不删除）；用于 identity/experience 筛选。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['identity', 'experience'], description: '要整理的目标类目' },
+      },
+      required: ['action'],
+    },
+    output: {
+      schema: buildOutputSchema('mnemos_curate'),
+      render: (_args, v) => {
+        if (!v || v.ok !== true) return [{ type: 'text', text: `独立整理未完成：${v?.reason || '未知原因'}` }]
+        if (v.applied === false) {
+          return [{
+            type: 'text',
+            text: `提案已生成但未应用：${v.action} → ${v.proposalId}\n原因：${v.reason || '未知'}\n旧版本保持原状。`,
+          }]
+        }
+        return [{
+          type: 'text',
+          text: `独立整理已应用：${v.action} → ${v.proposalId}\nrevision：${v.revisionId || '未知'}\n摘要：${v.summary || ''}\n旧版本保留为历史。`,
+        }]
+      },
+    },
+    timeoutMs: 180000,
+    async execute(args, exec) {
+      const action = String(args?.action || '')
+      if (action !== 'identity' && action !== 'experience') {
+        return curationResult({ ok: false, reason: 'action 只能是 identity 或 experience' })
+      }
+      const subagents = ctx.get('subagents')
+      const prompt = buildCurationPrompt(action)
+      let childId = null
+      try {
+        childId = await startHostCurationChild(subagents, exec, prompt)
+      } catch (e) {
+        return curationResult({ ok: false, action, reason: `独立整理会话启动失败：${(e && e.message) || e}` })
+      }
+      if (!childId) {
+        return curationResult({ ok: false, action, reason: '独立整理通道不可用（subagents.startActivation 或 agentPresets 不可用）' })
+      }
+      const deadline = Date.now() + 120000
+      while (Date.now() < deadline) {
+        try { await store.refreshFromDisk() } catch {}
+        const p = store.curationProposalBySession(childId, action)
+        if (p) {
+          let applied
+          try {
+            const sessionId = exec?.agent?.session?.id ?? null
+            const task = store.findOpenTaskBySession(sessionId)
+            applied = await store.applyCurationProposal(p.id, { taskId: task?.task?.id || null })
+          } catch (e) {
+            applied = { ok: false, reason: `应用失败：${(e && e.message) || e}` }
+          }
+          return curationResult({
+            ok: true,
+            action,
+            proposalId: p.id,
+            summary: p.summary,
+            applied: applied.ok === true,
+            revisionId: applied.revisionId,
+            ...(applied.ok === true ? {} : { reason: applied.reason || 'apply 失败' }),
+          })
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500))
+      }
+      return curationResult({ ok: false, action, reason: `独立整理会话没有写回 proposal（host-child sessionId=${childId}）` })
+    },
+  }
+}
+
 function makeConstitutionTool(constitution) {
   return {
     name: 'mnemos_constitution',
@@ -818,6 +1014,13 @@ function makeOpenTool(store) {
           `标签：${(value.tags || []).join(', ') || '无'}`,
           `分层：${value.layer} · 重要性：${value.salience} · 来源：${value.source}`,
         ]
+        if (value.taskSummary) lines.push('类型：任务摘要')
+        const fmtMs = (ms) => new Date((Number(ms) || 0) + 8 * 3600_000).toISOString().replace('T', ' ').slice(0, 16)
+        if (value.occurredAt) lines.push(`开始：${fmtMs(value.occurredAt)}`)
+        if (value.endedAt) lines.push(`结束：${fmtMs(value.endedAt)}`)
+        if (value.graphId) lines.push(`任务图：${value.graphId}`)
+        if (value.origin?.graphId && value.origin.graphId !== value.graphId) lines.push(`来源图：${value.origin.graphId}`)
+        if (value.source === 'autobiography' && !value.origin) lines.push('来源：legacy（旧数据未迁移）')
         if (Array.isArray(value.dormIn) && value.dormIn.length) {
           lines.push(
             `会话级降权：已在 ${value.dormIn.length} 个会话内标为暂时无关` +
@@ -1223,11 +1426,9 @@ function makeTaskCloseTool(store) {
   return {
     name: 'mnemos_task_close',
     description:
-      '收尾一张任务图：把该 taskId 下的记录汇成**一条长期结论**（结论 + 分工完成表 + 未完成清单，' +
-      '没有回执的分工会被列为未完成），图标记为 closed（此后不再受归档闸门保护）。' +
-      '临时中间结果（tags 含 `scratch`）**默认丢弃**；要留就给它加 `keep` 标签。' +
-      '注意交付物（子代理 handoff）不要同时打 `scratch`：带 `assign:` 标签的记录不会被当 scratch 丢弃，' +
-      '但那是安全网、不是可依赖的约定。',
+      '收尾一张任务图：优先把结论补进本任务已有事件（有始有终），没有事件才新建一条自传体 event；' +
+      '图标记为 closed。临时中间结果（tags 含 `scratch`）默认丢弃；要留就加 `keep`。' +
+      '注意交付物（子代理 handoff）不要同时打 `scratch`：带 `assign:` 标签的记录不会被当 scratch 丢弃。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1235,6 +1436,7 @@ function makeTaskCloseTool(store) {
         taskId: { type: 'string', description: '要收尾的 taskId' },
         conclusion: { type: 'string', description: '这个任务最终得出的结论（一两句，能独立看懂）' },
         newSummary: { type: 'string', description: '可选：覆盖长期记忆的摘要（默认取结论）' },
+        eventId: { type: 'string', description: '可选：指定本任务已有的自传体 event 作为收尾载体；不填则自动选最新事件，没有就新建。' },
       },
       required: ['taskId', 'conclusion'],
     },
@@ -1242,7 +1444,7 @@ function makeTaskCloseTool(store) {
       schema: buildOutputSchema('mnemos_task_close'),
       render: (_args, v) => {
         if (!v || v.ok === false) return [{ type: 'text', text: `收尾失败：${v?.reason || '未知原因'}` }]
-        const lines = [`已收尾 taskId=${v.taskId} → 长期记忆 ${v.longTermId}`]
+        const lines = [`已收尾 taskId=${v.taskId} → 长期摘要 ${v.longTermId}` + (v.graphId ? `（graphId=${v.graphId}）` : '')]
         for (const r of v.rolled || []) {
           lines.push(`- ${r.assign}［${r.status}］${r.handoffId ? `handoff ${r.handoffId}` : '无 handoff'}${r.note ? `（${r.note}）` : ''}`)
         }
@@ -1272,6 +1474,7 @@ function makeTaskCloseTool(store) {
           taskId: args?.taskId,
           conclusion: args?.conclusion,
           newSummary: args?.newSummary,
+          eventId: args?.eventId,
           sessionId,
         })
       )
@@ -1327,15 +1530,15 @@ function makeTaskCiteTool(store) {
   return {
     name: 'mnemos_task_cite',
     description:
-      '登记本任务**依赖的既有记忆**（调取已有结论/外部输入）：只存 id 与一句"为什么"，不复制正文。' +
-      `ids 最多 ${TASK_USES_MAX} 条；why ≤ ${TASK_USE_WHY_MAX} 字（推荐写、非必填）。` +
+      '登记本任务**依赖的既有记忆/技能**（调取已有结论/外部输入/技能）：只存地址与一句"为什么"，不复制正文。' +
+      `ids 最多 ${TASK_USES_MAX} 条；记忆用记忆 id，技能用 skill:<name>；why ≤ ${TASK_USE_WHY_MAX} 字（推荐写、非必填）。` +
       '外部性/作废状态在 open 图时从记忆现取，不另存字段。',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         taskId: { type: 'string', description: '任务 id' },
-        ids: { type: 'array', items: { type: 'string' }, description: '被依赖的记忆 id（去重）' },
+        ids: { type: 'array', items: { type: 'string' }, description: '被依赖的记忆 id 或 skill:<name>（去重）' },
         why: { type: 'string', description: `为什么需要它（≤${TASK_USE_WHY_MAX} 字；可空）` },
       },
       required: ['taskId', 'ids'],
@@ -1480,7 +1683,8 @@ function makeLearnerKickTool(ctx, opts) {
             onInfo: (m) => console.warn('mnemos:', m),
           })
           // ★ 状态迁移由 runLearnerKick 算好（nextState），这里只负责存 —— 两处各写一份必然漂移
-          if (r?.nextState && !isProbe) await saveLearnerState(stateFile, r.nextState)
+          //   只有真正 sent 或换代才写；busy/not-yet 的旧状态不覆盖新状态。
+          if (r?.nextState && !isProbe && (r.sent || r.recycle)) await saveLearnerState(stateFile, r.nextState)
           if (r?.recycle) {
             await appendLearnerLog(
               logFile,
@@ -1544,6 +1748,7 @@ export function apply(ctx, config) {
   // 隔离验证要用到一个"只挂 persona"的最小 preset（新宿主里不选 preset 会因 {{model}} 无值整轮报错）。
   // 注册失败不阻塞启动：validate 会在调用时如实报告挂不上 preset。
   void ensureValidatorPreset(ctx).catch((e) => skillWarn(`隔离验证 preset 注册失败：${(e && e.message) || e}`))
+  void ensureCurationPreset(ctx).catch((e) => skillWarn(`独立整理 preset 注册失败：${(e && e.message) || e}`))
 
   // 心跳机制：预定义维护功能注册表（预留接口，未来功能可 register 扩展）
   const heartbeat = createHeartbeat()
@@ -1871,7 +2076,13 @@ export function apply(ctx, config) {
       //   收敛式记录 = 每次踢周期恰好一行，既不刷屏也不失明。
       let notYetLoggedFor = null
       let notConfiguredLogged = false
+      // ★ 2026-10-24：tick 必须串行。setInterval 每 5 分钟触发，而一次踢可能等 waitIdle
+      //   最长 10 分钟；不串行就会有两次 tick 同时读/写 learner 状态，既会互相覆盖
+      //   lastKickAt（导致“没到点又踢”），也会让固定 tmp 名互相踩出 ENOENT。
+      let tickInFlight = false
       const tick = async () => {
+        if (tickInFlight) return
+        tickInFlight = true
         try {
           // ★ 2026-10-18 用户决定回退：**必须配第三方 api**（learnerProvider + learnerModel），
           //   留空即"不工作"（不再跟随主会话、也不再走宿主派活）。理由：
@@ -1922,8 +2133,10 @@ export function apply(ctx, config) {
               `会话重建：${r.recycle.text}${r.retiredCleaned ? `；顺手清了 ${r.retiredCleaned} 处旧代会话文件` : ''}`
             )
           }
-          // ★ 状态迁移（含回收后的 activeSessionId）统一由 nextState 落盘 —— 这里不再自己算
-          if (r?.nextState) await saveLearnerState(learnerStateFile, r.nextState)
+          // ★ 状态迁移（含回收后的 activeSessionId）统一由 nextState 落盘 —— 这里不再自己算。
+          //   busy/not-yet 没有状态推进，不写盘；只有真的 sent 或发生换代时才落盘，
+          //   避免旧 tick 把新 lastKickAt 覆盖回去（saveLearnerState 还会再做一次单调合并）。
+          if (r?.nextState && (r.sent || r.recycle)) await saveLearnerState(learnerStateFile, r.nextState)
           if (r?.sent) {
             notYetLoggedFor = null // 新周期开始，允许再记一次"未到点"
             // ★ 关键：followup 不抛错 ≠ 那一轮跑成功。把两件事分开记，便于排错。
@@ -1946,6 +2159,8 @@ export function apply(ctx, config) {
           }
         } catch (e) {
           await appendLearnerLog(learnerLogFile, `出错：${e?.stack || e?.message || e}`)
+        } finally {
+          tickInFlight = false
         }
       }
       // 每 5 分钟检查一次"到点没"（真正的间隔由 learnerIntervalMs 控制）
@@ -2033,6 +2248,7 @@ export function apply(ctx, config) {
     makeMaintenanceListTool(heartbeat),
     makeHeartbeatToggleTool(() => heartbeatEnabled, (v) => { heartbeatEnabled = v }),
     makeValidateTool(ctx, store, resolved),
+    makeCurateTool(ctx, store),
     makeConstitutionTool(constitution),
     makeDeleteTool(store),
     makeDeprecateTool(store),
