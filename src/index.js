@@ -28,6 +28,8 @@ import { buildSelfText } from './self-text.js'
 import { describeResolved, dirUnderProfile, skillsRootFor } from './paths.js'
 import { mnemosSystemPromptLines } from './system-prompt.js'
 import { appendStartupLog, pickLogFile, pickLogger } from './boot-log.js'
+import { FanSearchState, formatFansearchHint } from './fansearch.js'
+import { evaluateCurationDue } from './curation-trigger.js'
 import { makeSkillUsageRecorder, usageFileFor } from './skill-usage.js'
 import {
   makeUserSignalRecorder,
@@ -97,6 +99,12 @@ export const Config = Schema.object({
   ),
   archiveMinAgeMs: Schema.number().default(86400000).description('短时记忆归档时间阈值（毫秒），默认 24 小时'),
   archiveMaxShort: Schema.number().default(50).description('短时记忆数量阈值，超过则自动归档'),
+  curationEnabled: Schema.boolean().default(true).description(
+    '自动身份/经验整理：默认开启；只在到期条件满足时跑独立 curator，不每轮跑'
+  ),
+  identityCandidateTrigger: Schema.number().default(5).description('身份候选达到多少条触发整理（默认 5）'),
+  identityFallbackDays: Schema.number().default(30).description('身份候选不足 5 条时的 30 天兜底（天）'),
+  experienceIntervalDays: Schema.number().default(7).description('经验整理周期（天）；默认每周一次，不按条数触发'),
   // ★★ 空闲学习：**默认全关**（用户 2026-10-15 的规格）。
   //   要它工作，必须**同时**满足：① `learnerEnabled: true` ② 配了外部 API 的
   //   `learnerProvider` + `learnerModel`。**两个都必须配** —— 留空即不工作（已回退到「必须配第三方 api」的形态，见下方守卫）。
@@ -183,7 +191,8 @@ function makeRememberTool(store) {
     name: 'mnemos_remember',
     description:
       '把一条结论或任务资料写入 Mnemos 记忆体（外部存储，不占用上下文）。' +
-      '什么时候该写由纪律层规定，这里只负责把内容与形状写对。',
+      '什么时候该写由纪律层规定，这里只负责把内容与形状写对。' +
+      'tags 可写双语同串（如 "learner 学习"），中英都能命中；task/open/closed/assign 等系统协议 tag 必须保持原样。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -192,7 +201,7 @@ function makeRememberTool(store) {
           type: 'string',
           description: '详细记录：需要完整保留、可直接恢复任务状态的内容。',
         },
-        summary: { type: 'string', description: '一句话摘要，用于检索。' },
+        summary: { type: 'string', description: '一句话摘要，用于检索；关键词处附英文对照（如「任务图（task graph）」），不整句翻译。' },
         tags: { type: 'array', items: { type: 'string' }, description: '标签，用于分类快速匹配。' },
         taskId: { type: 'string', description: '归属任务（分身）ID，可空。' },
         salience: {
@@ -305,7 +314,7 @@ function makeRememberTool(store) {
   }
 }
 
-function makeRecallTool(store) {
+function makeRecallTool(store, fanState = null) {
   return {
     name: 'mnemos_recall',
     description:
@@ -377,7 +386,12 @@ function makeRecallTool(store) {
       const sessionId = exec?.agent?.session?.id ?? null
       // ★ V6-01：先刷新磁盘（别的实例刚写的记录），再检索 —— 不能只靠"本端恰好写过一次盘"。
       await store.refreshFromDisk()
-      return recallResult(store.recall({ ...args, sessionId }))
+      const value = recallResult(store.recall({ ...args, sessionId }))
+      if (fanState && sessionId) {
+        fanState.markSeen(sessionId, value.map((x) => x.id), 'recall')
+        fanState.noteRecall(sessionId, value.length)
+      }
+      return recallResult(value)
     },
   }
 }
@@ -421,6 +435,7 @@ function buildCurationPrompt(action) {
     '判断要求：',
     '- 身份：自我模型、偏好/好恶、目标、做事倾向、边界；稳定、第一人称、可合并。',
     '- 经验：最多 5 条；按跨任务复用、改变过判断、有证据、仍有效排序；允许合并同类。',
+    '- 如果当前 active experience >5：keep/replace/add 选满 5 后，remove 必须显式列出所有未入选的 active experience id；否则 apply 会因超上限拒绝。',
     '- 用户影响通过长期证据/说服，不把单次用户指定当身份。',
     '- 不覆盖宪法红线；没有证据的偏好/目标不要编造。',
     '',
@@ -757,6 +772,61 @@ export function logResolvedPaths(ctx, { dataFile, constitutionFile, logFile, pro
   return text
 }
 
+async function runAutoCuration(ctx, store, action, cfg = {}) {
+  const provider = cfg.learnerProvider
+  const model = cfg.learnerModel
+  if (!provider || !model) {
+    return { ok: false, action, reason: '没有 curation/learner provider+model，跳过自动整理' }
+  }
+  const agents = ctx.get('agents')
+  if (!agents || typeof agents.create !== 'function') {
+    return { ok: false, action, reason: 'agents.create 不可用，跳过自动整理' }
+  }
+  const childId = `mnemos-curation-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+  try {
+    await agents.create({
+      sessionId: childId,
+      agentOptions: { provider: String(provider), model: String(model) },
+      meta: { agentPreset: CURATOR_PRESET_ID },
+    })
+    const child = agents.get(childId)
+    if (!child) return { ok: false, action, reason: 'curation 会话创建后取不到 agent' }
+    const presets = ctx.get('agentPresets')
+    if (presets && typeof presets.select === 'function') await presets.select(child, CURATOR_PRESET_ID)
+    child.followup({
+      content: [{ type: 'text', text: buildCurationPrompt(action) }],
+      source: { kind: 'user' },
+    })
+  } catch (e) {
+    return { ok: false, action, reason: `自动整理会话启动失败：${(e && e.message) || e}` }
+  }
+
+  const deadline = Date.now() + 120000
+  while (Date.now() < deadline) {
+    try { await store.refreshFromDisk() } catch { /* 保持旧视图继续等 */ }
+    const p = store.curationProposalBySession(childId, action)
+    if (p) {
+      let applied
+      try {
+        applied = await store.applyCurationProposal(p.id)
+      } catch (e) {
+        applied = { ok: false, reason: `应用失败：${(e && e.message) || e}` }
+      }
+      return {
+        ok: applied.ok === true,
+        action,
+        proposalId: p.id,
+        applied: applied.ok === true,
+        revisionId: applied.revisionId,
+        reason: applied.ok === true ? '' : (applied.reason || 'apply 失败'),
+        childId,
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  return { ok: false, action, reason: `自动整理未写回 proposal（sessionId=${childId}）` }
+}
+
 function makeCurateTool(ctx, store) {
   return {
     name: 'mnemos_curate',
@@ -990,7 +1060,7 @@ function makeDormantTool(store) {
   }
 }
 
-function makeOpenTool(store) {
+function makeOpenTool(store, fanState = null) {
   return {
     name: 'mnemos_open',
     description: '取一条记忆的完整详情（两段式第二段）。传入 mnemos_recall 返回的 id。',
@@ -1033,10 +1103,14 @@ function makeOpenTool(store) {
       },
     },
     timeoutMs: 10000,
-    async execute(args) {
+    async execute(args, exec) {
       // ★ V6-01：详情读取也先刷新（用户可能刚在另一端写入，recall 与 open 不能各看各的）。
       await store.refreshFromDisk()
-      return openResult(await store.open(args.id))
+      const value = openResult(await store.open(args.id))
+      if (fanState && value.found && exec?.agent?.session?.id) {
+        fanState.markSeen(exec.agent.session.id, [value.id], 'open')
+      }
+      return openResult(value)
     },
   }
 }
@@ -1053,7 +1127,7 @@ function makeConsolidateTool(store) {
       properties: {
         newSummary: {
           type: 'string',
-          description: '重建的摘要。省略则拼接各条旧摘要。',
+          description: '重建的摘要；关键词处可附英文对照，格式同 summary。省略则拼接各条旧摘要。',
         },
       },
     },
@@ -1724,6 +1798,8 @@ export function apply(ctx, config) {
   const constitutionFileResolved =
     resolved.constitutionFile || (profileDataDir ? path.join(profileDataDir, 'constitution.json') : undefined)
   const store = new MemoryStore(dataFileResolved || undefined)
+  const fanState = new FanSearchState()
+  const fansearchEnabled = resolved.fansearchEnabled === true
   const constitution = new ConstitutionStore(constitutionFileResolved || undefined)
   let subagents
   try { subagents = ctx.subagents ?? ctx.get('subagents') } catch { subagents = undefined }
@@ -1753,6 +1829,33 @@ export function apply(ctx, config) {
   // 心跳机制：预定义维护功能注册表（预留接口，未来功能可 register 扩展）
   const heartbeat = createHeartbeat()
   heartbeat.register('decay', '记忆衰减降权（hot 闲置超阈值 → cold）', (s) => s.decay({}))
+  // 自动身份/经验整理：只在到期条件满足时启动独立 curator，不每轮跑。
+  let curationAutoRunning = false
+  const curationLastAttempt = { identity: 0, experience: 0 }
+  if (resolved.curationEnabled !== false) {
+    heartbeat.register('curation_due', '自动身份/经验整理：候选≥5/30天兜底、经验每7天', async (s) => {
+      if (curationAutoRunning) return { skipped: true, reason: '上一次自动整理仍在运行' }
+      const due = evaluateCurationDue(s, {
+        identityCandidateTrigger: resolved.identityCandidateTrigger ?? 5,
+        identityFallbackDays: resolved.identityFallbackDays ?? 30,
+        experienceIntervalDays: resolved.experienceIntervalDays ?? 7,
+      })
+      if (!due.due) return due
+      const now = Date.now()
+      const intervalMs = Math.max(1, Number(resolved.experienceIntervalDays ?? 7)) * 86400000
+      if (due.action === 'experience' && curationLastAttempt.experience &&
+          now - curationLastAttempt.experience < intervalMs) {
+        return { skipped: true, ...due, reason: '本周已尝试过经验整理，等待下一个周期' }
+      }
+      curationLastAttempt[due.action] = now
+      curationAutoRunning = true
+      try {
+        return { ...due, run: await runAutoCuration(ctx, s, due.action, resolved) }
+      } finally {
+        curationAutoRunning = false
+      }
+    })
+  }
   heartbeat.register('archive_due', '定时归档：到期短时记忆 → 长期（按 sessionId）', async (s) => {
     const minAge = resolved.archiveMinAgeMs ?? 86400000
     const now = Date.now()
@@ -1864,6 +1967,70 @@ export function apply(ctx, config) {
   ctx.on('session/event', (_session, event) => {
     if (event && event.type === 'turn/start' && heartbeatAllowAutoEnable) heartbeatEnabled = true
   })
+
+  // 范检索：旁路搭车。只在任务模式启用；不新增 user/message，线索追加到 tool result 附注。
+  if (fansearchEnabled) {
+    const textOf = (content) => (Array.isArray(content) ? content : [])
+      .filter((b) => b && b.type === 'text')
+      .map((b) => String(b.text || ''))
+      .join('\n')
+      .trim()
+    ctx.on('session/event', (session, event) => {
+      const sid = session?.id
+      if (!sid || !event) return
+      if (event.type === 'turn/start') {
+        fanState.onTurn(sid, event.data?.turn ?? 0)
+        try {
+          const fixed = store.autobiographyCompactV2()
+          fanState.seedFixed(sid, (fixed.entries || []).map((e) => e.id))
+        } catch { /* 固定注入取不到就跳过；不影响正常流程 */ }
+        return
+      }
+      if (event.type === 'user/message') {
+        fanState.onUser(sid, textOf(event.data?.message?.content))
+        return
+      }
+      if (event.type === 'assistant/message') {
+        const content = event.data?.message?.content || []
+        fanState.onAssistant(
+          sid,
+          event.data?.turn ?? 0,
+          event.data?.step ?? 0,
+          textOf(content),
+          content.some((b) => b && b.type === 'tool-call')
+        )
+      }
+    })
+
+    ctx.on('tools/post-execute', async (exec, result, next) => {
+      const decision = await next()
+      if (!decision || decision.kind !== 'accept' || result?.isError) return decision
+      const sid = exec?.agent?.session?.id
+      if (!sid) return decision
+      const name = String(exec.name || '')
+      if (name.startsWith('mnemos_')) return decision
+      if (!fanState.shouldScan(sid, { args: exec.arguments })) return decision
+
+      const query = fanState.queryFor(sid, exec.arguments)
+      const fragments = store.fanSearch(query, {
+        exclude: fanState.seenFor(sid),
+        limit: 30,
+        top: 3,
+      })
+      fanState.markScanned(sid)
+      if (!fragments.length) return decision
+
+      fanState.markSeen(sid, fragments.map((f) => f.id), 'fansearch')
+      const content = Array.isArray(decision.content)
+        ? decision.content
+        : Array.isArray(result.content) ? result.content : []
+      if (!content.length) return decision
+      return {
+        ...decision,
+        content: [...content, { type: 'text', text: formatFansearchHint(fragments) }],
+      }
+    })
+  }
 
   // 外部信息自动标记：post-execute 钩子，区分信息类/指令技能类，前后加标记界定边界
   const EXTERNAL_INFO_TOOLS = new Set(['web_search', 'web_fetch'])
@@ -2241,8 +2408,8 @@ export function apply(ctx, config) {
   //   声明（output.schema）与实际（execute 的返回）现在共用同一张规格表，脱节不可能再静默。
   const toolDefs = [
     makeRememberTool(store),
-    makeRecallTool(store),
-    makeOpenTool(store),
+    makeRecallTool(store, fanState),
+    makeOpenTool(store, fanState),
     makeConsolidateTool(store),
     makeHeartbeatTool(heartbeat, store),
     makeMaintenanceListTool(heartbeat),

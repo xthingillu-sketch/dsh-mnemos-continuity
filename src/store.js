@@ -7,6 +7,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { findSecrets, describeHits } from './secret-patterns.js'
 import { defaultDataFile } from './paths.js'
+import { searchMemories } from './fansearch.js'
 import {
   acquireLock, releaseLock, mergeMemories, atomicWriteFile,
   readTombstones, mergeTombstones, capTombstones, writeTombstones,
@@ -29,6 +30,37 @@ export const AUTOBIOGRAPHY_CATEGORIES = ['identity', 'decision', 'experience', '
 export const DEFAULT_IDENTITY_BUDGET = 800
 export const DEFAULT_RECENT_DECISION_COUNT = 3
 export const DEFAULT_IMPORTANT_EXPERIENCE_COUNT = 5
+
+/**
+ * tag 匹配：兼容两种写法，且不改变系统协议 tag 的精确语义。
+ * - 旧 tag: "learner"
+ * - 双语 tag: "learner 学习" 视为 token ["learner","学习"]
+ * - 整串输入 "learner 学习" 在 token 顺序不同时也能命中
+ * 只按空白拆 token，不拆 hyphen：task-graph 不会被当成 task + graph。
+ */
+function tagNeedle(s) {
+  return String(s ?? '').trim().toLowerCase()
+}
+
+export function splitTagTokens(tag) {
+  return tagNeedle(tag).split(/\s+/).filter(Boolean)
+}
+
+export function tagMatches(storedTags, wanted) {
+  const want = tagNeedle(wanted)
+  if (!want || !Array.isArray(storedTags)) return false
+  const wantTokens = want.split(/\s+/).filter(Boolean)
+  for (const stored of storedTags) {
+    const st = tagNeedle(stored)
+    if (!st) continue
+    if (st === want) return true
+    const tokens = st.split(/\s+/).filter(Boolean)
+    if (tokens.includes(want)) return true
+    if (wantTokens.length > 1 && wantTokens.every((t) => tokens.includes(t))) return true
+  }
+  return false
+}
+
 
 /**
  * 自传体主类目推断：显式 `category` 优先，否则按旧 tags 兼容。
@@ -827,6 +859,9 @@ export class MemoryStore {
     if (m.archiveOf) return true
     const tags = m.tags || []
     if (tags.includes('session-archive')) return true
+    // 打标前生成的拼接档没有 archiveOf：detail 以成员块 `[<uuid> vN]` 或
+    // 任务块 `[任务 <taskId>]` 开头；只匹配开头，避免正文里出现同形文本误伤。
+    if (/^\[(?:[0-9a-f-]{36} v\d+|任务 [^\]]+)\]/i.test(String(m.detail || '').trimStart())) return true
     return String(m.detail || '').length >= ARCHIVE_LIKE_DETAIL_CHARS || tags.length >= ARCHIVE_LIKE_TAGS
   }
 
@@ -844,7 +879,7 @@ export class MemoryStore {
       list = list.filter((m) => m.taskId === taskId || (m.tags || []).includes(tag))
     }
     if (tags && tags.length) {
-      list = list.filter((m) => tags.every((t) => (m.tags || []).includes(t)))
+      list = list.filter((m) => tags.every((t) => tagMatches(m.tags, t)))
     }
 
     // 每记忆算四个分：关键词 / 会话亲和 / 来源（dormant 降权）/ 分层
@@ -926,6 +961,15 @@ export class MemoryStore {
     })
   }
 
+  /**
+   * 范检索：只搜摘要/tags，返回带来源与片段的候选项；不返回 detail。
+   * exclude 由会话级 seen ledger 提供。
+   */
+  fanSearch(query, { exclude = new Set(), limit = 30, top = 3 } = {}) {
+    const list = [...this.memories.values()].filter((m) => !this.isArchiveLike(m))
+    return searchMemories(list, query, { exclude, limit, top })
+  }
+
   async open(id) {
     const m = this.memories.get(id)
     if (!m) return null
@@ -956,48 +1000,6 @@ export class MemoryStore {
     this.tombstones.set(id, Date.now())
     await this.save()
     return [m]
-  }
-
-  async consolidate(taskId, newSummary) {
-    await this.ensureLoaded()
-    const group = [...this.memories.values()].filter(
-      (m) => m.taskId === taskId && m.layer !== 'permanent'
-    )
-    if (group.length === 0) return null
-    const summary =
-      newSummary || group.map((m) => m.summary).filter(Boolean).join('；')
-    const detail = group
-      .map((m) => `[${m.id} v${m.version}] ${m.detail || ''}`)
-      .join('\n\n')
-    const tags = [...new Set(group.flatMap((m) => m.tags || []))]
-    const maxWeight = group.reduce(
-      (a, m) => Math.max(a, SALIENCE_WEIGHT[m.salience] || 2),
-      0
-    )
-    const salience =
-      Object.keys(SALIENCE_WEIGHT).find((k) => SALIENCE_WEIGHT[k] === maxWeight) || 'normal'
-    const now = Date.now()
-    const consolidated = {
-      id: randomUUID(),
-      taskId,
-      tags,
-      summary,
-      detail,
-      layer: 'hot',
-      salience,
-      recency: now,
-      createdAt: now,
-      version: 1,
-      source: 'internal',
-    }
-    // 原始记录降为冷存储、版本递增（保留，不删除）
-    for (const m of group) {
-      m.layer = 'cold'
-      m.version += 1
-    }
-    this.memories.set(consolidated.id, consolidated)
-    await this.save()
-    return consolidated
   }
 
   shortBySession() {
@@ -1524,10 +1526,14 @@ export class MemoryStore {
     const group = inScope.filter((m) => !isArchiveProtected(m, openTaskIds))
     // ★ V6-21 P2：会话存档要"完整"到任务层面 —— 把该会话**已收尾、尚未入过档**的 task-result
     //   作为"任务"一节收进来。只收任务结论，不复制成员正文（成员在收尾时已经转 cold）。
+    // ★ 2026-10-29：绝不能把 archive 自己（archiveOf/session-archive）再当 task-result 收进来；
+    //   旧实现会在每次归档时把上一次 archive 递归复制进下一次，造成 detail 越滚越大。
     const taskResults = [...this.memories.values()].filter(
       (m) =>
         (m.layer === 'hot' || m.layer === 'permanent') &&
         (m.tags || []).includes(TASK_RESULT_TAG) &&
+        !m.archiveOf &&
+        !(m.tags || []).includes('session-archive') &&
         (m.sessionId || '__unassigned__') === scope &&
         m.archivedIn !== scope
     )
@@ -1538,6 +1544,7 @@ export class MemoryStore {
       report.tasks = taskResults.length
     }
     if (group.length === 0 && taskResults.length === 0) return null
+
     const summary =
       newSummary ||
       [...group, ...taskResults].map((m) => m.summary).filter(Boolean).join('；')
@@ -1554,32 +1561,57 @@ export class MemoryStore {
     const salience =
       Object.keys(SALIENCE_WEIGHT).find((k) => SALIENCE_WEIGHT[k] === maxWeight) || 'normal'
     const now = Date.now()
-    const consolidated = {
-      id: randomUUID(),
-      taskId: null,
-      // ★ 显式标记"这条是会话存档"（2026-10-18，用户要求：这种巨物是整会话存档、有价值，只降召回优先级）。
-      //   召回排序用 isArchiveLike() 认它：**新存档认标记、历史存档认体积**，两条路都在。
-      archiveOf: scope,
-      tags: [...new Set([...tags, 'session-archive'])],
-      summary,
-      detail,
-      layer: 'hot',
-      salience,
-      recency: now,
-      createdAt: now,
-      version: 1,
-      source: 'internal',
-      sessionId: sessionId || null,
-      scope, // 供回执如实说明"归到哪个作用域"（null 会话 → '__unassigned__'）
+
+    // 每个 scope 只保留一份会话存档：重复归档只追加到同一份，不再新建。
+    const existing = [...this.memories.values()].find(
+      (m) => m.archiveOf === scope && (m.tags || []).includes('session-archive') && m.source !== 'deprecated'
+    )
+
+    let consolidated
+    if (existing) {
+      existing.summary = String(existing.summary || '').includes(summary)
+        ? existing.summary
+        : [existing.summary, summary].filter(Boolean).join('；')
+      existing.detail = [existing.detail, detail].filter(Boolean).join('\n\n')
+      existing.tags = [...new Set([...(existing.tags || []), ...tags, 'session-archive'])]
+      existing.salience = existing.salience === 'high' || salience === 'high' ? 'high' : salience
+      existing.sessionId = sessionId || existing.sessionId || null
+      existing.archivedIn = scope
+      existing.layer = 'cold'
+      existing.recency = now
+      existing.version = (existing.version || 1) + 1
+      consolidated = existing
+    } else {
+      consolidated = {
+        id: randomUUID(),
+        taskId: null,
+        // ★ 显式标记"这条是会话存档"（2026-10-18，用户要求：这种巨物是整会话存档、有价值，只降召回优先级）。
+        //   召回排序用 isArchiveLike() 认它：**新存档认标记、历史存档认体积**，两条路都在。
+        archiveOf: scope,
+        tags: [...new Set([...tags, 'session-archive'])],
+        summary,
+        detail,
+        // 存档本身是冷存；不再以 hot 身份进入 recall/下一轮归档。
+        layer: 'cold',
+        salience,
+        recency: now,
+        createdAt: now,
+        version: 1,
+        source: 'internal',
+        sessionId: sessionId || null,
+        archivedIn: scope,
+        scope, // 供回执如实说明"归到哪个作用域"（null 会话 → '__unassigned__'）
+      }
+      this.memories.set(consolidated.id, consolidated)
     }
+
     // 原始记录降为冷存储、版本递增（保留，不删除）
     for (const m of group) {
       m.layer = 'cold'
       m.version += 1
     }
-    // 任务结论只记"已入过档"（保持 hot：图/召回仍可指向它），避免下次归档重复收
+    // 任务结论只记"已入过档"（保持原层：图/召回仍可指向它），避免下次归档重复收。
     for (const m of taskResults) m.archivedIn = scope
-    this.memories.set(consolidated.id, consolidated)
     await this.save()
     return consolidated
   }

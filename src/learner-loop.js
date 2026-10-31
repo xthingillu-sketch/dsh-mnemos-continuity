@@ -47,6 +47,17 @@ export const DEFAULT_LEARNER_INTERVAL_MS = 60 * 60 * 1000
 /** 等待"跑完"的上限：超过就不再等（不取消它，只是本次心跳不再阻塞）。 */
 export const DEFAULT_WAIT_LIMIT_MS = 10 * 60 * 1000
 
+// 进程级单飞 + 最近一次真正 sent 的时刻：定时 tick 与手动 mnemos_learner_kick
+// 是两条独立入口，各自的闸门挡不住对方；同一进程内共享这两个值。
+let learnerKickInFlight = false
+let globalLastSentAt = 0
+
+/** 仅测试用：清掉进程级门闩，避免用例之间互相污染。 */
+export function resetLearnerKickGateForTest() {
+  learnerKickInFlight = false
+  globalLastSentAt = 0
+}
+
 /** 任务文件默认文件名（与 memory.json 同目录）。 */
 export const LEARNER_TASKS_FILENAME = 'learner-tasks.md'
 
@@ -532,6 +543,16 @@ export function describeLearnerRecycle(recycle) {
  * @returns { skipped:true, reason } 或 { sent:true, ... }
  */
 export async function runLearnerKick(deps = {}) {
+  if (learnerKickInFlight) return { skipped: true, reason: 'busy-global' }
+  learnerKickInFlight = true
+  try {
+    return await runLearnerKickInner(deps)
+  } finally {
+    learnerKickInFlight = false
+  }
+}
+
+async function runLearnerKickInner(deps = {}) {
   const {
     agents,
     sessionId = DEFAULT_LEARNER_SESSION_ID,
@@ -564,8 +585,10 @@ export async function runLearnerKick(deps = {}) {
     return { skipped: true, reason: 'no-agents-service' }
   }
 
-  // 到点才踢（心跳可能更频繁）
-  const since = now - (lastKickAt || 0)
+  // 到点才踢（心跳可能更频繁）；进程级最近 sent 也作为锚，挡住
+  // "两个入口同时读到旧 state、后一个再把同一窗口踢一遍"。
+  const anchor = Math.max(lastKickAt || 0, globalLastSentAt)
+  const since = now - anchor
   if (since < intervalMs) {
     return { skipped: true, reason: 'not-yet', minutesUntil: Math.ceil((intervalMs - since) / 60000) }
   }
@@ -759,6 +782,7 @@ export async function runLearnerKick(deps = {}) {
   onInfo(`空闲学习：已把这一脚送进 ${usedId}${ensured.created ? '（本次新建会话）' : ''}${ensured.staleRemoved ? `（先清了 ${ensured.staleRemoved} 处同名残留）` : ''}`)
 
   const waited = await waitIdle(agent, waitLimitMs)
+  globalLastSentAt = Math.max(globalLastSentAt, now)
   return {
     sent: true,
     sessionId: usedId,

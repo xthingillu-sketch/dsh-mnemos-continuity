@@ -26,6 +26,7 @@
  */
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { readUsages, revisionOf } from './skill-usage.js'
 import { readUserSignals } from './user-signals.js'
 import { parseSkillFile, listSkills } from './skill-provider.js'
@@ -160,12 +161,17 @@ export async function loadReviewState(file) {
   }
 }
 
-/** 原子保存（临时文件 + rename，避免半截状态）。 */
+/** 原子保存（唯一临时名 + rename，避免半截状态/并发撞名）。 */
 export async function saveReviewState(file, state) {
   await fs.mkdir(path.dirname(file), { recursive: true })
-  const tmp = file + '.tmp'
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8')
-  await fs.rename(tmp, file)
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await fs.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8')
+    await fs.rename(tmp, file)
+  } catch (e) {
+    try { await fs.unlink(tmp) } catch { /* 已 rename 或从未创建 */ }
+    throw e
+  }
 }
 
 /** V6-10：外来技能（不是我们目录里的）不记账 —— 改了也改不了。 */
@@ -283,7 +289,7 @@ export function extractRulePoints(content) {
  * 收集模型按自评提示写下的评价（tags 含 skill-feedback）。
  * 它们和用户信号走**同一座桥**：记忆带 (sessionId, createdAt) → 反查使用记录。
  */
-export function collectSelfReviews(memories, { sinceT = 0 } = {}) {
+export function collectSelfReviews(memories, { sinceT = 0, skillNames = null } = {}) {
   const out = []
   for (const m of memories || []) {
     if (!m) continue
@@ -292,7 +298,17 @@ export function collectSelfReviews(memories, { sinceT = 0 } = {}) {
     if (m.source === 'deprecated') continue
     const t = m.createdAt ?? m.recency
     if (typeof t !== 'number' || t <= sinceT) continue
-    out.push({ t, session: m.sessionId ?? null, text: m.detail || m.summary || '', from: 'self' })
+    const summary = String(m.summary || '')
+    let skill = null
+    if (skillNames && skillNames.size) {
+      for (const tag of tags) {
+        if (tag !== 'skill-feedback' && skillNames.has(tag) && summary.startsWith(tag)) {
+          skill = tag
+          break
+        }
+      }
+    }
+    out.push({ t, session: m.sessionId ?? null, text: m.detail || m.summary || '', from: 'self', skill, selfDeclared: !!skill, summary })
   }
   return out
 }
@@ -562,9 +578,14 @@ export async function writeBackSkill(skillDir, oldContent, oldRevision, newConte
   await fs.mkdir(vdir, { recursive: true })
   if (oldContent) await fs.writeFile(path.join(vdir, `${oldRevision}.md`), oldContent, 'utf8')
   const file = path.join(skillDir, 'SKILL.md')
-  const tmp = file + '.tmp'
-  await fs.writeFile(tmp, newContent, 'utf8')
-  await fs.rename(tmp, file)
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await fs.writeFile(tmp, newContent, 'utf8')
+    await fs.rename(tmp, file)
+  } catch (e) {
+    try { await fs.unlink(tmp) } catch { /* 已 rename 或从未创建 */ }
+    throw e
+  }
 }
 
 /** 读 history.jsonl 的原始条目（`lastAppliedOf` 用；`readHistory` 只给人看最近 10 条摘要）。 */
@@ -674,7 +695,13 @@ export async function runSkillReview(deps) {
   const sigFrom = state.signalCount || 0
   const selfFrom = state.selfReviewT || 0
   const newSignals = signals.slice(sigFrom).map((s, i) => ({ ...s, _idx: sigFrom + i }))
-  const newSelfReviews = collectSelfReviews(memories, { sinceT: selfFrom })
+  let ownSkillNames = null
+  try {
+    ownSkillNames = new Set((await listSkills(skillRoot, onWarn)).map((s) => s.name))
+  } catch (e) {
+    onWarn(`预读自家技能名单失败（自评仍按会话归因）：${e?.message || e}`)
+  }
+  const newSelfReviews = collectSelfReviews(memories, { sinceT: selfFrom, skillNames: ownSkillNames })
   const usageGrew = usages.length > (state.usageCount || 0)
 
   // ---- 第三条证据：该用未用（miss）----
@@ -725,6 +752,14 @@ export async function runSkillReview(deps) {
   const unattr = []
   const attributeOne = (item, from) => {
     const a = attribute({ session: item.session, t: item.t }, usages)
+    if (!a && from === 'self' && item.selfDeclared && item.skill) {
+      return {
+        t: item.t, session: item.session, from, text: item.text, _idx: item._idx,
+        _selfT: item.t, skill: item.skill, revision: null, usageT: null,
+        confidence: 'low', reason: 'self-declared-skill（无同会话使用记录，按 summary 前缀+tag 直引）',
+        selfDeclared: true,
+      }
+    }
     if (!a) {
       unattr.push({ kind: from, t: item.t, session: item.session, reason: '同会话内找不到更早的技能使用' })
       return null
@@ -855,7 +890,9 @@ export async function runSkillReview(deps) {
     }
 
     // 规则 3：只认 revision 与当前一致的反馈（miss 不适用 —— 它针对描述，不带 revision）
-    const valid = fbs.filter((f) => f.revision === revision)
+    // self-declared：没有同会话使用记录，允许按当前 revision 送审，但 confidence=low，
+    // 仍由独立验证者决定是否改（不因为它来自 learner 就直接信任）。
+    const valid = fbs.filter((f) => f.revision === revision || f.selfDeclared === true)
     if (mode === 'feedback' && !valid.length) {
       results.push({ skill: name, step: 'stale-feedback', reason: `反馈指向旧 revision（当前 ${revision}）` })
       continue

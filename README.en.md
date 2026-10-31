@@ -1,4 +1,6 @@
-# Mnemos
+# Mnemos (v1.7.0)
+
+> **v1.7 changes:** recall now has three modes — fixed self-narrative injection, task activation (`recall`/`open`), and experimental associative hints. The task graph is a foundational mechanism (address space, working memory, dossier/trace entry, event/decision anchor), not just a delegation tool. Constitution v3 adds the cognitive-body statement; red lines are unchanged.
 
 **A DeepSeek Harness (DSH) plugin — not a bigger memory store, but memory that stays usable after you switch sessions, directories, or models.**
 
@@ -11,7 +13,7 @@ Mnemos is installed **into** [DeepSeek Harness](https://github.com/deepseek-ai/d
 ## What you get
 
 - **Continue a task in a new session** — new session, new working directory: say "continue with X" and it picks the relevant conclusions back up (no ids to memorize).
-- **Task graph as a dossier/address space** — the graph stores **pointers, not copied text**: completed milestones, dependency ids and conclusion ids, whether the work is delegated or done by the main agent. Sub-agents read it by id; one writer, nothing overwritten.
+- **Task graph as a foundational mechanism** — one memory record carries task address space, working memory (own/delegated), a dossier/trace entry, and event/decision source anchors. It stores **pointers, not copied text**: completed milestones, dependency ids and conclusion ids. One writer; close writes a closure event and does not merge members.
 - **Skills are compiled experience** — a reusable practice can come from a fixed failure, a recurring problem in memory (≥3 events across ≥2 sessions), or an external rewrite. External skills stay in `skill-proposals/` until you approve them.
 - **External information is auditable** — fetched content is treated as untrusted, verified in a restricted one-shot session, and stored with its provenance permanently attached.
 - **Context compaction is a short-term fallback, not long-term memory** — the plugin writes only a fact card (no 4K raw text) plus a notice carrying the top negative conclusions/tool failures; the fact card expires after 7 days.
@@ -40,8 +42,8 @@ the `continuity` in the package name is the point: **judgement survives the mode
 
 - Memory is **local plain-text files** (JSON): back them up yourself; do not put secrets in memory.
 - Background maintenance is on by default and **some steps call an AI model** (cost); it can be disabled entirely.
-- Recall is **keyword + tag** matching — deterministic and auditable, **no semantic search**. Something you wrote may not be recalled; that is a known trade-off.
-- **Not measured yet**: recall quality, scale latency, unit cost, long-term learning effects, multi-machine use.
+- Recall is **keyword + tag** matching for task activation — deterministic and auditable, **no semantic search**. Something you wrote may not be recalled; that is a known trade-off. v1.7 also has experimental associative hints after tool calls; they may be irrelevant and are not a guarantee.
+- **Not measured yet**: task recall quality, associative-hint quality, scale latency, unit cost, long-term learning effects, multi-machine use. DSH 0.2.1-rc.5 was tested; 0.2.2-alpha.2 plugin-API migration is not yet implemented.
 - Some reliability rests on discipline (the agent's own habits), not on mechanisms. We say so instead of claiming otherwise.
 
 ## Risks and responsibility

@@ -1,4 +1,4 @@
-# 安装与配置 Mnemos
+# 安装与配置 Mnemos（v1.7.0）
 
 > 这份文件只写**你要做的事**：装、配、验证、排错、数据放哪。
 > 它是什么、值不值得用 → `docs/简介`；有什么机制 → `docs/architecture-机制清单`；为什么这样设计 → `docs/设计者视角`。
@@ -379,12 +379,18 @@ learnerAgentPreset: standard
     # —— 存储 ——
     dataFile: ""                   # 记忆文件路径；留空 = 自动解析（见第 11 节）
     constitutionFile: ""           # 宪法路径；默认与 dataFile 同目录
-    autobiographyBudget: 2000      # 自传体注入的字符预算
+    autobiographyBudget: 2000      # 自传体注入字符预算；当前实测注入 12 条 / 约 1167 字
     # —— 心跳与归档 ——
     heartbeatIntervalMs: 1800000   # 心跳周期（毫秒），默认 30 分钟；0 = 禁用
     heartbeatEnabled: true         # 心跳初值；false = 持久关闭
+    curationEnabled: true          # 自动身份/经验整理；false = 关闭
+    identityCandidateTrigger: 5    # 身份候选达到多少条触发整理
+    identityFallbackDays: 30       # 候选不足 5 条时的 30 天兜底
+    experienceIntervalDays: 7      # 经验整理周期（天）；不按条数触发
     archiveMinAgeMs: 86400000      # 归档时间阈值（默认 24 小时）
     archiveMaxShort: 50            # 短时记忆数量阈值
+    # 联想激活（实验性；当前代码读取 fansearchEnabled，但尚未正式写入 Config schema）
+    # fansearchEnabled: true       # 工具执行后附注候选 id + 摘要片段；默认关
     # —— 空闲学习（默认关） ——
     learnerEnabled: false          # ★ 默认关；开它必须同时配 provider + model
     learnerIntervalMs: 3600000     # 间隔（毫秒）；0 = 关掉
@@ -442,7 +448,7 @@ learnerAgentPreset: standard
 | 装了但行为像旧版 | 还是缓存：完全退出再启动，别用"重新加载窗口" |
 | 出现"宪法 · 未初始化"警告 | 三种原因：① 第 5 节没做；② `constitutionFile` 指错路径；③ **第 5 节做了但没再完全重启一次**（宪法只在启动时装载） |
 | 记忆"空了" | 看日志里的 `dataFile=` —— 大概率是路径指到别处，数据本身没丢 |
-| 检索明显不准 | 召回是**关键词 + 标签**匹配（不是语义检索）：换关键词试，并检查标签是否覆盖关键类别 |
+| 检索明显不准 | 任务召回是**关键词 + 标签**匹配（不是语义检索）：换关键词试，并检查标签是否覆盖关键类别；联想候选是实验性搭车线索，可能无关 |
 | 技能一直不变好 | `reviewProvider` / `reviewModel` 不可用 → 评审静默失败（技能不会变差，但也不会变好）。v1.6 起**没有"冻结"这回事**了，别去 `skill-review-state.json` 里找 |
 | 子代理说"文件不存在"但明明有 | `glob` 用**绝对 Windows 路径**会静默返回 `No files found`。改用 `pwsh Get-ChildItem -File -Filter *.js` 或相对工作区根的路径。**静默假阴性比报错更危险** |
 | 任务的临时结果在收尾时没了 | 那是设计：临时的默认丢弃，要留请显式标记。交付物别同时标成临时 |

@@ -13,6 +13,8 @@ import { createHeartbeat } from '../src/heartbeat.js'
 import { parseSkillFile, listSkills, createSkillProvider } from '../src/skill-provider.js'
 import { skillsRootFor, resolveConstitutionFileForCli, defaultDataFile, defaultConstitutionFile, mnemosDataDir, describeResolved } from '../src/paths.js'
 import { buildSelfText, constitutionMissingWarning } from '../src/self-text.js'
+import { searchMemories, formatFansearchHint, FanSearchState } from '../src/fansearch.js'
+import { evaluateCurationDue } from '../src/curation-trigger.js'
 import { usageFileFor, revisionOf, appendUsage, readUsages, selfReviewHint, makeSkillUsageRecorder } from '../src/skill-usage.js'
 import { userSignalsFileFor, extractUserText, appendUserSignal, readUserSignals, makeSessionUsageTracker, makeUserSignalRecorder, skillOffersFileFor, sessionTasksFileFor, parseCatalogSkills, taskFingerprint, makeSessionOfferTracker, TASK_FINGERPRINT_CHARS, TASK_MAX_PER_SESSION } from '../src/user-signals.js'
 import { attribute, extractRulePoints, parseJsonReply, collectSelfReviews, runSkillReview, createSkill, newSkillStagingDirFor, buildReviewPrompt, buildVerifyPrompt, buildNewSkillVerifyPrompt, isDescriptionOnlyChange, splitSkillContent, writeBackSkill, appendJsonl, assertNoSecretInSkill, resolveSkillWriteBacks, DEFAULT_CREATE_WRITE_BACK, DEFAULT_REVIEW_WRITE_BACK, DEFAULT_MAX_SKILLS, classifyReviewReply, classifyVerifyReply, lastAppliedOf, resolveLastApplied, prunePendingLedger, pendingStats, PENDING_TTL_MS, PENDING_HANDLED_TTL_MS } from '../src/skill-review.js'
@@ -36,7 +38,7 @@ import {
 import { plain } from '../src/plain-text.js'
 // ★ 空闲学习：纯逻辑用**假 agents 服务**直接测（不碰真会话、不花 token）
 import {
-  runLearnerKick, ensureLearnerAgent, buildLearnerMessage,
+  runLearnerKick, ensureLearnerAgent, buildLearnerMessage, resetLearnerKickGateForTest,
   loadLearnerState, saveLearnerState, learnerStateFileFor,
   removeStaleSessionFiles, resolveLearnerWorkspace,
   learnerTasksFileFor, ensureLearnerTasksFile, readLearnerTasks,
@@ -134,24 +136,52 @@ console.log('== 4. 按标签检索 ==')
 const r3 = store.recall({ tags: ['db'] })
 assert(r3.length === 1 && r3[0].source === 'external', '标签 db 命中外部来源记忆')
 
+console.log('== 4b. 双语 tag：token 匹配 + 旧 tag/系统 tag 兼容 ==')
+{
+  const bi = await store.remember({
+    content: '双语 tag 样本',
+    summary: '双语 tag 样本',
+    tags: ['learner 学习', 'provenance 溯源'],
+    sessionId: 'tag-bilingual',
+  })
+  const sys = await store.remember({
+    content: '系统 tag 样本',
+    summary: '系统 tag 样本',
+    tags: ['task-graph', 'open'],
+    sessionId: 'tag-bilingual',
+  })
+  for (const t of ['learner', '学习', 'learner 学习', 'provenance', '溯源']) {
+    const hit = store.recall({ tags: [t], limit: 50 })
+    assert(hit.some((m) => m.id === bi.id), `双语 tag 输入 ${t} 应命中`)
+  }
+  const old = store.recall({ tags: ['task-graph'], limit: 50 })
+  assert(old.some((m) => m.id === sys.id), '系统 tag 仍按原 tag 精确命中')
+  const wrong = store.recall({ tags: ['task'], limit: 50 })
+  assert(!wrong.some((m) => m.id === sys.id), 'task 不应误命中 task-graph（不拆 hyphen）')
+}
+
 console.log('== 5. 取详情（两段式第二段）==')
 const opened = await store.open(b.id)
 assert(opened.detail.includes('UTF-8 BOM'), 'open 返回完整详情')
 
-console.log('== 6. 归档 task-1 短时→长期 ==')
-const cons = await store.consolidate('task-1', 'task-1 归档摘要')
-assert(cons.layer === 'hot', '归档后新记录 layer=hot')
-assert(cons.summary === 'task-1 归档摘要', '重建摘要生效')
-assert(a.id !== cons.id, '归档产生新 id')
-// 原始记录应降为 cold 且版本递增
-const aAfter = store.memories.get(a.id)
-const bAfter = store.memories.get(b.id)
-assert(aAfter.layer === 'cold' && bAfter.layer === 'cold', '原始记录降为冷存储（不删除）')
-assert(aAfter.version === 2, '原始记录版本递增到 2')
+console.log('== 6. 会话级归档：迁移一份存档 + 原始记录转冷 ==')
+const archiveSrc = await store.remember({
+  content: '会话级归档样本',
+  summary: '会话级归档样本',
+  tags: ['archive-sample'],
+  sessionId: 'session-archive-test',
+})
+const cons = await store.archiveSession('session-archive-test', '会话归档摘要')
+assert(cons.layer === 'cold', '归档记录是冷存，不进入 hot')
+assert(cons.summary === '会话归档摘要', '重建摘要生效')
+assert(cons.id !== archiveSrc.id, '归档产生独立存档 id')
+assert(cons.archiveOf === 'session-archive-test' && cons.archivedIn === 'session-archive-test', '存档带 archiveOf/archivedIn，可追溯')
+const archiveSrcAfter = store.memories.get(archiveSrc.id)
+assert(archiveSrcAfter.layer === 'cold' && archiveSrcAfter.version === 2, '原始记录降为冷存储（不删除）')
 
 console.log('== 7. 归档后再检索 ==')
 const r4 = store.recall({ taskId: 'task-1' })
-assert(r4.length === 3, '归档后 task-1 仍有 3 条（2 冷 + 1 热）')
+assert(r4.length === 2, 'task-1 仍保留两条原始记录（不再生成巨型合并记忆）')
 
 console.log('== 8. 持久化重载 ==')
 const store2 = new MemoryStore(dataFile)
@@ -164,6 +194,21 @@ hb.register('noop', '测试功能', async () => 'done')
 assert(hb.list().length === 1, '注册表有 1 个功能')
 const hbResult = await hb.run(store)
 assert(hbResult.results.length === 1 && hbResult.results[0].ok === true, '心跳运行成功')
+
+// ★ 心跳单飞：定时器与手动 mnemos_heartbeat 同时触发时，维护任务只能跑一轮
+{
+  const hb2 = createHeartbeat()
+  let slowRuns = 0
+  hb2.register('slow', '并发测试', async () => {
+    slowRuns++
+    await new Promise((r) => setTimeout(r, 20))
+    return 'ok'
+  })
+  const [x, y] = await Promise.all([hb2.run(store), hb2.run(store)])
+  const skipped = [x, y].filter((r) => r.skipped === true).length
+  assert(slowRuns === 1 && skipped === 1,
+    `★★ 心跳并发只跑一次（runs=${slowRuns}, skipped=${skipped}）`)
+}
 
 console.log('== 11b. V6-01：别的实例写入要先"看得到"（心跳/读取入口先刷新）==')
 {
@@ -300,6 +345,20 @@ console.log('== 11c. 空闲学习：那一脚怎么被送进专用会话（假 a
     assert(Array.isArray(input.content) && input.content[0]?.type === 'text', 'followup 收到 { content:[{type:text,...}] } 形状')
     assert(input.source && input.source.kind === 'user', '来源用宿主允许的 kind=user（plugin 会被 format v4 直接拒）')
     assert(calls.whenIdle === 1, '踢完等它静默（whenIdle 被调用）')
+  }
+
+  // ①d ★★ 定时 tick 与手动 kick 两个入口共用进程级单飞：并发只能有一个 sent
+  {
+    resetLearnerKickGateForTest()
+    const { agents, calls } = mkFake('idle')
+    const [a, b] = await Promise.all([
+      runLearnerKick({ agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000 }),
+      runLearnerKick({ agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000 }),
+    ])
+    const sent = [a, b].filter((r) => r.sent === true).length
+    const busy = [a, b].filter((r) => r.skipped && r.reason === 'busy-global').length
+    assert(sent === 1 && busy === 1 && calls.followedUp.length === 1,
+      `★★ 两个入口并发 → 只踢一次（sent=${sent}, busy=${busy}, followup=${calls.followedUp.length}）`)
   }
 
   // ①b ★★ 会话不活着（宿主重启过）→ **换新 id 并直接 create**，绝不 resume
@@ -856,6 +915,8 @@ console.log('== 11c. 空闲学习：那一脚怎么被送进专用会话（假 a
 }
 
 console.log('== 12. 衰减降权 ==')
+store.memories.get(a.id).layer = 'hot'
+await store.save()
 const decayResult = await store.decay({ thresholdMs: 0 })
 assert(decayResult.demoted >= 1, 'decay 降权了至少 1 条 hot 记忆')
 
@@ -867,11 +928,68 @@ const byS = store.shortBySession()
 assert(byS.has('session-A') && byS.get('session-A').length === 2, '会话A有2条短时记忆')
 assert(byS.has('session-B') && byS.get('session-B').length === 1, '会话B有1条短时记忆')
 const archA = await store.archiveSession('session-A')
-assert(archA !== null && archA.layer === 'hot' && archA.sessionId === 'session-A', '归档会话A成长期记忆')
+assert(archA !== null && archA.layer === 'cold' && archA.sessionId === 'session-A', '归档会话A成冷存存档')
 assert(archA.summary.includes('A1') && archA.summary.includes('A2'), '归档摘要合并 A1、A2')
 const byS2 = store.shortBySession()
 assert(!byS2.has('session-A'), '归档后会话A短时清空')
 assert(byS2.has('session-B') && byS2.get('session-B').length === 1, '会话B不受影响（各归各）')
+
+console.log('== 21b. 会话存档只保留一份，且不递归收编 archive ==')
+{
+  const st = new MemoryStore(path.join(dir, 'x21b', 'memory.json'))
+  await st.load()
+  const s1 = await st.remember({ content: 'one', summary: 'ONE', tags: ['x'], sessionId: 's21b' })
+  const tr = await st.remember({ content: 'task result detail', summary: 'TASK', tags: ['task-result', 'task'], sessionId: 's21b' })
+  tr.layer = 'hot'
+  await st.save()
+  const a1 = await st.archiveSession('s21b')
+  assert(a1 && a1.layer === 'cold' && a1.archiveOf === 's21b', '★★ 会话存档冷存且带 archiveOf')
+  assert(st.memories.get(tr.id).archivedIn === 's21b', '★★ task-result 标记已入档')
+  const s2 = await st.remember({ content: 'two', summary: 'TWO', tags: ['x'], sessionId: 's21b' })
+  const a2 = await st.archiveSession('s21b')
+  assert(a2 && a2.id === a1.id, '★★ 同一会话再次归档复用同一份存档')
+  assert([...st.memories.values()].filter((m) => m.archiveOf === 's21b').length === 1, '★★ 同一会话只保留一份 archive')
+  assert(!String(a2.detail || '').includes(a1.id), '★★ 存档不会把上一次 archive 递归复制进自己')
+  assert(st.memories.get(s1.id).layer === 'cold' && st.memories.get(s2.id).layer === 'cold', '★★ 原始短时记录均转冷')
+}
+
+console.log('== 21c. 自动 curation 到期判据 ==')
+{
+  const now = Date.now()
+  const rec = (id, category, status, summary, createdAt = now) => ({
+    id, source: 'autobiography', category, identityStatus: status, summary, createdAt, tags: [category],
+  })
+  const fake = (arr) => ({ memories: new Map(arr.map((m) => [m.id, m])) })
+  const no = evaluateCurationDue(fake([
+    rec('i1', 'identity', 'core', 'x'.repeat(323)),
+    ...[1, 2, 3, 4, 5].map((n) => rec(`e${n}`, 'experience', null, `经验${n}`)),
+  ]), { now })
+  assert(no.due === false, '★★ 未满 800 / 经验 5 条 → 不自动整理')
+
+  const idDue = evaluateCurationDue(fake([
+    rec('i1', 'identity', 'core', 'x'.repeat(801)),
+    ...[1, 2, 3, 4, 5].map((n) => rec(`c${n}`, 'identity', 'candidate', `候选${n}`)),
+  ]), { now })
+  assert(idDue.due === true && idDue.action === 'identity', '★★ core 满且候选≥5 → 身份到期')
+
+  const fallback = evaluateCurationDue(fake([
+    rec('i1', 'identity', 'core', 'x'.repeat(801)),
+    rec('c1', 'identity', 'candidate', '候选', now - 31 * 24 * 3600 * 1000),
+  ]), { now })
+  assert(fallback.due === true && fallback.action === 'identity', '★★ 候选不足 5 但最老 >30 天 → 兜底到期')
+
+  const expDue = evaluateCurationDue(fake([
+    ...[1, 2, 3].map((n) => rec(`i${n}`, 'identity', 'core', `身份${n}`)),
+    ...[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].map((n) => rec(`e${n}`, 'experience', null, `经验${n}`)),
+  ]), { now })
+  assert(expDue.due === false, '★★ 只按条数（>12）不再触发经验整理')
+
+  const expAge = evaluateCurationDue(fake([
+    ...[1, 2, 3, 4, 5].map((n) => rec(`e${n}`, 'experience', null, `经验${n}`)),
+    { id: 'r1', source: 'internal', tags: ['experience-revision'], createdAt: now - 8 * 24 * 3600 * 1000 },
+  ]), { now })
+  assert(expAge.due === true && expAge.action === 'experience', '★★ 距上次经验整理 ≥7 天 → 周触发')
+}
 
 console.log('== 22. 召回排序（sessionId 感知 + mode）==')
 await store.remember({ content: 'SELF 会话的短时记忆', summary: 'SELF短时', tags: ['recall'], sessionId: 'SELF' })
@@ -1523,6 +1641,16 @@ assert(sr.length === 2, '只按 skill-feedback 标签收集（不要求技能名
 assert(sr[0].text === '不好用' && sr[0].session === 'S1', '带出文本与会话')
 assert(collectSelfReviews(mems, { sinceT: 20 }).length === 1, 'sinceT 过滤掉旧的')
 assert(collectSelfReviews(mems).every((x) => x.from === 'self'), '标记来源为 self')
+{
+  const declared = collectSelfReviews([
+    { id: 'd1', tags: ['skill-feedback', 'sk'], createdAt: 50, sessionId: 'learn', summary: 'sk 的修订反馈', detail: '建议...' },
+    { id: 'd2', tags: ['skill-feedback', 'sk'], createdAt: 60, sessionId: 'learn', summary: '别的摘要', detail: '提及 sk' },
+  ], { skillNames: new Set(['sk']) })
+  assert(declared[0].skill === 'sk' && declared[0].selfDeclared === true,
+    '★★ 无使用记录时，skill-feedback + summary 以技能名开头 → 可直引')
+  assert(declared[1].selfDeclared === false,
+    '★ 仅 tag 有技能名但 summary 不以它开头 → 不直引（防误伤）')
+}
 
 console.log('== 60. 评审编排：六条「不改」与写回开关 ==')
 const rvRoot = path.join(dir, 'rv')
@@ -4446,6 +4574,66 @@ console.log('== 94h. applyCurationProposal：身份应用 + 历史 revision ==')
   assert(active.length === 2 && active.some((m) => m.summary === '新身份'), '★★ 应用后身份为 keep + replace 新条')
 }
 
+console.log('== 94i. fansearch：英文查询命中中文摘要 + 来源/ID + seen ==')
+{
+  const mems = [
+    {
+      id: '11111111-1111-4111-8111-111111111111',
+      summary: 'learner 会话回收后工具集退化，需要检查 session cleanup',
+      source: 'autobiography', category: 'experience',
+      tags: ['learner', 'session', 'experience'],
+    },
+    {
+      id: '22222222-2222-4222-8222-222222222222',
+      summary: '心跳定时清理会话',
+      source: 'internal', tags: ['heartbeat'],
+    },
+    {
+      id: '33333333-3333-4333-8333-333333333333',
+      summary: '外部资料：toolset cleanup',
+      source: 'external', tags: ['toolset'],
+    },
+  ]
+  const hits = searchMemories(mems, 'learner session cleanup toolset regression', { top: 3 })
+  assert(hits.length > 0 && hits[0].id === mems[0].id, '★★ 英文查询应命中中文 learner 摘要')
+  assert(hits[0].source === '自传体·经验', '★★ 来源戳应区分自传体类目')
+  assert(hits[0].id.includes('-') && hits[0].fragment.length <= 40, '★★ 片段带完整 id 且不返回全文')
+  const excluded = searchMemories(mems, 'learner session cleanup toolset regression', {
+    exclude: new Set([mems[0].id]), top: 3,
+  })
+  assert(!excluded.some((x) => x.id === mems[0].id), '★★ seen 过滤应排除已查看 id')
+  const external = searchMemories(mems, 'toolset cleanup external', { top: 3 })
+  assert(external.some((x) => x.id === mems[2].id && x.source === '外部记忆·未验证'), '★★ 外部记忆必须带未验证来源戳')
+  const weighted = searchMemories([
+    { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', summary: 'learner session cleanup', source: 'internal', tags: ['learner'] },
+    { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', summary: 'learner session cleanup', source: 'autobiography', category: 'experience', tags: ['learner'] },
+  ], 'learner session cleanup', { top: 2 })
+  assert(weighted[0].id === 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '★★ 同命中时自传体应优先于普通记忆')
+  const gated = searchMemories([
+    { id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', summary: 'cleanup', source: 'autobiography', category: 'experience', tags: ['misc'] },
+    { id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', summary: 'cleanup', source: 'internal', tags: ['cleanup'] },
+  ], 'cleanup', { top: 2 })
+  assert(!gated.some((x) => x.id === 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'), '★★ 弱匹配自传体不得靠来源加权过候选门槛')
+  assert(gated.some((x) => x.id === 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'), '★★ 强匹配普通记忆仍应成为候选')
+
+  const st = new FanSearchState()
+  st.onTurn('s1', 1)
+  for (let i = 0; i < 3; i++) st.onAssistant('s1', 1, i, 'x'.repeat(160), true)
+  assert(st.shouldScan('s1', { toolName: 'read' }) === true, '★★ 3 个工具轮次且内容足够应触发')
+  st.markScanned('s1')
+  assert(st.shouldScan('s1', { toolName: 'read' }) === false, '★★ 同一 step 不重复扫描')
+  const low = new FanSearchState()
+  low.onTurn('s2', 1)
+  low.onAssistant('s2', 1, 0, 'x'.repeat(90), true)
+  assert(low.shouldScan('s2', { toolName: 'write' }) === false, '★★ 高风险工具本身不再强制触发')
+  low.noteRecall('s2', 0)
+  assert(low.shouldScan('s2', { toolName: 'read' }) === true, '★★ 正常召回极少时应提前触发')
+  st.markSeen('s1', [mems[0].id], 'test')
+  assert(st.seenFor('s1').has(mems[0].id), '★★ seen ledger 记录已查看 id')
+  const hint = formatFansearchHint(hits)
+  assert(hint.includes(`[id: ${mems[0].id}]`) && hint.includes('自传体·经验'), '★★ 附注带 id 与来源')
+}
+
 console.log('== 95. ★ F-5 无 sessionId：remember({source:dormant}) 必须明确回执，不许静默回「已写入」==')
 {
   const f5b = new MemoryStore(path.join(dir, 'x95', 'memory.json'))
@@ -4484,6 +4672,12 @@ console.log('== 95c. 会话存档型巨物：默认不返回，显式 includeArc
   })
   assert(st.isArchiveLike(big) === true, '★★ 体积/标记判定：30K detail + 210 tags 算"会话存档型巨物"')
   assert(st.isArchiveLike(st.memories.get([...st.memories.keys()][0])) === false, '★ 普通小记录不算存档型')
+  assert(st.isArchiveLike({ detail: '[7c787300-0000-4000-8000-000000000000 v1] \\n成员块' }) === true,
+    '★★ 打标前拼接档：detail 以 [uuid vN] 开头也算存档型')
+  assert(st.isArchiveLike({ detail: '[任务 t-abc] 记录' }) === true,
+    '★★ 打标前任务块：[任务 ...] 开头也算存档型')
+  assert(st.isArchiveLike({ detail: '正文里提到 [7c787300-0000-4000-8000-000000000000 v1] 但不在开头' }) === false,
+    '★ 前缀判据不误伤正文里的同形文本')
 
   const hit = st.recall({ query: '沙箱', limit: 2 })
   assert(hit.length === 1 && !hit.some((m) => m.id === big.id),
@@ -4731,6 +4925,11 @@ console.log('== 97. ★ F-4 规则⑧补全三类 + 全部提示行不含字面�
   //   ★ 2026-10-24 抬到 3800：自传体改为五类（identity/decision/experience/event/other），
   //     ⑧ 补 identity/experience/occurredAt；不再为旧四类口径硬压字数。实测 3638。
   assert(one.length < 3800, `★ 提示词预算（实测 ${one.length} 字符 / 上限 3800；去重前 3062）`)
+  {
+    const summaryRule = lines97.find((l) => l.startsWith('⑤'))
+    assert(summaryRule.includes('中文（english）') && summaryRule.includes('不整句翻译'),
+      '★★ ⑤ 要求摘要关键词附英文检索锚点，但不整句翻译')
+  }
   const taskRule = lines97.filter((l) => l.startsWith('㉔'))
   assert(taskRule.length === 1 &&
     taskRule[0].includes('多个模型或子代理协作') &&

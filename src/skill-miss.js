@@ -20,6 +20,7 @@
  */
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { readUsages } from './skill-usage.js'
 import { listSkills } from './skill-provider.js'
 import { callLlm, parseJsonReply } from './skill-review.js'
@@ -50,9 +51,14 @@ export async function loadMissState(file) {
 export async function saveMissState(file, state) {
   state.judged = state.judged.slice(-JUDGED_KEEP)
   await fs.mkdir(path.dirname(file), { recursive: true })
-  const tmp = file + '.tmp'
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8')
-  await fs.rename(tmp, file)
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await fs.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8')
+    await fs.rename(tmp, file)
+  } catch (e) {
+    try { await fs.unlink(tmp) } catch { /* 已 rename 或从未创建 */ }
+    throw e
+  }
 }
 
 export async function appendMiss(file, rec) {
