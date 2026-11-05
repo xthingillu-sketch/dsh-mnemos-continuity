@@ -65,7 +65,7 @@ Full statement (Chinese): [`README.md`](README.md) → 风险与责任.
 | Install / configure / tools / data location / troubleshooting | [`INSTALL.md`](INSTALL.md) |
 | Architecture, data flow, one task end-to-end | `docs/架构总览.md` |
 | Every mechanism and its guarantees/limits | `docs/architecture-机制清单.md` |
-| **Module-by-module implementation** (appendix: the constitution and the system prompt, verbatim) | [`docs/模块与功能实现.md`](docs/模块与功能实现.md) |
+| **Module-by-module implementation** (appendix: the constitution and the system prompt, verbatim) | [`docs/04-模块与功能实现.md`](docs/04-模块与功能实现.md) |
 | Why it is shaped this way | `docs/设计者视角.md` |
 
 > The release ships Markdown docs only; docx/pdf are not bundled.

@@ -207,7 +207,7 @@ dsh plugin --profile web add dsh-mnemos-continuity
 | 装它 / 查配置 | [`INSTALL.md`](INSTALL.md) |
 | 看它**有哪些机制**、各自保证什么、边界在哪 | `docs/architecture-机制清单.md` |
 | 知道**为什么**这样设计 | `docs/设计者视角.md` |
-| **想读代码 / 改代码**：每个模块有哪些功能、具体怎么实现 | `docs/模块与功能实现.md`（**纯 Markdown**，附录含宪法原文与系统提示原文） |
+| **想读代码 / 改代码**：每个模块有哪些功能、具体怎么实现 | `docs/04-模块与功能实现.md`（**纯 Markdown**，附录含宪法原文与系统提示原文） |
 | 确认这是哪一版 | 发行目录根部的 `VERSION.md` |
 
 > 发布包只带 `.md` 文档，不再附带 docx/pdf，避免重复占空间；内容以 Markdown 为准。
