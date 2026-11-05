@@ -1,4 +1,4 @@
-# 安装与配置 Mnemos（v1.7.0）
+# 安装与配置 Mnemos（v1.7.1）
 
 > 这份文件只写**你要做的事**：装、配、验证、排错、数据放哪。
 > 它是什么、值不值得用 → `docs/简介`；有什么机制 → `docs/architecture-机制清单`；为什么这样设计 → `docs/设计者视角`。
@@ -19,7 +19,7 @@ Mnemos 是**装在你机器上的一套「让判断跨会话、跨模型继续�
 
 > **保守起步（推荐第一次就这么做）**：装完先关掉后台维护 —— `heartbeatEnabled: false`（见第 10 节），
 > 只留"写记忆 / 召回 / 任务续接"，确认对你真有用再一项项开回来。
-> 空闲学习（learner）本来就是默认关的。这样第一晚不会有任何自动的 AI 调用，也就不会有惊喜账单。
+> 空闲学习已在 v1.7.1 移除，开放任务改由宿主自动化任务承担；所以第一晚不会有 learner 的自动 AI 调用。
 >
 > **关掉之后还剩什么**（这张表就是"保守起步"的全部代价，先看清再决定）：
 >
@@ -222,7 +222,6 @@ $env:ELECTRON_RUN_AS_NODE = 1
 | `mnemos_propose_skill` | 提议新建技能（failure-fixed 要反例+正例；memory-recurring 要 ≥3 个跨会话事件、正反例至少一种；external-rewrite 要来源记录，且默认只暂存、保留需你确认） |
 | `mnemos_task_open` / `mnemos_task_update` / `mnemos_task_close` / `mnemos_task_done` / `mnemos_task_cite` | 任务图（任务档案/寻址空间）：开图 / 填回执 / 收尾 / 记已完成里程碑 / 登记依赖 —— 派活、跨会话、或会产出多条记忆时用；未完成步骤用宿主 todo，图不复制结论正文 |
 | `mnemos_heartbeat` / `mnemos_maintenance_list` / `mnemos_heartbeat_toggle` | 手动跑一次维护 / 看维护清单 / 关心跳 |
-| `mnemos_learner_kick` | 立刻踢一轮空闲学习（诊断用，也可主动触发） |
 
 ## 8. 后台维护在做什么（心跳）
 
@@ -233,142 +232,14 @@ $env:ELECTRON_RUN_AS_NODE = 1
 **一个定时器跑整张注册表**：`heartbeatIntervalMs` 管的是全部维护任务。
 运行时开关默认在每轮对话开始时被置回开启；要**持久关闭**，在配置里写 `heartbeatEnabled: false`。
 
-## 9. 空闲学习（可选，默认关）
+## 9. 宿主自动化（替代空闲学习）
 
-> **这一节可以整段跳过**：它默认是关的，跳过不影响上面任何一步。只有你打算开它时，才需要读下去 ——
-> 下面这些是把它开起来才会遇到的坑（preset、provider 路由、工作目录），不是使用这个插件的前提知识。
+v1.7.1 已移除空闲学习：`learner-loop`、`mnemos_learner_kick`、learner 配置与 preset 都不再存在。
 
-到点了，它把"一脚"送进一个**专用会话**，让模型自己安排这一轮：读你留的任务，没任务就自由学点，也可以什么都不做。
-**不占用、不污染你正在用的对话。**
+开放任务改由**宿主自动化任务**承担：用宿主定时任务给主模型发提示，会话按正常流程 recall / 写记忆。
+不再需要 `learnerProvider` / `learnerModel` / `learnerAgentPreset` / `learnerTasksFile`，也不需要专用 learner 会话。
 
-### 两个前提，缺一不可
-
-| 前提 | 配置 |
-|---|---|
-| ① 打开开关 | `learnerEnabled: true`（默认 false） |
-| ② 配好外部 API | `learnerProvider` + `learnerModel`（**必须**，缺一即不工作；为什么不能用 DeepSeek 自家路由见下） |
-
-```yaml
-- id: dsh-mnemos
-  config:
-    learnerEnabled: true
-    learnerIntervalMs: 3600000         # 1 小时
-    learnerProvider: <provider-id>     # 必须：带 key 的第三方路由（见下）
-    learnerModel: <model-id>
-    learnerAgentPreset: standard       # 不设它就没有联网/读文件工具（也可自建精简 preset，见下）
-```
-
-> **默认用什么模型**：没有默认 —— **必须自己填** `learnerProvider` + `learnerModel`（带 key 的第三方路由），留空即不工作。
-> 想让它跑在别的模型上，就显式填 `learnerProvider` + `learnerModel`（必须是带 key 的 provider）。
-> 注意：如果你把模型配错（比如配了一个拿不到凭据的 provider），回执与 `learner.log` 会记下失败原因，不会静默。
-
-### 我们实际用的接法（可以直接照抄）
-
-关键点是：**联网与学习是两套独立的接线，各走各的路由。**
-
-| 用途 | 走哪条路由 | 为什么 |
-|---|---|---|
-| **联网**（`web_search` / `web_fetch`） | **DeepSeek 官方**（`web-search-deepseek`，凭据用 `DEEPSEEK_API_KEY`，key 存凭据服务、不写进配置） | 官方端点能真正拿到搜索结果；换第三方 Anthropic 端点会因缺计费头而**拿不到结果**（实测） |
-| **空闲学习的模型** | **必须第三方 api-key 路由**（如阿里云 token-plan 的 `qwen3.8-flash`） | 空闲学习是**插件自己建**的 agent：后台几乎不存在活父会话，也就借不到宿主的派活通道；而自建 agent 走 DeepSeek 自家路由会稳定 `TRANSPORT`，第三方 api-key 一次就通。另外宿主派活的子会话会挂在父会话下面、人不好看见 —— 后台任务应当独立可观测 |
-
-所以一句话：**官方 key 只用在"搜索"上，不用在 learner 的 LLM 上** —— 两者互不影响，也不用为了联网去动学习模型。
-
-```yaml
-- id: dsh-mnemos
-  config:
-    learnerEnabled: true
-    learnerIntervalMs: 21600000          # 6 小时；每轮 token 取决于模型自己选的任务（未测量），频率低一点更划算
-    learnerProvider: aliyun              # ★ 第三方 api-key 路由（必须）
-    learnerModel: qwen3.8-flash
-    # 留空 = 不工作：后台没有主会话可借，也不会退回 DeepSeek 自家路由
-    learnerAgentPreset: standard         # 出厂 preset（带联网/读文件）；要收窄再自建，见下
-```
-
-> **为什么必须是第三方路由**：空闲学习是**插件自己建**的 agent —— 后台运行时几乎不存在"活着的父会话"，
-> 所以借不到宿主的派活通道；而自建 agent 走 DeepSeek 自家路由会稳定 `TRANSPORT`（实测 5 次重试全败），
-> 走第三方 api-key 路由一次就通。另一条理由：宿主派活的子会话挂在**父会话的智能体**下面，人不好看见。
-
-### 工具集由 preset 决定
-
-**不设 `learnerAgentPreset` 时，默认就是 `standard`** —— 它带联网与读文件工具，能正常学习。
-只有当你**想收窄**工具集（比如不想要 shell / 子代理 / 待办这些），才需要自建一个精简 preset。
-
-照抄这一行就够用：
-
-```yaml
-learnerAgentPreset: standard
-```
-
-想更克制（只留 **联网 + 读文件 + Mnemos 自己的工具**），自己声明一个再引用它 ——
-把它和 `dsh-mnemos-continuity` 写进**同一份** `cordis.patch.yml`：
-
-```yaml
-- insert:
-    - id: preset-mnemos-learner
-      name: "@deepseek-ai/dsh-agent-preset"
-      config:
-        id: mnemos-learner
-        plugins:
-          - id: persona                  # ★ 必须：没它连 {{model}} 都没有值，整轮直接报错
-            name: "@deepseek-ai/dsh-persona"
-            config:
-              prefix: 'You are a coding agent powered by the {{model}} model.'
-              # ★ 不要写 {{cwd}}：宿主的提示变量只有 provider / model / self_narrative，
-              #   {{cwd}} 会让子会话**第一轮就整轮失败**（unknown prompt variable）。
-              suffix: 'Work inside the configured learner workspace; do not wander outside it.'
-          - id: tool-fs                  # 读文件（同包也带 write/edit，拆不开）
-            name: "@deepseek-ai/dsh-tool-fs"
-          - id: tool-fs-search           # glob / grep
-            name: "@deepseek-ai/dsh-tool-fs-search"
-          - id: tool-web                 # web_search / web_fetch
-            name: "@deepseek-ai/dsh-tool-web"
-            config:
-              fetch: true
-          - id: tool-todo                # 宿主任务清单（系统提示 ㉔ 的"未完成步骤"）
-            name: "@deepseek-ai/dsh-tool-todo"
-            config:
-              allowParallelInProgress: true
-```
-
-> `tool-todo` 是 v1.6 补上的：系统提示 ㉔ 要求未完成步骤写宿主 todo；没有它，learner 只能开图、却无法按规则记录未完成步骤。
->
-> 另外，空闲任务的提醒会明确**禁止申请提权/审批**：用户不在旁边，提权请求会把这一轮卡住；需要提权的操作应跳过并回报。
-
-然后 `learnerAgentPreset: mnemos-learner`。**两个坑**：
-
-1. preset 里 `persona` 必须带上 —— 没它 `{{model}}` 就没有值、整轮报错。
-   **但 persona 里别写 `{{cwd}}`**：宿主只注册了 `provider` / `model` / `self_narrative` 三个提示变量，
-   写 `{{cwd}}` 会让子会话第一轮就失败（这条是实测踩出来的）；
-2. **换 preset 后要先删掉旧的 learner 会话** —— 宿主只在"会话第一轮之前"选 preset，已跑过的会话不会补挂。
-
-### 想立刻看它跑一轮
-
-用 `mnemos_learner_kick`（`force: true` 可忽略间隔）。它会把**每一步的真实结果**回报：到点判定 / 新建还是恢复会话 / 是否选中 preset / 入队是否成功 / 入队后状态。
-
-### 任务文件（你写，它读）
-
-首次开启会自动生成（也可用 `learnerTasksFile` 指定）：`<memory.json 同目录>\learner-tasks.md`。
-
-- 写**开放学习类**的事（"把 X 弄明白"），不用写成工单；
-- **每次到点，文件内容原样送给模型**；文件开头的说明是 HTML 注释，不会当成任务送出去；
-- **这个文件归你管**：想让某件事别再做了，你自己把那段删掉。
-  ⚠ 说准一点：它手上确实有写工具，改不动是因为**这个文件在它的工作区之外、越界写会被拒** ——
-  是沙箱挡住的，不是"机制保证它改不了"。
-
-### 两条实测边界（值得先知道）
-
-- **自指工具已加闸门**：弱模型会把 `mnemos_learner_kick` 当成"今天的任务"，连踢三轮零产出。现在这个工具在**执行处**拒绝 learner 会话自己调用它。
-- **它发来的提权请求可以直接拒绝**：看到 `mnemos-learner` 请求提权，拒绝即可。
-
-### 它靠什么、不靠什么
-
-- **结论落记忆，不落会话** —— 专用会话被删也能重建，成果不丢；
-- 同一时刻只用一个会话，残留会被清掉后重建，不会越堆越多；
-- 它**不打断**正在忙的 agent（忙就跳过这一轮）；
-- **每一轮都用一个（可能是全新的）会话**：不 resume 旧会话 —— resume 出来的会话补不上工具集
-  （实测踩过：`read`/`glob` 全变 `unknown tool`）。回执与日志里可能看到"会话重建"。
-  换会话不影响结论 —— 能留下来的只有写进记忆的东西。
-
+自动 curation 也不再依赖 `auxProvider`：它找一个空闲会话，注入一次 `mnemos_curate`；没有空闲会话就跳过。
 ## 10. 配置项（完整清单）
 
 写在 `~/.dsh/profiles/<name>/cordis.patch.yml`：
@@ -379,7 +250,7 @@ learnerAgentPreset: standard
     # —— 存储 ——
     dataFile: ""                   # 记忆文件路径；留空 = 自动解析（见第 11 节）
     constitutionFile: ""           # 宪法路径；默认与 dataFile 同目录
-    autobiographyBudget: 2000      # 自传体注入字符预算；当前实测注入 12 条 / 约 1167 字
+    autobiographyBudget: 2000      # 自传体注入字符预算；身份固定，决策/经验按预算
     # —— 心跳与归档 ——
     heartbeatIntervalMs: 1800000   # 心跳周期（毫秒），默认 30 分钟；0 = 禁用
     heartbeatEnabled: true         # 心跳初值；false = 持久关闭
@@ -391,21 +262,13 @@ learnerAgentPreset: standard
     archiveMaxShort: 50            # 短时记忆数量阈值
     # 联想激活（实验性；当前代码读取 fansearchEnabled，但尚未正式写入 Config schema）
     # fansearchEnabled: true       # 工具执行后附注候选 id + 摘要片段；默认关
-    # —— 空闲学习（默认关） ——
-    learnerEnabled: false          # ★ 默认关；开它必须同时配 provider + model
-    learnerIntervalMs: 3600000     # 间隔（毫秒）；0 = 关掉
-    learnerSessionId: "mnemos-learner"   # 专用会话 id（代码自建）
-    learnerAgentPreset: "standard"       # ★ 决定有没有联网/读文件工具
-    learnerTasksFile: ""           # 任务文件；留空 = memory.json 同目录
-    learnerWorkspace: ""           # 会话工作目录；留空 = DSH 默认工作区
-    learnerProvider: ""            # 留空 = 不工作（必须配第三方 api-key 路由）
-    learnerModel: ""               # 留空 = 不工作
-    learnerMaxTokens: 0            # 0 = 继承全局 agent 配置
+    # —— 辅助路由（validation 兜底；自动 curation 已改为空闲会话注入，不用这里）——
+    auxProvider: ""                # 留空 = 走父会话/主模型
+    auxModel: ""                   # 留空 = 走父会话/主模型
     # —— 隔离验证（mnemos_validate）——
-    # 子会话必须有自己的 provider/model；留空 = 复用 learnerProvider/learnerModel（推荐），再不行才用父会话的。
-    # ★ 不要指望它跟父会话走 DeepSeek 自家路由：实测那条路对"插件自建 agent"一律 TRANSPORT 失败。
-    validateProvider: ""           # 留空 = 复用 learnerProvider
-    validateModel: ""              # 留空 = 复用 learnerModel
+    # 留空 = 父会话；再不行才用 auxProvider/auxModel。
+    validateProvider: ""           # 隔离验证 provider
+    validateModel: ""              # 隔离验证 model
     # —— 技能 ——
     createWriteBack: true          # 新建技能是否直接入目录
     externalSkillWriteBack: false  # 外部来源技能是否允许自动入目录（默认只暂存，等你确认）
@@ -459,4 +322,5 @@ learnerAgentPreset: standard
 **所以覆盖安装不会碰到你的记忆**：数据在 profile 目录下，与代码目录分开。
 
 > **使用限制与责任**：这套能力在善意使用下是效率工具，恶意使用会放大后果 —— 四类风险与责任划分
-> 见 README 的「**风险与责任**」一节（很短，建议开空闲学习或联网前读一遍）。
+> 见 README 的「**风险与责任**」一节（很短，建议开自动化或联网前读一遍）。
+

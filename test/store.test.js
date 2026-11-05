@@ -19,6 +19,8 @@ import { usageFileFor, revisionOf, appendUsage, readUsages, selfReviewHint, make
 import { userSignalsFileFor, extractUserText, appendUserSignal, readUserSignals, makeSessionUsageTracker, makeUserSignalRecorder, skillOffersFileFor, sessionTasksFileFor, parseCatalogSkills, taskFingerprint, makeSessionOfferTracker, TASK_FINGERPRINT_CHARS, TASK_MAX_PER_SESSION } from '../src/user-signals.js'
 import { attribute, extractRulePoints, parseJsonReply, collectSelfReviews, runSkillReview, createSkill, newSkillStagingDirFor, buildReviewPrompt, buildVerifyPrompt, buildNewSkillVerifyPrompt, isDescriptionOnlyChange, splitSkillContent, writeBackSkill, appendJsonl, assertNoSecretInSkill, resolveSkillWriteBacks, DEFAULT_CREATE_WRITE_BACK, DEFAULT_REVIEW_WRITE_BACK, DEFAULT_MAX_SKILLS, classifyReviewReply, classifyVerifyReply, lastAppliedOf, resolveLastApplied, prunePendingLedger, pendingStats, PENDING_TTL_MS, PENDING_HANDLED_TTL_MS } from '../src/skill-review.js'
 import { findSecrets, redactSecrets, describeHits, secretBlocksFileFor } from '../src/secret-patterns.js'
+import { memoryTrustLabel, isExternalInfoToolName } from '../src/trust-label.js'
+import { buildCurationDispatchMessage, pickIdleCurationAgent } from '../src/curation-dispatch.js'
 // ★ 注入消息的唯一构造点 + 宿主加载校验的等价规则（2026-10-17：缺 role 让 DeepSeek 路由 422、缺 id 让会话打不开）
 import { buildInjectedUserMessage, userMessageShapeProblems } from '../src/host-message.js'
 import { detectMissedUsage, readMisses, buildMissPrompt, MISS_REASONS } from '../src/skill-miss.js'
@@ -36,18 +38,6 @@ import {
   MAX_SNAPSHOTS_PER_SESSION, MAX_ITEMS_PER_CLASS, pruneCompactionSnapshots, SNAPSHOT_TTL_MS,
 } from '../src/compaction-snapshot.js'
 import { plain } from '../src/plain-text.js'
-// ★ 空闲学习：纯逻辑用**假 agents 服务**直接测（不碰真会话、不花 token）
-import {
-  runLearnerKick, ensureLearnerAgent, buildLearnerMessage, resetLearnerKickGateForTest,
-  loadLearnerState, saveLearnerState, learnerStateFileFor,
-  removeStaleSessionFiles, resolveLearnerWorkspace,
-  learnerTasksFileFor, ensureLearnerTasksFile, readLearnerTasks,
-  DEFAULT_LEARNER_SESSION_ID, DEFAULT_LEARNER_INTERVAL_MS, selfKickRefusal,
-  // ★ 会话回收（2026-10-17）：learner 会话不能无限复用（撑爆后整轮被拒、会话永久卡死）
-  normalizeLearnerState, shouldRecycleLearnerSession, nextLearnerSessionId, learnerSessionLogBytes,
-  describeLearnerRecycle,
-  DEFAULT_LEARNER_RECYCLE_BYTES, DEFAULT_LEARNER_RECYCLE_KICKS,
-} from '../src/learner-loop.js'
 import { acquireLock, probeLock, isStaleLock, lockBody, lockPathFor } from '../src/store-lock.js'
 // ★ F-15：形状真相源 + 纯构造函数（都是无宿主依赖的模块，所以这里 import 得到 ——
 //   这正是结构性修复的一半：index.js 有 @deepseek-ai/schemastery，纯 node 跑不起来）。
@@ -57,7 +47,7 @@ import {
 } from '../src/tool-output.js'
 import {
   rememberResult, recallResult, validateResult, curationResult, constitutionResult, deleteResult,
-  deprecateResult, dormantResult, openResult, consolidateResult, heartbeatResult, learnerKickResult,
+  deprecateResult, dormantResult, openResult, consolidateResult, heartbeatResult,
   maintenanceListResult, toggleResult, proposeSkillResult,
   taskOpenResult, taskUpdateResult, taskCloseResult, taskDoneResult, taskCiteResult,
 } from '../src/tool-results.js'
@@ -257,661 +247,6 @@ console.log('== 11b. V6-01：别的实例写入要先"看得到"（心跳/读取
   const idxSrcR = await fs.readFile(path.join(pluginRoot, 'src', 'index.js'), 'utf8')
   assert((idxSrcR.match(/await store\.refreshFromDisk\(\)/g) || []).length >= 2,
     '★ recall / open 两个读取入口都先刷新')
-}
-
-console.log('== 11c. 空闲学习：那一脚怎么被送进专用会话（假 agents，不碰真会话）==')
-{
-  const msg = buildLearnerMessage()
-  assert(typeof msg === 'string' && msg.length > 60, '那一脚是一段可读文本')
-  assert(msg.includes('空闲学习时间'), '这条消息标明是"空闲学习时间"')
-  assert(msg.includes('什么都不做') && msg.includes('这次不学'), '**显式允许零产出**（"这次不学"也算处理完）')
-  assert(msg.includes('不要申请提权') && msg.includes('用户不在旁边'),
-    '★ 空闲任务禁止申请提权（无人值守，提权会把这一轮卡住）')
-  assert(msg.includes('学点你想弄明白的东西'), '不规定学什么（留给模型自己决定）')
-  assert(!/必须|一定|务必产出/.test(msg), '不强制产出（没有"必须/务必"这类措辞）')
-
-  // ★★ 自指守卫（2026-10-16 新增）：**learner 自己不许调"空闲学习踢"**。
-  //   实测动机：本地的 granite4.1:8b 连跑三轮，每轮都只调这一个工具（"把自己又踢一次"），
-  //   零学习产出 —— 弱模型把"工具名（空闲学习踢）"当成了"任务（空闲学习）"。
-  //   平台没有"按 agent 隐藏工具"的接口，所以闸门放在执行处；判断逻辑是这里的纯函数。
-  {
-    const LS = 'mnemos-learner'
-    // ① 调用者就是 learner 自己 → 拒绝，且必须给出"该去做什么"的指路
-    const self = selfKickRefusal(LS, LS)
-    assert(self !== null, '★★ 自指守卫：learner 自己调用 → 必须拒绝（不是放行）')
-    assert(self.refused === 'self', '★★ 自指守卫：拒绝原因是可机读的 refused=self')
-    assert(typeof self.error === 'string' && self.error.includes('自己踢自己'), '★★ 自指守卫：拒绝文案点明"自己踢自己"没有效果')
-    assert(/学习/.test(self.error) && self.error.includes('mnemos_remember'), '★★ 自指守卫：拒绝文案要**指路**（去做学习、结论写进记忆），否则模型只会反复撞墙')
-    // ② 别的会话调用 → 放行（正常诊断/手动触发不受影响）
-    assert(selfKickRefusal('some-other-session', LS) === null, '★★ 自指守卫：外部会话调用 → 放行（诊断能力不能被误伤）')
-    assert(selfKickRefusal('mnemos-learner-2', LS) === null, '★★ 自指守卫：**前缀相同但 id 不同**必须放行（不能写成 startsWith 那种误伤）')
-    // ③ 取不到调用者 → 放行（宁可放过，不要因为拿不到 id 就把工具打瘸）
-    assert(selfKickRefusal(null, LS) === null, '★★ 自指守卫：调用者未知（null）→ 放行（fail-open，不误伤）')
-    assert(selfKickRefusal(undefined, LS) === null, '★★ 自指守卫：调用者 undefined → 放行')
-    assert(selfKickRefusal('', LS) === null, '★★ 自指守卫：空字符串 → 放行（不把空值当成"就是 learner"）')
-    // ④ learner 会话 id 没配/为空 → 放行（否则会一竿子拒掉所有调用）
-    assert(selfKickRefusal(LS, '') === null && selfKickRefusal(LS, null) === null, '★★ 自指守卫：learnerSessionId 为空 → 放行（不能因此拒掉一切）')
-    // ⑤ 反例核对：把"必须相等"写成"不相等"，上面第①条必须失败 —— 这条断言防的就是"闸门写反了还全绿"
-    assert(selfKickRefusal(LS, LS) !== null && selfKickRefusal('other', LS) === null, '★★ 自指守卫：方向性核对（相等才拒、不等才放）')
-  }
-
-  // 假 agents 服务：能记录被调用的动作
-  const mkFake = (existingStatus, opts = {}) => {
-    const calls = { created: 0, resumed: 0, followedUp: [], whenIdle: 0, createIds: [], removed: [] }
-    const agent = {
-      status: existingStatus,
-      followup(input) { calls.followedUp.push(input) },
-      async whenIdle() { calls.whenIdle++ },
-    }
-    let createAttempt = 0
-    const agents = {
-      get: (id) => (existingStatus === null ? null : agent),
-      async create(o) {
-        const { sessionId } = o
-        calls.created++
-        calls.createIds.push(sessionId)
-        calls.createOpts = o
-        createAttempt++
-        // createAlwaysExists：永远报"已存在"（模拟同名残留）；createExistsOnce：第一次报
-        const exists = opts.createAlwaysExists || (opts.createExistsOnce && createAttempt === 1)
-        if (exists) throw new Error(`session "${sessionId}" already exists`)
-        return { agent }
-      },
-    }
-    if (opts.withResume) {
-      agents.resume = async (o) => {
-        calls.resumed++
-        calls.resumeOpts = o
-        // ★ 钉住字段名：宿主 resume 读的是 `resumeSessionId`（与 sessionId 互斥）；
-        //   传错会得到 `Cannot read properties of undefined (reading 'length')`，进而每次踢都新建会话。
-        if (!o || typeof o.resumeSessionId !== 'string' || o.sessionId !== undefined) {
-          throw new Error('resume 必须用 resumeSessionId（且不得同时传 sessionId）')
-        }
-        if (opts.resumeThrows) throw new Error('无落盘会话')
-        return { agent }
-      }
-    }
-    return { calls, agents }
-  }
-
-  // ① 已有会话（空闲）→ 既不新建也不 resume，直接踢
-  {
-    const { agents, calls } = mkFake('idle', { withResume: true })
-    const r = await runLearnerKick({ agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000 })
-    assert(r.sent === true && r.created === false && r.resumed === false, '已有空闲会话 → 直接踢（不新建、不 resume）')
-    assert(calls.created === 0 && calls.resumed === 0, '没有多余的 create/resume')
-    assert(calls.followedUp.length === 1, 'followup 被调用一次')
-    const input = calls.followedUp[0]
-    assert(Array.isArray(input.content) && input.content[0]?.type === 'text', 'followup 收到 { content:[{type:text,...}] } 形状')
-    assert(input.source && input.source.kind === 'user', '来源用宿主允许的 kind=user（plugin 会被 format v4 直接拒）')
-    assert(calls.whenIdle === 1, '踢完等它静默（whenIdle 被调用）')
-  }
-
-  // ①d ★★ 定时 tick 与手动 kick 两个入口共用进程级单飞：并发只能有一个 sent
-  {
-    resetLearnerKickGateForTest()
-    const { agents, calls } = mkFake('idle')
-    const [a, b] = await Promise.all([
-      runLearnerKick({ agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000 }),
-      runLearnerKick({ agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000 }),
-    ])
-    const sent = [a, b].filter((r) => r.sent === true).length
-    const busy = [a, b].filter((r) => r.skipped && r.reason === 'busy-global').length
-    assert(sent === 1 && busy === 1 && calls.followedUp.length === 1,
-      `★★ 两个入口并发 → 只踢一次（sent=${sent}, busy=${busy}, followup=${calls.followedUp.length}）`)
-  }
-
-  // ①b ★★ 会话不活着（宿主重启过）→ **换新 id 并直接 create**，绝不 resume
-  //   为什么推翻 v1.4.1 的"先 resume"：宿主的 agentPresets.select() 只允许在会话第一轮之前调用，
-  //   resume 回来的旧会话补不上 preset → 工具集退化成"只有 mnemos + context7"（没有 read/联网），
-  //   表现像"网络坏了"。结论都在记忆里，会话是草稿纸，所以直接换新。
-  {
-    const { agents, calls } = mkFake(null, { withResume: true })
-    const r = await runLearnerKick({ agents, intervalMs: 0, lastKickAt: 0, now: 1000 })
-    assert(calls.resumed === 0, '★★ 不活着时**不 resume**（resume 出来的会话挂不上 preset，工具集会退化）')
-    assert(calls.created === 1 && calls.createIds[0] === 'mnemos-learner-1', '★★ 换新 id 并直接 create（created=true 才会去选 preset）')
-    assert(r.sent === true && r.created === true && r.resumed === false, '结果标明是新建的（不是 resume）')
-    assert(r.recycle && r.recycle.reason === 'restarted', '★★ 回执写明原因是"宿主重启过"（不是悄悄换掉）')
-    assert(r.sessionId === 'mnemos-learner-1' && r.activeSessionId === 'mnemos-learner-1', '★ 新 id 被回报，调用点会存回状态')
-  }
-
-  // ①c 已经在用新 id（本进程里活着）→ 复用，不再 create/resume
-  {
-    const { agents, calls } = mkFake('idle', { withResume: true })
-    const r = await runLearnerKick({
-      agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-      state: { activeSessionId: 'mnemos-learner-1', recycled: 1, retired: ['mnemos-learner'], kicksSinceRecycle: 1 },
-    })
-    assert(r.sent === true && r.created === false && r.resumed === false, '活着的新 id → 直接踢（既不新建也不 resume）')
-    assert(calls.created === 0 && calls.resumed === 0 && r.recycle === null, '没有多余的 create/resume/回收')
-    assert(r.sessionId === 'mnemos-learner-1', '用的是状态里的 activeSessionId，不会退回基础 id')
-  }
-
-  // ② 宿主没提供 resume → 直接 create
-  {
-    const { agents, calls } = mkFake(null)
-    const r = await runLearnerKick({ agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000 })
-    assert(calls.created === 1, '宿主没有 resume → 直接 create（自己建，无需用户手动开对话）')
-    assert(r.sent === true && r.created === true, '新建会话并踢成功')
-  }
-
-  // ③ 它在忙 → 跳过，不打扰
-  {
-    const { agents, calls } = mkFake('running')
-    const r = await runLearnerKick({ agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000 })
-    assert(r.skipped === true && r.reason === 'busy', 'agent 在忙 → 跳过（绝不 steer/inject 打断）')
-    assert(calls.followedUp.length === 0 && calls.whenIdle === 0, '跳过时没有 followup、没有等待')
-  }
-
-  // ②b ★★ 同名残留：**清掉残留 → 用同一个 id 重建**（不再换 id，避免"每次调用堆一个新对话"）
-  {
-    const removedIds = []
-    const { agents, calls } = mkFake(null, { withResume: true, resumeThrows: true, createExistsOnce: true })
-    const r = await runLearnerKick({
-      agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-      removeStale: async (id) => { removedIds.push(id); return 3 },
-    })
-    // 现在先因"不活着"换到 -1，再在 -1 上碰到"已存在"→ 清 -1 的残留 → 用同一个 -1 重试
-    assert(removedIds.length >= 1 && removedIds.includes('mnemos-learner-1'), '★ 报"已存在"时清的是**当前新 id** 的残留')
-    assert(calls.createIds.every((x) => x === 'mnemos-learner-1'),
-      '★★ 清完仍用**同一个新 id** 重试（不再继续换 -2/-3 —— 那正是会话堆积的根源）')
-    assert(r.sent === true && r.sessionId === 'mnemos-learner-1' && r.staleRemoved === 3, '★ id 稳定在新 id 上，并回报清掉了几处')
-  }
-
-  // ②b2 ★★ meta（尤其 agentPreset）必须原样透传到宿主 —— 少了它 agent 只拿最小工具集、**没有联网工具**
-  {
-    const { agents, calls } = mkFake(null, { withResume: true, resumeThrows: true })
-    const meta = { cwd: 'C:\\tmp', agentPreset: 'standard' }
-    const r = await runLearnerKick({ agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000, meta })
-    assert(r.sent === true, '★ 带 meta 也能正常踢')
-    assert(calls.createOpts && calls.createOpts.meta === meta, '★★ meta（含 agentPreset）原样传给 create')
-    assert(calls.createOpts.meta.agentPreset === 'standard', '★★ agentPreset 在里面 —— 它决定有没有联网工具')
-  }
-
-  // ②b3 ★★ agentPreset 必须**主动 select** —— 光写 meta 不挂插件（实测工具数不变、没网）
-  {
-    const picked = []
-    const { agents } = mkFake(null, { withResume: true, resumeThrows: true })
-    const r = await runLearnerKick({
-      agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-      meta: { cwd: 'C:\\tmp', agentPreset: 'standard' },
-      selectPreset: async (agent) => { picked.push(agent); return 'standard' },
-    })
-    assert(picked.length === 1, '★★ 新建会话后调用了 selectPreset（不调就没有工具集/联网工具）')
-    assert(r.sent === true && r.preset === 'standard', '★ 回报实际选中的 preset 名')
-  }
-
-  // ②b4 已跑过的会话（resume）不再 select —— 宿主会抛 agent-preset/locked，不做无用功
-  {
-    const picked = []
-    const { agents } = mkFake('idle')
-    await runLearnerKick({
-      agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-      selectPreset: async (a) => { picked.push(a); return 'standard' },
-    })
-    assert(picked.length === 0, '★ 复用已有 agent 时不调 select（宿主规则：会话开始后就锁定了）')
-  }
-
-  // ②b5 selectPreset 失败不致命 —— 照踢，只是这个 agent 少掉那套工具
-  {
-    const { agents } = mkFake(null)
-    const r = await runLearnerKick({
-      agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-      selectPreset: async () => { throw new Error('agent-preset/locked') },
-    })
-    assert(r.sent === true, '★★ select 失败也要照常踢（绝不因此让整条链失败）')
-    assert(String(r.preset).startsWith('failed:'), '★ 但如实记下失败原因')
-  }
-
-  // ②c 清不掉（返回 0）→ 不硬试第二次，如实报失败
-  {
-    const { agents, calls } = mkFake(null, { createAlwaysExists: true })
-    const r = await runLearnerKick({
-      agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-      removeStale: async () => 0,
-    })
-    assert(r.skipped === true && /already exists/.test(r.reason), '清不掉 → 如实报 create-failed（不假装成功）')
-    assert(calls.createIds.length === 1, '清不掉时不反复重试（避免死循环）')
-  }
-
-  // ②d ★★ 任务文件：内容内联进那一脚（因为 learner agent 没有文件工具，让它"自己去读"做不到）
-  {
-    const tf = path.join(dir, 'lf', 'learner-tasks.md')
-    await fs.mkdir(path.dirname(tf), { recursive: true })
-    await fs.writeFile(tf, '<!-- 说明段：不该被送出去 -->\n\n把 store-lock 的竞态再想一遍\n', 'utf8')
-
-    // 读：剥掉 HTML 注释，只留用户写的内容
-    const got = await readLearnerTasks(tf)
-    assert(got.error === null && got.tasks === '把 store-lock 的竞态再想一遍',
-      `★ 读任务文件：剥掉模板注释，只留用户写的（实测 "${got.tasks}"）`)
-
-    // 消息里必须带上它 + 指向文件路径 + 说明"有就做、没有就默认"
-    const msg = buildLearnerMessage({ tasks: got.tasks, tasksFile: tf })
-    assert(msg.includes('把 store-lock 的竞态再想一遍'), '★ 任务内容出现在那一脚里')
-    assert(msg.includes(tf), '★ 消息里带上任务文件路径（让人知道去哪改）')
-    assert(msg.includes('默认') && msg.includes('什么都不做'), '★ 说明"没有任务就做默认的空闲任务/也可以什么都不做"')
-    assert(msg.includes('简短'), '★ 明确要求简短回报')
-    assert(!msg.includes('学习通道自检'), '★ 调试用的"学习通道自检"已去掉')
-    assert(!/必须|务必产出/.test(msg), '★ 仍不强迫产出')
-
-    // 没任务时也要说清楚（而不是让模型猜）
-    const empty = buildLearnerMessage({ tasks: '', tasksFile: tf })
-    assert(empty.includes('没有指定任务') && empty.includes('默认'), '★ 空任务文件 → 消息里明确说"这一轮没有指定任务"')
-
-    // 读失败要如实告知（不能让模型以为"没任务"）
-    const bad = await readLearnerTasks(path.join(dir, 'no-such-dir', 'nope.md'))
-    assert(bad.error === null && bad.tasks === '', '★ 文件不存在 → 视为"没有任务"，不算错误')
-    const failed = buildLearnerMessage({ tasks: '', tasksFile: tf, tasksReadFailed: 'EACCES' })
-    assert(failed.includes('EACCES'), '★ 读失败时把原因写进消息（不假装没任务）')
-  }
-
-  // ②e 任务文件首次自动生成模板；**绝不覆盖已有内容**
-  {
-    const tf = path.join(dir, 'lf2', 'learner-tasks.md')
-    const made = await ensureLearnerTasksFile(tf)
-    assert(made === true, '★ 首次调用生成了模板')
-    const raw = await fs.readFile(tf, 'utf8')
-    assert(raw.includes('<!--') && raw.includes('-->'), '★ 模板说明包在 HTML 注释里（所以不会当成任务送出去）')
-    const r1 = await readLearnerTasks(tf)
-    assert(r1.tasks === '', '★ 只有模板时视为"没有任务"')
-
-    await fs.writeFile(tf, '我自己的任务', 'utf8')
-    const made2 = await ensureLearnerTasksFile(tf)
-    assert(made2 === false, '★ 已存在时不重复生成')
-    assert((await fs.readFile(tf, 'utf8')) === '我自己的任务', '★★ 绝不覆盖用户已写的内容')
-  }
-
-  // ④ 未到间隔 → 跳过
-  {
-    const { agents, calls } = mkFake('idle')
-    const r = await runLearnerKick({ agents, intervalMs: 30 * 60000, lastKickAt: 0, now: 5 * 60000 })
-    assert(r.skipped === true && r.reason === 'not-yet', '未到间隔 → 不踢')
-    assert(calls.followedUp.length === 0, '未到间隔时没有任何动作')
-  }
-
-  // ⑤ 没有 agents 服务（宿主未就绪）→ 安静跳过，不抛错
-  {
-    const r = await runLearnerKick({ agents: null, intervalMs: 0, lastKickAt: 0, now: 1000 })
-    assert(r.skipped === true && r.reason === 'no-agents-service', '取不到 agents 服务 → 安静跳过（不影响插件加载）')
-  }
-
-  // ⑥ create 失败 → 报告原因，不抛
-  {
-    const agents = { get: () => null, create: async () => { throw new Error('factory 未注册') } }
-    const r = await runLearnerKick({ agents, intervalMs: 0, lastKickAt: 0, now: 1000 })
-    assert(r.skipped === true && String(r.reason).startsWith('create-failed'), 'create 失败 → 跳过并带上原因')
-  }
-
-  // ⑦ 三级兜底之二：get 抛错也不致命
-  {
-    const agents = { get: () => { throw new Error('boom') }, create: async () => ({ agent: { status: 'idle', followup() {}, async whenIdle() {} } }) }
-    const r = await runLearnerKick({ agents, intervalMs: 0, lastKickAt: 0, now: 1000 })
-    assert(r.sent === true, 'get 抛错 → 当成"没有"，走 create 恢复')
-  }
-
-  // ⑦b ★★ 清同名残留：真在临时目录上建出 DSH 结构，验证"删对了、没多删"
-  {
-    const home = path.join(dir, 'fakedsh')
-    const dataFile = path.join(home, 'profiles', 'desktop', 'mnemos', 'memory.json')
-    const mk = async (p) => { await fs.mkdir(p, { recursive: true }); await fs.writeFile(path.join(p, 'session.v4.jsonl.zstd'), 'x') }
-    await fs.mkdir(path.dirname(dataFile), { recursive: true })
-    await mk(path.join(home, 'sessions', '--group-a--', 'mnemos-learner'))   // 要删
-    await mk(path.join(home, 'sessions', '--group-b--', 'mnemos-learner'))   // 要删（同名、别的分组）
-    await mk(path.join(home, 'sessions', '--group-a--', 'someone-else'))     // 不许动
-    await fs.mkdir(path.join(home, 'storages', 'session_projcache', 'sessions'), { recursive: true })
-    await fs.writeFile(path.join(home, 'storages', 'session_projcache', 'sessions', 'mnemos-learner.json'), '{}')
-    await fs.writeFile(path.join(home, 'storages', 'session_projcache', 'sessions', 'someone-else.json'), '{}')
-
-    const n = await removeStaleSessionFiles('mnemos-learner', dataFile)
-    assert(n === 3, `★ 清残留：2 个同名会话目录 + 1 份缓存（实测 ${n}）`)
-    assert(!existsSync(path.join(home, 'sessions', '--group-a--', 'mnemos-learner')), '★ --group-a-- 下的同名会话已删')
-    assert(!existsSync(path.join(home, 'sessions', '--group-b--', 'mnemos-learner')), '★ --group-b-- 下的同名会话也删了（不能只删一个分组）')
-    assert(!existsSync(path.join(home, 'storages', 'session_projcache', 'sessions', 'mnemos-learner.json')), '★ 投影缓存已删')
-    assert(existsSync(path.join(home, 'sessions', '--group-a--', 'someone-else')), '★★ 别人的会话一个都没动')
-    assert(existsSync(path.join(home, 'storages', 'session_projcache', 'sessions', 'someone-else.json')), '★★ 别人的缓存也没动')
-
-    const again = await removeStaleSessionFiles('mnemos-learner', dataFile)
-    assert(again === 0, '★ 第二次调用返回 0（已经没了）—— 调用方据此放弃重试，避免死循环')
-
-    // ★ 防路径穿越：带 / .. 的 id 一律拒绝（否则等于把 rm 交给外部输入）
-    for (const bad of ['../evil', 'a/b', 'a\\b', '..']) {
-      const r2 = await removeStaleSessionFiles(bad, dataFile)
-      assert(r2 === 0, `★★ 拒绝带路径片段的 id（${bad}）—— 防路径穿越`)
-    }
-    assert(existsSync(path.join(home, 'sessions', '--group-a--', 'someone-else')), '★★ 穿越尝试后别人的会话仍在')
-  }
-
-  // ⑧ 状态文件可往返（避免重启即踢）
-  {
-    const sf = learnerStateFileFor(path.join(dir, 'ls', 'memory.json'))
-    const s0 = await loadLearnerState(sf)
-    assert(s0.lastKickAt === 0 && s0.kicks === 0, '无状态文件时默认全 0')
-    await saveLearnerState(sf, { lastKickAt: 123456, kicks: 7 })
-    const s1 = await loadLearnerState(sf)
-    assert(s1.lastKickAt === 123456 && s1.kicks === 7, '状态可写可读（重启后不会立刻再踢）')
-  }
-
-  // ⑧b 并发保存 / 旧 tick 回写：不许 ENOENT，也不许把 lastKickAt 回滚
-  {
-    const sf = learnerStateFileFor(path.join(dir, 'ls-race', 'memory.json'))
-    await Promise.all(Array.from({ length: 20 }, (_, i) => saveLearnerState(sf, {
-      lastKickAt: 1000 + i,
-      kicks: i,
-      activeSessionId: 'mnemos-learner',
-      recycled: 0,
-      retired: [],
-      kicksSinceRecycle: i,
-    })))
-    const s = await loadLearnerState(sf)
-    assert(s.lastKickAt === 1019 && s.kicks === 19,
-      `★★ 并发保存不互相踩（20 次并发后 lastKickAt=${s.lastKickAt} / kicks=${s.kicks}）`)
-    await saveLearnerState(sf, {
-      lastKickAt: 500, kicks: 2, activeSessionId: 'mnemos-learner',
-      recycled: 0, retired: [], kicksSinceRecycle: 2,
-    })
-    const s2 = await loadLearnerState(sf)
-    assert(s2.lastKickAt === 1019 && s2.kicks === 19,
-      `★★ 旧 tick 的晚到回写不得把 lastKickAt 回滚（实测 ${s2.lastKickAt} / ${s2.kicks}）`)
-  }
-
-  // ⑧c tick 串行：setInterval 5min + waitIdle 10min 会重叠，必须看到 in-flight 闸门
-  {
-    const idxLearner = await fs.readFile(path.join(pluginRoot, 'src', 'index.js'), 'utf8')
-    assert(idxLearner.includes('let tickInFlight = false') && idxLearner.includes('if (tickInFlight) return'),
-      '★★ learner tick 必须有 in-flight 串行闸门（否则 10 分钟等待会叠出并发 tick）')
-  }
-
-  // ⑨ 默认值自洽
-  assert(DEFAULT_LEARNER_SESSION_ID === 'mnemos-learner', '专用会话默认 id 固定为 mnemos-learner（便于代码定位）')
-  assert(DEFAULT_LEARNER_INTERVAL_MS === 60 * 60 * 1000, '默认间隔 1 小时（与 INSTALL/profile 一致；曾是 30 分钟，已纠正漂移）')
-
-  // ══════════════ ⑩ 会话重建（2026-10-17）══════════════
-  // 事故：learner 会话通宵跑 14 轮，日志涨到压缩 620KB，第 13/14 轮**整轮**被拒
-  // （pi-ai CONTEXT_WINDOW_EXCEEDED，工具调用全成功 0 isError）→ 会话永久卡死。
-  // 本模块绝不 dispose、agent 进程内一直活着复用 → **删文件不能让它变短**，只能换会话 id。
-  // ★ 用户最终拍板的规则只有两条：**每 5 轮换一次** + **上下文（日志）过长也换一次**。
-  {
-    // ① id 生成：只有这一处规则
-    assert(nextLearnerSessionId('mnemos-learner', 0) === 'mnemos-learner', '★ 未重建时用基础 id')
-    assert(nextLearnerSessionId('mnemos-learner', 1) === 'mnemos-learner-1', '★ 第 1 代 = base-1')
-    assert(nextLearnerSessionId('mnemos-learner', 3) === 'mnemos-learner-3', '★ 第 3 代 = base-3')
-    assert(nextLearnerSessionId('mnemos-learner', -2) === 'mnemos-learner', '★ 负数按"没重建过"处理')
-    assert(nextLearnerSessionId('mnemos-learner', 2.9) === 'mnemos-learner-2', '★ 小数向下取整（不生成 base-2.9）')
-    assert(nextLearnerSessionId('', 5) === '', '★ 空 base → 空（不拼出 "-5" 这种孤儿 id）')
-
-    // ② 判据（纯函数）：**轮数优先**（无条件，不依赖任何测量），字节数第二条
-    const B = DEFAULT_LEARNER_RECYCLE_BYTES
-    const K = DEFAULT_LEARNER_RECYCLE_KICKS
-    assert(B === 350 * 1024 && K === 5, '★ 阈值常量：350KB / 5 轮（用户定的"留最近五轮"）')
-    const byKicks = shouldRecycleLearnerSession({ logBytes: 1024, kicksSinceRecycle: K })
-    assert(byKicks.recycle === true && byKicks.reason === 'kicks',
-      '★★ 踢满 5 轮 → **无条件**重建（日志再小也换：结论在记忆里，会话只留最近五轮）')
-    assert(shouldRecycleLearnerSession({ logBytes: 1024, kicksSinceRecycle: K - 1 }).recycle === false,
-      '★ 只差一轮不重建（否则会变成"每轮都换"）')
-    const big = shouldRecycleLearnerSession({ logBytes: B, kicksSinceRecycle: 0 })
-    assert(big.recycle === true && big.reason === 'log-bytes', '★ 上下文过长（日志达到上限）→ 也重建（等于上限就算）')
-    assert(shouldRecycleLearnerSession({ logBytes: B - 1, kicksSinceRecycle: 0 }).recycle === false,
-      '★ 差 1 字节不重建（判据就是"大于等于"，没有别的花样）')
-    const unm = shouldRecycleLearnerSession({ logBytes: 0, kicksSinceRecycle: K })
-    assert(unm.recycle === true && unm.reason === 'kicks' && unm.measured === false,
-      '★★ 量不到日志（磁盘上根本没有那个会话，实测真会这样）→ 照样按轮数重建（所以"量不到"不再是漏洞）')
-    assert(shouldRecycleLearnerSession({ logBytes: null, kicksSinceRecycle: K - 1 }).recycle === false,
-      '★ 量不到且轮数不够 → 不重建')
-    assert(shouldRecycleLearnerSession({ logBytes: NaN, kicksSinceRecycle: NaN }).recycle === false,
-      '★ NaN 一律不重建（不因为取到脏值就无限换会话）')
-    assert(shouldRecycleLearnerSession({ logBytes: 1e9, kicksSinceRecycle: 0 }, { maxBytes: 0 }).recycle === false,
-      '★ maxBytes 非法（0）→ 字节判据不生效，不重建')
-    assert(shouldRecycleLearnerSession({ logBytes: null, kicksSinceRecycle: 99 }, { maxKicks: NaN }).recycle === false,
-      '★ maxKicks 非法 → 轮数判据不生效')
-    // 方向性核对：把"≥"写成"<"时下面两条必须失败
-    assert(big.recycle === true && byKicks.recycle === true &&
-      shouldRecycleLearnerSession({ logBytes: 1024, kicksSinceRecycle: 0 }).recycle === false,
-      '★ 方向性核对（超线才重建、没超不重建）')
-    // 人话措辞只有一处：describeLearnerRecycle
-    const t1 = describeLearnerRecycle({ from: 'a', to: 'b', reason: 'kicks', kicks: 5 })
-    const t2 = describeLearnerRecycle({ from: 'a', to: 'b', reason: 'log-bytes', logBytes: 400 * 1024 })
-    assert(t1 === 'a → b（已踢满 5 轮）', `★ 轮数原因说人话（实测 "${t1}"）`)
-    assert(t2 === 'a → b（日志 400 KB 超上限）', `★ 字节原因说人话（实测 "${t2}"）`)
-    assert(describeLearnerRecycle(null) === '', '★ 没重建 → 空串（调用方不必判断）')
-
-    // ③ 量日志大小：真在临时目录上建出 DSH 结构
-    {
-      const home = path.join(dir, 'recdsh')
-      const df = path.join(home, 'profiles', 'desktop', 'mnemos', 'memory.json')
-      await fs.mkdir(path.dirname(df), { recursive: true })
-      const mkLog = async (p, n) => {
-        await fs.mkdir(p, { recursive: true })
-        await fs.writeFile(path.join(p, 'session.v4.jsonl.zstd'), Buffer.alloc(n, 1))
-      }
-      await mkLog(path.join(home, 'sessions', '--g1--', 'mnemos-learner'), 1000)
-      await mkLog(path.join(home, 'sessions', '--g2--', 'mnemos-learner'), 234)   // 同名、别的分组 → 要累加
-      await mkLog(path.join(home, 'sessions', '--g1--', 'someone-else'), 777)      // 别人的不动也不数
-      await mkLog(path.join(home, 'sessions', '--g1--', 'mnemos-learner-1'), 11)   // 别的代不算进来
-
-      const n1 = await learnerSessionLogBytes('mnemos-learner', df)
-      assert(n1 === 1234, `★★ 量大小：累加**所有分组**下的同名会话日志（实测 ${n1} = 1000+234）`)
-      assert((await learnerSessionLogBytes('mnemos-learner-1', df)) === 11, '★ 按 id 精确取（不把别的代算进来）')
-      assert((await learnerSessionLogBytes('not-there', df)) === 0, '★ 不存在 → 0（调用方据此走轮数兜底）')
-      assert((await learnerSessionLogBytes('', df)) === 0 && (await learnerSessionLogBytes(null, df)) === 0, '★ 空 id → 0')
-      for (const bad of ['../evil', 'a/b', 'a\\b', '..']) {
-        assert((await learnerSessionLogBytes(bad, df)) === 0, `★★ 量大小也拒绝带路径片段的 id（${bad}）—— 防路径穿越`)
-      }
-      // 没有 sessions 目录（DSH 未落盘过）→ 0，且不抛
-      const emptyDf = path.join(dir, 'recdsh2', 'profiles', 'desktop', 'mnemos', 'memory.json')
-      assert((await learnerSessionLogBytes('mnemos-learner', emptyDf)) === 0, '★ 读不到 sessions 目录 → 0（不抛、不崩）')
-    }
-
-    // ④ 状态归一：缺字段/脏值不炸，字段齐了能原样往返
-    {
-      const s0 = normalizeLearnerState(null)
-      assert(s0.activeSessionId === '' && s0.recycled === 0 && s0.kicksSinceRecycle === 0 && s0.retired.length === 0,
-        '★ 空状态 → 全默认（activeSessionId 空 = 用基础 id）')
-      const s1 = normalizeLearnerState({
-        lastKickAt: 5, kicks: 3, activeSessionId: 'mnemos-learner-2', recycled: 2,
-        retired: ['mnemos-learner', 'mnemos-learner-1'], kicksSinceRecycle: 4,
-      })
-      assert(s1.activeSessionId === 'mnemos-learner-2' && s1.recycled === 2 && s1.kicksSinceRecycle === 4,
-        '★ 已有字段原样保留（回收状态不会被 load 丢掉）')
-      const s2 = normalizeLearnerState({ recycled: -5, kicksSinceRecycle: 'x', retired: ['a', 3, '', null] })
-      assert(s2.recycled === 0 && s2.kicksSinceRecycle === 0 && s2.retired.join(',') === 'a',
-        '★ 脏值归一：负数/字符串/非字符串数组项都被清掉')
-      const s3 = normalizeLearnerState({ retired: Array.from({ length: 40 }, (_, i) => 'x' + i) })
-      assert(s3.retired.length === 20, '★ 退休 id 列表有上限（不会无限膨胀落盘）')
-    }
-
-    // ⑤ 真踢一次：上下文过长 → 换新 id 建会话，并把新状态交给调用方
-    {
-      const { agents, calls } = mkFake(null)
-      const picked = []
-      // kicksSinceRecycle=1（还没到 5 轮）→ 这次只能是**字节判据**触发
-      const st = { lastKickAt: 0, kicks: 5, activeSessionId: '', recycled: 0, retired: [], kicksSinceRecycle: 1 }
-      const r = await runLearnerKick({
-        agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-        state: st,
-        measureLogBytes: async () => DEFAULT_LEARNER_RECYCLE_BYTES + 1,
-        removeStale: async () => 1,
-        selectPreset: async (a) => { picked.push(a); return 'standard' },
-      })
-      assert(r.sent === true && r.sessionId === 'mnemos-learner-1', '★★ 超上限 → 用**新一代** id 建会话并踢进去')
-      assert(calls.createIds.length === 1 && calls.createIds[0] === 'mnemos-learner-1', '★★ create 用的是 base-1（不是再堆 -2/-3）')
-      assert(r.recycle && r.recycle.from === 'mnemos-learner' && r.recycle.to === 'mnemos-learner-1' && r.recycle.reason === 'log-bytes',
-        '★ 回执如实说明"从哪个换到哪个、按什么判据换的"')
-      assert(r.recycle.text === 'mnemos-learner → mnemos-learner-1（日志 350 KB 超上限）',
-        `★ 回执里带人话版本（实测 "${r.recycle?.text}"）`)
-      assert(picked.length === 1, '★★ 新一代是**新建**的 → 照常 selectPreset（工具集/联网工具不解）')
-      assert(r.nextState.activeSessionId === 'mnemos-learner-1' && r.nextState.recycled === 1,
-        '★★ nextState 带出新活动 id 与重建代数（调用点只管存，不自己算）')
-      assert(r.nextState.kicksSinceRecycle === 1 && r.nextState.kicks === 6 && r.nextState.lastKickAt === 1000,
-        '★ 踢成功 → kicks/lastKickAt/kicksSinceRecycle 各推进一次')
-      assert(!r.nextState.retired.includes('mnemos-learner'), '★ 旧代已被清掉（这次是"不活着"，所以清完就不再挂账）')
-    }
-
-    // ⑥ 再踢一次：状态里已经是 base-1 → 换代必须在**基础 id** 上累加（不能变成 base-1-2）
-    {
-      const { agents, calls } = mkFake(null)
-      const st = normalizeLearnerState({ activeSessionId: 'mnemos-learner-1', recycled: 1, kicksSinceRecycle: 3 })
-      const r = await runLearnerKick({
-        agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-        state: st, measureLogBytes: async () => DEFAULT_LEARNER_RECYCLE_BYTES * 2,
-      })
-      assert(r.sent === true && r.sessionId === 'mnemos-learner-2', '★★ 从 base-1 再重建 → base-2（在基础 id 上累加，不拼出 base-1-2）')
-      assert(calls.createIds[0] === 'mnemos-learner-2', '★ create 用 base-2')
-      assert(r.nextState.recycled === 2 && r.nextState.kicksSinceRecycle === 1, '★ 代数 +1、本代轮数归零后记 1')
-    }
-
-    // ⑦ ★★ 用户要的主线：**踢满 5 轮就换**，量得到量不到都一样
-    {
-      const { agents, calls } = mkFake(null)
-      const st = normalizeLearnerState({ activeSessionId: 'mnemos-learner-1', recycled: 1, kicksSinceRecycle: DEFAULT_LEARNER_RECYCLE_KICKS })
-      const r = await runLearnerKick({
-        agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-        state: st, measureLogBytes: async () => 0, // 量不到（现场实况：活着的会话在磁盘上没有任何文件）
-      })
-      assert(r.sent === true && r.sessionId === 'mnemos-learner-2', '★★ 踢满 5 轮 → 直接删掉旧会话、换 base-2 重建')
-      assert(r.recycle && r.recycle.reason === 'kicks' && r.recycle.kicks === DEFAULT_LEARNER_RECYCLE_KICKS,
-        '★ 回执标明"是按轮数换的"（不依赖日志大小）')
-      assert(r.nextState.kicksSinceRecycle === 1, '★ 新一代重新从 1 开始数（所以每代正好 5 轮）')
-
-      // 注意：这里让 agent **活着**（mkFake('idle')）。若用不活着，新规矩会因"宿主重启过"直接换新，
-      // 永远走不到"还差一轮"这条路 —— 那样这两条断言就测不到轮数阈值了。
-      const { agents: agents2, calls: calls2 } = mkFake('idle')
-      const st2 = normalizeLearnerState({ activeSessionId: 'mnemos-learner', kicksSinceRecycle: DEFAULT_LEARNER_RECYCLE_KICKS - 1 })
-      const r2 = await runLearnerKick({
-        agents: agents2, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-        state: st2, measureLogBytes: async () => 0,
-      })
-      assert(r2.sessionId === 'mnemos-learner' && r2.recycle === null, '★ 还差一轮 → 这次不换（第 5 轮才换）')
-      assert(calls2.created === 0 && calls2.createIds.length === 0, '★ 活着就直接复用，不新建（更不乱换 id）')
-    }
-
-    // ⑧ 测量回调抛错 → 不咬掉整次踢，按"量不到"处理
-    {
-      const { agents } = mkFake('idle')
-      const r = await runLearnerKick({
-        agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-        state: normalizeLearnerState({ kicksSinceRecycle: 1 }),
-        measureLogBytes: async () => { throw new Error('EACCES') },
-      })
-      assert(r.sent === true, '★★ 测量失败也要照常踢（诊断/回收绝不能反过来咬主流程）')
-      assert(r.recycle === null, '★ 且不因为测量失败就乱换会话')
-    }
-
-    // ⑨ 顺手清旧代文件：**只清确实不活着的**（清活着的会破坏运行中的会话）
-    {
-      const agent = { status: 'idle', followup() {}, async whenIdle() {} }
-      const removedIds = []
-      // 活着的：base-1（上一代）与 base-2（当前活动）；不活着的：base（最早那代）
-      const alive = new Set(['mnemos-learner-1', 'mnemos-learner-2'])
-      const agents = {
-        get: (id) => (alive.has(id) ? agent : null),
-        create: async () => ({ agent }),
-      }
-      const st = normalizeLearnerState({
-        activeSessionId: 'mnemos-learner-2', recycled: 2,
-        retired: ['mnemos-learner', 'mnemos-learner-1'], kicksSinceRecycle: 9,
-      })
-      const r = await runLearnerKick({
-        agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-        state: st, measureLogBytes: async () => DEFAULT_LEARNER_RECYCLE_BYTES + 1,
-        removeStale: async (id) => { removedIds.push(id); return 1 },
-      })
-      assert(r.sessionId === 'mnemos-learner-3', '★ 从 base-2 回收 → base-3')
-      assert(removedIds.length === 1 && removedIds[0] === 'mnemos-learner',
-        `★★ 只清不活着的旧代（清了：${removedIds.join(',') || '无'}）—— 活着的 base-1/base-2 绝不删`)
-      assert(r.retiredCleaned === 1, '★ 回执报出顺手清了几处')
-      assert(!r.nextState.retired.includes('mnemos-learner') && r.nextState.retired.includes('mnemos-learner-1'),
-        '★ 清掉的从账上划掉，没清掉的继续挂账（下次再试）')
-    }
-
-    // ⑩ 跳过路径（busy）：换代**已提交**，只是不算踢过一轮 ——
-    //   ★ 2026-10-21 改（V6-02）：旧断言"状态不许提交"把 D-1 的 noCommit 误用到了这里。
-    //     走到 busy 时 ensure 已成功、换代是既成事实；回滚会让下一 tick 从旧 id 再换一次，
-    //     重复执行 create / 清旧代文件（实测 10-20 12→13、10-21 13→14 各重复两次）。
-    //     正确语义：换代字段照常提交；kicks/lastKickAt 不推进（没踢成就不算踢过）。
-    {
-      const { agents } = mkFake('running')
-      const r = await runLearnerKick({
-        agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-        state: normalizeLearnerState({ activeSessionId: 'mnemos-learner-1', recycled: 1, kicksSinceRecycle: 0 }),
-        measureLogBytes: async () => DEFAULT_LEARNER_RECYCLE_BYTES + 1,
-      })
-      assert(r.skipped === true, '★ 新建的 agent 报忙 → 跳过（不打扰）')
-      assert(r.recycle && r.recycle.from === 'mnemos-learner-1' && r.recycle.to === 'mnemos-learner-2',
-        '★ 回收**决策**照样带出（回执/日志里看得见要换到哪一代）')
-      assert(r.nextState && r.nextState.activeSessionId === 'mnemos-learner-2' && r.nextState.recycled === 2,
-        '★★ [V6-02] 忙也要提交换代（agent 已起、换代是既成事实；回滚旧 id 会导致重复换代）')
-      assert(r.nextState.kicks === 0 && r.nextState.lastKickAt === 0,
-        '★ 但没凭空推进 kicks/lastKickAt（没踢成就不算踢过）')
-    }
-
-    // ⑩b ★★ 重叠实例（风暴回归判据）：成功入队的 A 与后到的 busy B，落盘后必须**同一代**
-    //   事故原形：A 提交了 12→13，B 读到旧状态 12、判 busy 后把 12 写回去 → 下一 tick 再从 12 换到 13，
-    //   每 5 分钟重跑一次 create/清旧代（非幂等），直到 learner 会话跑完转 idle 才自愈。
-    {
-      const baseState = normalizeLearnerState({ activeSessionId: 'mnemos-learner-1', recycled: 1, kicksSinceRecycle: 4 })
-      // A：先到，入队成功
-      const { agents: agentsA } = mkFake('idle')
-      const a = await runLearnerKick({
-        agents: agentsA, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-        state: baseState, measureLogBytes: async () => DEFAULT_LEARNER_RECYCLE_BYTES + 1,
-      })
-      // B：与 A 同时启动、读到同一份旧状态；A 入队后对它来说就是 busy
-      const { agents: agentsB } = mkFake('running')
-      const b = await runLearnerKick({
-        agents: agentsB, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1001,
-        state: baseState, measureLogBytes: async () => DEFAULT_LEARNER_RECYCLE_BYTES + 1,
-      })
-      assert(a.sent === true && b.skipped === true && b.reason === 'busy', '★ 场景成立：A 踢成功、B 撞上 busy')
-      assert(a.nextState.activeSessionId === 'mnemos-learner-2' && b.nextState.activeSessionId === 'mnemos-learner-2',
-        '★★ 两条路径都落在同一代（-2），B 不再把 A 的成功换代写回旧 id')
-      // 按真实落盘顺序回放：A 先存、B 后存（后写覆盖前写）→ 最终仍必须是新一代
-      const sf = path.join(dir, 'learner-state-v602.json')
-      await saveLearnerState(sf, a.nextState)
-      await saveLearnerState(sf, b.nextState)
-      const after = await loadLearnerState(sf)
-      assert(after.activeSessionId === 'mnemos-learner-2' && after.recycled === 2,
-        '★★ 落盘回放：后到的 busy 实例不会把已提交的换代覆盖回旧代（风暴的回归判据）')
-    }
-
-    // ⑩c 入队抛错（followup-threw）：agent 已起来 → 同样提交换代，只标记这次没踢成
-    {
-      const agent = { status: 'idle', followup() { throw new Error('inbox closed') }, async whenIdle() {} }
-      const agents = { get: () => agent, create: async () => ({ agent }) }
-      const r = await runLearnerKick({
-        agents, sessionId: 'mnemos-learner', intervalMs: 0, lastKickAt: 0, now: 1000,
-        state: normalizeLearnerState({ activeSessionId: 'mnemos-learner-1', recycled: 1 }),
-        measureLogBytes: async () => DEFAULT_LEARNER_RECYCLE_BYTES + 1,
-      })
-      assert(r.skipped === true && String(r.reason).startsWith('followup-threw'), '★ 入队失败如实报出来')
-      assert(r.nextState.activeSessionId === 'mnemos-learner-2' && r.nextState.recycled === 2,
-        '★★ [V6-02] 入队失败也不回滚换代（agent 已经起来了）')
-      assert(r.nextState.kicks === 0 && r.nextState.lastKickAt === 0, '★ 没踢成 → 不推进踢过的计数')
-    }
-
-    // ⑪ 未到点时不碰回收（不做无用 IO）
-    {
-      let measured = 0
-      const { agents } = mkFake('idle')
-      const r = await runLearnerKick({
-        agents, sessionId: 'mnemos-learner', intervalMs: 60 * 60 * 1000, lastKickAt: 1, now: 1000,
-        state: normalizeLearnerState({}), measureLogBytes: async () => { measured++; return 1e9 },
-      })
-      assert(r.skipped === true && r.reason === 'not-yet' && measured === 0, '★ 未到点 → 不量日志、不回收')
-    }
-
-    // ⑫ ★★ 回收引入的真 bug：自指守卫必须比对**当前活动 id**（否则回收一次守卫就失效）
-    {
-      const idxSrc = (await fs.readFile(path.join(pluginRoot, 'src', 'index.js'), 'utf8')).replace(/^\uFEFF/, '')
-      assert(/selfKickRefusal\([^)]*activeLearnerId/.test(idxSrc),
-        '★★ 自指守卫传的是"当前活动 id"（回收后 learner 跑在 base-N 上，只比基础 id 会漏）')
-      assert(/const activeLearnerId = st\.activeSessionId \|\| sessionId/.test(idxSrc),
-        '★ 活动 id 的取法：state.activeSessionId 优先，回落到配置的基础 id')
-      // 反例核对：状态里的活动 id 是 base-2 时，守卫必须拒"base-2"、放"base"
-      const active = 'mnemos-learner-2'
-      assert(selfKickRefusal(active, active) !== null, '★★ 活动 id 上自指仍然被拒')
-      assert(selfKickRefusal('mnemos-learner', active) === null, '★ 基础 id 反而是"别人"（放行）—— 说明比对的是活动 id')
-    }
-  }
 }
 
 console.log('== 12. 衰减降权 ==')
@@ -5706,11 +5041,10 @@ console.log('== 104. ★ F-15 结构性修复：20 个工具的"声明 vs 实际
     // ★ 新增工具必须同时进**三处**：TOOL_OUTPUT_SPECS（形状）、index.js 的注册、以及这份清单
     // ★★ 顺序必须与 **index.js 里工厂函数的源码顺序**一致 —— F-15 的静态切片按相邻工具的
     //    `name: 'xxx'` 字面量切块，顺序错了会把下一个工具的回执字段算到上一个头上
-    //    （实测：把 learner_kick 放在 task_* 前面时，propose_skill 块吞掉了三个任务工具的 render）。
+    //    （实测：工具顺序放错时，前一个工具的块会吞掉后一个工具的 render）。
     'mnemos_task_open', 'mnemos_task_update', 'mnemos_task_close', 'mnemos_task_done', 'mnemos_task_cite',
-    'mnemos_learner_kick',
   ]
-  assert(TOOL_NAMES.length === 20, `★★ [F15] 形状表覆盖 20 个工具（实测 ${TOOL_NAMES.length}：${TOOL_NAMES.join(',')}）`)
+  assert(TOOL_NAMES.length === 19, `★★ [F15] 形状表覆盖 19 个工具（实测 ${TOOL_NAMES.length}：${TOOL_NAMES.join(',')}）`)
   assert(
     EXPECTED_TOOLS.every((t) => TOOL_NAMES.includes(t)) && TOOL_NAMES.every((t) => EXPECTED_TOOLS.includes(t)),
     '★★ [F15] 表的键集合 == 实际注册的工具集合（多一个/少一个都挂 —— 新增工具必须同时声明形状）'
@@ -5804,11 +5138,6 @@ console.log('== 104. ★ F-15 结构性修复：20 个工具的"声明 vs 实际
     mnemos_maintenance_list: maintenanceListResult(hb104.list()),
     mnemos_heartbeat_toggle: toggleResult(true),
     mnemos_propose_skill: proposeSkillResult(proposeRes),
-    // ★ 新增工具三处：形状表（已加）、真值表（这里）、以及 EXPECTED_TOOLS 清单
-    mnemos_learner_kick: learnerKickResult({
-      sessionId: 'mnemos-learner', sent: true, created: true, resumed: false,
-      waited: true, statusAfter: 'idle', skipped: false, kickedAt: 1,
-    }),
     // ★ 任务图三件套：真值同样来自真 store（开→填→收都跑过一遍）
     mnemos_task_open: taskOpenResult(taskOpened104),
     mnemos_task_update: taskUpdateResult(taskUpdated104),
@@ -6123,14 +5452,49 @@ console.log('== 105. ★★ 注入消息的形状：role/id 必须齐（缺 role
     ctorHits += [...src.matchAll(ctorCall)].length
   }
   assert(inlineHits.length === 0, `★★ src 里没有"手搓 {content, source}"的注入点（命中 ${inlineHits.length} 处${inlineHits.length ? '：' + inlineHits.join(' / ') : ''}）`)
-  assert(ctorHits >= 2, `★★ 两处注入都走构造器（命中 ${ctorHits} 处：折叠提醒 + 空闲学习）`)
+  assert(ctorHits >= 1, `★★ 注入走构造器（命中 ${ctorHits} 处：折叠提醒）`)
 
-  // ── ④ 两个已知注入点确实都改成了构造器（点名核对，防止"别处合格、这两处退回去"）──
+  // ── ④ 已知注入点确实改成了构造器（点名核对，防止退回去）──
   const idxSrc = await fs.readFile(path.join(srcDir, 'index.js'), 'utf8')
-  const loopSrc = await fs.readFile(path.join(srcDir, 'learner-loop.js'), 'utf8')
   assert(idxSrc.includes('agent.inject(buildInjectedUserMessage('), '★ 折叠提醒注入走构造器（src/index.js）')
-  assert(loopSrc.includes('agent.followup(buildInjectedUserMessage('), '★ 空闲学习注入也走构造器（src/learner-loop.js）')
 }
+
+// ── 106. 信任标签：只提醒，不改召回/写入 ──
+console.log('== 106. 信任标签 / 外部信息工具判定 ==')
+assert(memoryTrustLabel({ source: 'autobiography', category: 'identity' }) === '[自传体·身份] ',
+  '身份保留来源戳，不冒充普通背景')
+for (const category of ['experience', 'decision', 'event']) {
+  const label = memoryTrustLabel({ source: 'autobiography', category })
+  assert(label.includes('实际掌控权高/可修正') && label.includes('不是普通背景'),
+    `自传体·${category} 召回提醒含掌控权与“不是普通背景”`)
+}
+assert(memoryTrustLabel({ source: 'external' }).includes('非自己掌握'),
+  '外部记忆召回提醒标“非自己掌握/未验证”')
+assert(memoryTrustLabel({ source: 'internal' }) === '',
+  '普通内部记忆不加信任标签（不做等级徽章）')
+assert(isExternalInfoToolName('web_search') && isExternalInfoToolName('web_fetch'),
+  'web 工具结果按外部信息标记')
+assert(isExternalInfoToolName('mcp__bilibili__bilibili_search'),
+  'mcp__* 结果按外部信息标记')
+assert(isExternalInfoToolName('list_mcp_resources') && isExternalInfoToolName('read_mcp_resource'),
+  'MCP 资源读取按外部信息标记')
+assert(!isExternalInfoToolName('read') && !isExternalInfoToolName('pwsh'),
+  'read/pwsh 不按工具名一刀切为外部（文档/命令来源需另行判断）')
+
+// ── 107. 自动 curation 投递：只找空闲会话，不依赖 aux provider ──
+console.log('== 107. 自动 curation 会话投递 ==')
+assert(buildCurationDispatchMessage('identity').includes("mnemos_curate({ action: 'identity' })"),
+  '派发消息明确要求调用 mnemos_curate(identity)')
+assert(buildCurationDispatchMessage('experience').includes("mnemos_curate({ action: 'experience' })"),
+  '派发消息明确要求调用 mnemos_curate(experience)')
+const idle = { id: 's1', status: 'idle', followup() {} }
+const busy = { id: 's2', status: 'running', followup() {} }
+const curator = { id: 'mnemos-curation-abc', status: 'idle', followup() {} }
+const validator = { id: 'mnemos-validator-abc', status: 'idle', followup() {} }
+assert(pickIdleCurationAgent([busy, idle]) === idle, '跳过忙会话，选空闲会话')
+assert(pickIdleCurationAgent([curator, validator, busy]) === null, '排除 curation/validator 子会话')
+assert(pickIdleCurationAgent([{ id: 'no-followup', status: 'idle' }]) === null, '没有 followup 的 agent 不可投递')
+assert(pickIdleCurationAgent([]) === null, '没有会话时返回 null，不新建 provider')
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`)
 await writeReport(fail)

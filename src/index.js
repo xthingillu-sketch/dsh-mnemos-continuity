@@ -57,18 +57,11 @@ import { detectMissedUsage, missStateFileFor, missFileFor } from './skill-miss.j
 import { makeStuckDetector } from './stuck-detector.js'
 import { makeCompactionSnapshot, pruneCompactionSnapshots } from './compaction-snapshot.js'
 import { secretBlocksFileFor } from './secret-patterns.js'
+import { memoryTrustLabel, isExternalInfoToolName } from './trust-label.js'
+import { buildCurationDispatchMessage, pickIdleCurationAgent } from './curation-dispatch.js'
 // ★ 注入消息的唯一构造点（role/id 不能靠手搓：2026-10-17 折叠提醒缺 role 把会话炸了，
 //   缺 id 又让那条会话重启后加载不了）。规则与事故记录见该文件头。
 import { buildInjectedUserMessage } from './host-message.js'
-// ★ 空闲学习：把"到点踢一脚"送进**专用会话**（agent 的 inbox），不污染当前上下文。
-//   接口依据与三条自律见该文件头注释（尤其：绝不 dispose、不 resume、忙就跳过）。
-import {
-  runLearnerKick, removeStaleSessionFiles, learnerStateFileFor, loadLearnerState, saveLearnerState,
-  learnerLogFileFor, appendLearnerLog, resolveLearnerWorkspace, buildLearnerMessage,
-  learnerTasksFileFor, ensureLearnerTasksFile, readLearnerTasks, learnerSessionLogBytes,
-  DEFAULT_LEARNER_SESSION_ID, DEFAULT_LEARNER_INTERVAL_MS, LEARNER_TOOL_NAME,
-  DEFAULT_LEARNER_AGENT_PRESET, selfKickRefusal,
-} from './learner-loop.js'
 // ★ F-15：工具返回值的**形状真相源**（声明由它生成）+ **纯构造函数**（可被单测直接喂真实输入）。
 //   本文件顶层 import 了 @deepseek-ai/schemastery，纯 node 单测跑不起来 —— 所以这两样必须住在
 //   无依赖的模块里，否则"声明 vs 实际"永远没法被测试抓住。
@@ -76,7 +69,7 @@ import { buildOutputSchema, withToolOutputGate } from './tool-output.js'
 import {
   rememberResult, recallResult, validateResult, curationResult, constitutionResult, deleteResult,
   deprecateResult, dormantResult, openResult, consolidateResult, heartbeatResult,
-  maintenanceListResult, toggleResult, proposeSkillResult, learnerKickResult,
+  maintenanceListResult, toggleResult, proposeSkillResult,
   taskOpenResult, taskUpdateResult, taskCloseResult, taskDoneResult, taskCiteResult,
 } from './tool-results.js'
 
@@ -105,54 +98,20 @@ export const Config = Schema.object({
   identityCandidateTrigger: Schema.number().default(5).description('身份候选达到多少条触发整理（默认 5）'),
   identityFallbackDays: Schema.number().default(30).description('身份候选不足 5 条时的 30 天兜底（天）'),
   experienceIntervalDays: Schema.number().default(7).description('经验整理周期（天）；默认每周一次，不按条数触发'),
-  // ★★ 空闲学习：**默认全关**（用户 2026-10-15 的规格）。
-  //   要它工作，必须**同时**满足：① `learnerEnabled: true` ② 配了外部 API 的
-  //   `learnerProvider` + `learnerModel`。**两个都必须配** —— 留空即不工作（已回退到「必须配第三方 api」的形态，见下方守卫）。
-  learnerEnabled: Schema.boolean().default(false).description(
-    '空闲学习：是否启用（**默认 false**）。开启后**必须**配 learnerProvider + learnerModel 才会真正工作'
+  // 辅助路由：validation 的可选 provider；留空则走父会话/主模型。
+  // 自动 curation 不再使用 aux；它把任务注入空闲会话，由该会话调用 mnemos_curate。
+  auxProvider: Schema.string().default('').description(
+    '辅助 provider（validation 兜底）；留空 = 走父会话/主模型'
   ),
-  learnerIntervalMs: Schema.number().default(DEFAULT_LEARNER_INTERVAL_MS).description(
-    '空闲学习的间隔（毫秒），默认 1 小时；0 = 关掉'
+  auxModel: Schema.string().default('').description(
+    '辅助 model（validation 兜底）；留空 = 走父会话/主模型'
   ),
-  learnerSessionId: Schema.string().default(DEFAULT_LEARNER_SESSION_ID).description(
-    '空闲学习用的专用会话 id（代码自己建；同名残留会被清掉后用**同一 id** 重建，结论仍然靠记忆保存）'
-  ),
-  learnerTasksFile: Schema.string().default('').description(
-    '给用户写"开放学习任务"的文件；留空 = 与 memory.json 同目录的 learner-tasks.md（不存在会自动生成带说明的模板）'
-  ),
-  learnerAgentPreset: Schema.string().default(DEFAULT_LEARNER_AGENT_PRESET).description(
-    '空闲学习 agent 用哪个 agentPreset —— **它决定挂哪些子插件，也就是有没有联网工具**；' +
-    '留空 = 只拿最小工具集（没有 web_search/web_fetch，"学习"会跛脚）'
-  ),
-  learnerWorkspace: Schema.string().default('').description(
-    '空闲学习会话的工作目录（留空 = 优先用 DSH 默认工作区，否则用插件进程当前目录）；不设会落到"未分组工作区"'
-  ),
-  // ★ 外部 API：**默认留空 = 不工作**（按规格"不配也默认不工作"）。
-  //
-  // 背景（实测，别删这段注释）：
-  //   · learner agent 是**插件自建的根 agent**：宿主默认的 `deepseek-account` 对它稳定 TRANSPORT
-  //     —— 请求 config 与我这个能正常跑的会话**逐字段完全相同**，所以不是配置差异，是那条账号路由的限制。
-  //   · `bailian` 是 API key 路由，不受那套身份限制，同一条路一次就通。
-  //   · 另外：宿主 `agentDefaultModel.currentSelection()` 虽然能给一套 provider+model+reasoningEffort，
-  //     但"什么都不传"会让系统提示的 `{{model}}` 无值（`prompt variable "{{model}}" has no value … persona-prefix`）。
-  //   所以这里要求用户**显式**配第三方 provider/model；留空即视为未配置、不工作。
-  learnerProvider: Schema.string().default('').description(
-    '外部 API 的 provider（如 bailian）；**留空 = 未配置，空闲学习不工作**'
-  ),
-  learnerModel: Schema.string().default('').description(
-    '外部 API 的 model（如 qwen3.8-flash）；**留空 = 未配置，空闲学习不工作**'
-  ),
-  // 隔离验证子会话用哪条 LLM 路由。**默认留空 = 复用 learnerProvider/learnerModel**
-  //   （实测：DeepSeek 自家路由对"插件自建 agent"一律 `DeepSeek Messages transport failed`；
-  //    第三方 api-key 路由（如 aliyun）一次就通 —— 与 learner 是同一个坑）。
+  // 隔离验证子会话用哪条 LLM 路由。留空 = 父会话；再不行才用 auxProvider/auxModel。
   validateProvider: Schema.string().default('').description(
-    '隔离验证子会话的 provider；留空 = 复用 learnerProvider（再不行才退回父会话的路由）'
+    '隔离验证子会话的 provider；留空 = 父会话路由'
   ),
   validateModel: Schema.string().default('').description(
-    '隔离验证子会话的 model；留空 = 复用 learnerModel'
-  ),
-  learnerMaxTokens: Schema.number().default(0).description(
-    '空闲学习的输出上限；**留空(0) = 继承全局 agent 配置**（默认，不做额外限制）；只有要压小才填'
+    '隔离验证子会话的 model；留空 = 父会话路由'
   ),
   constitutionFile: Schema.string().default('').description(
     '宪法文件路径；留空 = 与 dataFile 同一套解析（$DSH_PROFILE_DIR/mnemos/constitution.json 优先）'
@@ -361,14 +320,12 @@ function makeRecallTool(store, fanState = null) {
       render: (_args, value) => {
         if (!value.length) return [{ type: 'text', text: '没有找到相关记忆。' }]
         const lines = [`找到 ${value.length} 条相关记忆：`, '']
-        const autoLabel = { identity: '身份', decision: '决策', experience: '经验', event: '事件', other: '其他' }
         value.forEach((m, i) => {
-          const auto = m.source === 'autobiography'
-            ? `[自传体·${autoLabel[m.category] || '其他'}] ` : ''
+          const trust = memoryTrustLabel(m)
           const task = m.taskSummary ? '[任务摘要] ' : ''
           lines.push(
             `${i + 1}. [${m.id}] (${m.salience}/${m.layer}) ` +
-              `${task}${auto}${m.dormantHere ? '（本会话已标为暂时无关·降权中，仍可召回）' : ''} ${m.summary}`
+              `${task}${trust}${m.dormantHere ? '（本会话已标为暂时无关·降权中，仍可召回）' : ''} ${m.summary}`
           )
           if (m.tags && m.tags.length) lines.push(`   标签：${m.tags.join(', ')}`)
           if (m.taskId) lines.push(`   任务：${m.taskId}`)
@@ -679,13 +636,13 @@ function makeValidateTool(ctx, store, config) {
         candidates.push({ ...fromParent, provider: String(cfg.validateProvider), model: String(cfg.validateModel) })
       }
       if (fromParent.provider && fromParent.model) candidates.push(fromParent)
-      if (cfg.learnerProvider && cfg.learnerModel) {
-        candidates.push({ provider: String(cfg.learnerProvider), model: String(cfg.learnerModel) })
+      if (cfg.auxProvider && cfg.auxModel) {
+        candidates.push({ provider: String(cfg.auxProvider), model: String(cfg.auxModel) })
       }
       if (candidates.length === 0) {
         return validateResult(
           false,
-          'isolated-channel-unavailable：没有可用的 provider/model（请配 validateProvider/validateModel，或 learnerProvider/learnerModel）'
+          'isolated-channel-unavailable：没有可用的 provider/model（请配 validateProvider/validateModel，或 auxProvider/auxModel）'
         )
       }
       const childAgentOptions = candidates[0]
@@ -773,58 +730,42 @@ export function logResolvedPaths(ctx, { dataFile, constitutionFile, logFile, pro
 }
 
 async function runAutoCuration(ctx, store, action, cfg = {}) {
-  const provider = cfg.learnerProvider
-  const model = cfg.learnerModel
-  if (!provider || !model) {
-    return { ok: false, action, reason: '没有 curation/learner provider+model，跳过自动整理' }
-  }
   const agents = ctx.get('agents')
-  if (!agents || typeof agents.create !== 'function') {
-    return { ok: false, action, reason: 'agents.create 不可用，跳过自动整理' }
-  }
-  const childId = `mnemos-curation-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
-  try {
-    await agents.create({
-      sessionId: childId,
-      agentOptions: { provider: String(provider), model: String(model) },
-      meta: { agentPreset: CURATOR_PRESET_ID },
-    })
-    const child = agents.get(childId)
-    if (!child) return { ok: false, action, reason: 'curation 会话创建后取不到 agent' }
-    const presets = ctx.get('agentPresets')
-    if (presets && typeof presets.select === 'function') await presets.select(child, CURATOR_PRESET_ID)
-    child.followup({
-      content: [{ type: 'text', text: buildCurationPrompt(action) }],
-      source: { kind: 'user' },
-    })
-  } catch (e) {
-    return { ok: false, action, reason: `自动整理会话启动失败：${(e && e.message) || e}` }
+  if (!agents || typeof agents.list !== 'function') {
+    return { ok: false, action, reason: 'agents.list 不可用，跳过自动整理' }
   }
 
-  const deadline = Date.now() + 120000
-  while (Date.now() < deadline) {
-    try { await store.refreshFromDisk() } catch { /* 保持旧视图继续等 */ }
-    const p = store.curationProposalBySession(childId, action)
-    if (p) {
-      let applied
-      try {
-        applied = await store.applyCurationProposal(p.id)
-      } catch (e) {
-        applied = { ok: false, reason: `应用失败：${(e && e.message) || e}` }
-      }
-      return {
-        ok: applied.ok === true,
-        action,
-        proposalId: p.id,
-        applied: applied.ok === true,
-        revisionId: applied.revisionId,
-        reason: applied.ok === true ? '' : (applied.reason || 'apply 失败'),
-        childId,
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500))
+  let list
+  try {
+    list = agents.list()
+  } catch (e) {
+    return { ok: false, action, reason: `agents.list 失败：${(e && e.message) || e}` }
   }
-  return { ok: false, action, reason: `自动整理未写回 proposal（sessionId=${childId}）` }
+  // 兼容 list() 返回 agent 或 sessionId 的实现
+  const resolved = (Array.isArray(list) ? list : []).map((item) => {
+    if (item && typeof item === 'object') return item
+    if (typeof agents.get === 'function') return agents.get(item)
+    return null
+  })
+  const target = pickIdleCurationAgent(resolved)
+  if (!target) {
+    return { ok: false, action, reason: '没有空闲会话可注入 curation（跳过，不新建 provider）' }
+  }
+
+  try {
+    target.followup(buildInjectedUserMessage(buildCurationDispatchMessage(action)))
+  } catch (e) {
+    return { ok: false, action, reason: `注入 curation 失败：${(e && e.message) || e}` }
+  }
+
+  return {
+    ok: true,
+    action,
+    dispatched: true,
+    applied: false,
+    sessionId: String(target.id || target.session?.id || ''),
+    reason: '已把 curation 任务注入空闲会话',
+  }
 }
 
 function makeCurateTool(ctx, store) {
@@ -1091,6 +1032,12 @@ function makeOpenTool(store, fanState = null) {
         if (value.graphId) lines.push(`任务图：${value.graphId}`)
         if (value.origin?.graphId && value.origin.graphId !== value.graphId) lines.push(`来源图：${value.origin.graphId}`)
         if (value.source === 'autobiography' && !value.origin) lines.push('来源：legacy（旧数据未迁移）')
+        if (value.source === 'autobiography' && value.category !== 'identity') {
+          lines.push('信任提醒：这部分属于自传体，我对它有实际掌控权（可检查/可修正），不是普通背景。')
+        }
+        if (value.source === 'external') {
+          lines.push('信任提醒：这部分不是自己掌握的信息，未验证前不可直接采信。')
+        }
         if (Array.isArray(value.dormIn) && value.dormIn.length) {
           lines.push(
             `会话级降权：已在 ${value.dormIn.length} 个会话内标为暂时无关` +
@@ -1648,136 +1595,6 @@ function makeTaskCiteTool(store) {
   }
 }
 
-/**
- * ★ 诊断工具：立刻执行一次"空闲学习踢"（不等定时器）。
- * 为什么需要它：到点判定默认 30 分钟，靠"等"来验证一次要半小时，
- * 而且未到点时是**静默跳过**的 —— 表现出来就是"什么都没发生"，无法区分"坏"与"没到点"。
- * 这个工具把"等待"变成"一次调用"，并且**如实返回每个分支的原因**。
- */
-function makeLearnerKickTool(ctx, opts) {
-  const { stateFile, logFile, dataFile, tasksFile, sessionId, agentOptions, meta, agentPreset, intervalMs, minGapMs } = opts
-  return {
-    // ★ 名字字面量**必须在这里**（工厂体内），与其余 13 个工具同形：
-    //   F15 的静态检查按 `name: 'xxx'` 切源码块，并断言"每个块里有 execute、且每个 return 出自构造函数"。
-    //   若把名字挪到 toolDefs 的数组项上，块里就只剩注册那一行（没有 execute），断言必挂 —— 实测踩过。
-    name: 'mnemos_learner_kick',
-    description:
-      '★ 只在**外部会话**里用（诊断/手动触发）：立刻执行一次"空闲学习踢"（不等定时器），' +
-      '取/建/恢复那个专用会话，把学习提示送进它的收件箱。' +
-      '返回每一步的真实结果（到点判定、是否需要 resume/create、入队是否成功）。' +
-      '**learner 会话自己调用会被直接拒绝**（自己踢自己没有意义）—— 如果你就是那个空闲学习的会话，' +
-      '请直接去做这一轮的学习，不要调这个工具。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        force: {
-          type: 'boolean',
-          description: '忽略"未到间隔"的限制，强制踢一次（默认 false，尊重间隔）',
-        },
-        probe: {
-          type: 'boolean',
-          description:
-            '对照实验：用**不同的会话 id**、发**一句极短消息**再踢一次，用来区分"请求太大"与"agent 接线缺失"（前者会成功，后者仍失败）',
-        },
-      },
-    },
-    output: {
-      schema: buildOutputSchema('mnemos_learner_kick'),
-      render: (_args, value) => {
-        if (value.error) return [{ type: 'text', text: `空闲学习踢失败：${value.error}` }]
-        const l = []
-        l.push(`sessionId: ${value.sessionId}`)
-        l.push(`到点判定: ${value.skipped ? '未执行（' + value.reason + '）' : '已执行'}`)
-        if (value.minutesUntil != null) l.push(`距下次到点: ${value.minutesUntil} 分钟`)
-        if (value.created != null) l.push(`是否新建会话: ${value.created}`)
-        if (value.resumed != null) l.push(`是否 resume 恢复: ${value.resumed}`)
-        if (value.sent) {
-          l.push(`入队结果: 成功；等待静默 waited=${value.waited}${value.waitReason ? '（' + value.waitReason + '）' : ''}`)
-          l.push(`入队后 status: ${value.statusAfter}`)
-        }
-        if (value.getError) l.push(`get/resume 附带信息: ${value.getError}`)
-        if (value.recycled) {
-          l.push(`会话重建: ${value.recycleWhy || `${value.recycleFrom} → ${value.recycleTo}`}`)
-        }
-        return [{ type: 'text', text: l.join('\n') }]
-      },
-    },
-    timeoutMs: 600000,
-    async execute(args, exec) {
-      // ★ 单返回结构：F15 要求"每个 return 都出自构造函数"（就地 return 一个裸对象 = 形状没人测）。
-      //   所以这里把结果收进 value，最后统一 `return learnerKickResult(value)`。
-      let value = null
-      try {
-        // ★★ 自指守卫（2026-10-16 加）：**learner 自己不许调这个工具**。
-        //   实测动机：本地的 granite4.1:8b 连跑三轮，每轮都只调这一个工具（"把自己又踢一次"），
-        //   零学习产出 —— 弱模型把"工具名（空闲学习踢）"当成了"任务（空闲学习）"。
-        //   平台层面没有"按 agent 隐藏某个工具"的接口（`ctx.tools.register` 是全局的，
-        //   也没有独立的工具策略插件，permission preset 只管沙箱/审批），
-        //   所以把闸门放在**执行处**：让这个动作物理上做不到，并当场告诉它该做什么。
-        //   判断逻辑抽成纯函数放在 learner-loop.js（便于单测；index.js 有宿主依赖，纯 node 测不了）。
-        //   取调用者的写法与仓库其它处一致：`exec?.agent?.session?.id`。
-        // ★ 会话回收后 learner 跑在 `<base>-<n>` 上：自指守卫必须比对**当前活动 id**。
-        //   只比配置的基础 id 会漏 —— 回收一次，learner 就又能把自己踢起来（守卫形同虚设），
-        //   所以这里**先读状态再判**。
-        const st = await loadLearnerState(stateFile)
-        const activeLearnerId = st.activeSessionId || sessionId
-        const refusal = selfKickRefusal(exec?.agent?.session?.id ?? null, activeLearnerId)
-        if (refusal !== null) {
-          value = { sessionId: activeLearnerId, ...refusal }
-        } else {
-        const agents = ctx.get('agents')
-        if (!agents) {
-          value = { sessionId: activeLearnerId, error: '取不到 agents 服务' }
-        } else {
-          const effInterval = args && args.force ? 0 : intervalMs
-          // ★ probe：换一个 id + 一句极短消息，做"请求大小 vs agent 接线"的对照实验
-          const isProbe = !!(args && args.probe)
-          // 手动踢与定时踢用**同一条消息**（含任务文件内容），避免两条路径漂移
-          const tasksRead = await readLearnerTasks(tasksFile)
-          const kickText = buildLearnerMessage({
-            tasks: tasksRead.tasks,
-            tasksFile: tasksFile,
-            tasksReadFailed: tasksRead.error || '',
-          })
-          const r = await runLearnerKick({
-            agents,
-            sessionId: isProbe ? sessionId + '-probe' : sessionId,
-            // ★ probe 是"一次性对照实验"，不该碰回收状态（否则会把活动 id 换掉）
-            state: isProbe ? null : st,
-            measureLogBytes: isProbe ? null : (id) => learnerSessionLogBytes(id, dataFile),
-            agentOptions,
-            meta,
-            intervalMs: effInterval,
-            minGapMs,
-            lastKickAt: st.lastKickAt,
-            removeStale: (id) => removeStaleSessionFiles(id, dataFile),
-            selectPreset: (agent) => ctx.get('agentPresets')?.select(agent, agentPreset),
-            ...(isProbe ? { text: '只回复两个字：测试' } : { text: kickText }),
-            onInfo: (m) => console.warn('mnemos:', m),
-          })
-          // ★ 状态迁移由 runLearnerKick 算好（nextState），这里只负责存 —— 两处各写一份必然漂移
-          //   只有真正 sent 或换代才写；busy/not-yet 的旧状态不覆盖新状态。
-          if (r?.nextState && !isProbe && (r.sent || r.recycle)) await saveLearnerState(stateFile, r.nextState)
-          if (r?.recycle) {
-            await appendLearnerLog(
-              logFile,
-              `[工具调用] 会话重建：${r.recycle.text}${r.retiredCleaned ? `；顺手清了 ${r.retiredCleaned} 处旧代会话文件` : ''}`
-            )
-          }
-          await appendLearnerLog(logFile, `[工具调用${isProbe ? '·probe' : ''}] ${JSON.stringify(r)}`)
-          value = { sessionId: r?.sessionId || sessionId, ...(r && r.sent === undefined ? r : {}), ...(r || {}) }
-        }
-        } // ← 关闭"非 learner 自己调用"的 else 分支
-      } catch (e) {
-        await appendLearnerLog(logFile, `[工具调用] 出错：${e?.stack || e?.message || e}`)
-        value = { sessionId, error: String(e?.message || e) }
-      }
-      return learnerKickResult(value)
-    },
-  }
-}
-
 export function apply(ctx, config) {
   const resolved = config || {}
   // ★★ P0（2026-10-18 安装审查）：默认数据目录**先问宿主要 profile 目录**，别靠环境变量猜。
@@ -2033,7 +1850,6 @@ export function apply(ctx, config) {
   }
 
   // 外部信息自动标记：post-execute 钩子，区分信息类/指令技能类，前后加标记界定边界
-  const EXTERNAL_INFO_TOOLS = new Set(['web_search', 'web_fetch'])
   const EXTERNAL_INSTRUCTION_TOOLS = new Set(['context7_search', 'context7_get_docs'])
   ctx.on(
     'tools/post-execute',
@@ -2053,7 +1869,7 @@ export function apply(ctx, config) {
           ],
         }
       }
-      if (EXTERNAL_INFO_TOOLS.has(name)) {
+      if (isExternalInfoToolName(name)) {
         return {
           kind: 'accept',
           content: [
@@ -2152,195 +1968,6 @@ export function apply(ctx, config) {
     return () => clearInterval(timer)
   }, 'dsh-mnemos: heartbeat timer')
 
-  // ── 空闲学习：把"到点踢一脚"送进专用会话 ──────────────────────────────
-  // ★ 独立于心跳开关：这是"我想学点什么"，不是维护任务，所以它不受 mnemos_heartbeat_toggle 影响。
-  // ★ agents 服务**动态取**（不在加载期取）：宿主其它插件可能晚于本插件就绪，动态取最稳；
-  //   取不到就安静跳过（下一轮再试），绝不让插件加载失败。
-  // ★ 本块**只做**：get/create → 空闲判断 → followup → whenIdle(带超时)。
-  //   不 resume（会话是草稿纸）、不 dispose（那是唯一能删掉学习记录的路）、忙则跳过（不打扰）。
-  const learnerIntervalMs = resolved.learnerIntervalMs ?? DEFAULT_LEARNER_INTERVAL_MS
-  // ★ 这几个提到**外层作用域**：诊断工具（在文件后半段注册）也要用同一份配置，
-  //   否则工具里只能把参数抄一遍 —— 那就多了一处会漂的副本。
-  const learnerSessionId = resolved.learnerSessionId || DEFAULT_LEARNER_SESSION_ID
-  const learnerStateFile = learnerStateFileFor(store.dataFile)
-  const learnerLogFile = learnerLogFileFor(store.dataFile)
-  // ★ 模型路由：**只用配置里的外部 API**（2026-10-15 用户规格：不配 = 不工作）。
-  //
-  // 为什么不退回"问宿主默认模型服务"（原先有这条兜底，现已去掉）：按规格"配置项可配可不配，
-  // 不配也默认不工作" —— 那就没有"留空时的兜底行为"这回事了，留空即未配置。
-  // 另外这也避开了宿主默认路由的一个真坑：`deepseek-account` 对**插件自建的根 agent** 稳定 TRANSPORT
-  // （请求 config 与我能正常跑的会话逐字段完全相同 → 不是配置问题，是那条账号路由的限制）。
-  // ★ 回退到"必须显式配"：守卫会先拦住没配的情况，这里就不会出现空串路由。
-  const learnerAgentOptions = {
-    provider: resolved.learnerProvider,
-    model: resolved.learnerModel,
-  }
-  // ★ 输出上限：**默认什么都不设，直接继承全局 agent 配置**（2026-10-17 用户决定"不限制了"）。
-  //   历史：曾想固定成 16000（当时 deepseek 路由在这个继承值上稳定 TRANSPORT），但那个常量
-  //   只在 `learnerMaxTokens > 0` 时才用得上 → 配置默认 0 时它其实是死代码、"注释声称的值 ≠ 实际值"。
-  //   现在删掉那个常量，语义明确成一句话：**不填 = 继承全局；要压就显式填 `learnerMaxTokens`**。
-  if (learnerAgentOptions && resolved.learnerMaxTokens > 0) learnerAgentOptions.maxTokens = resolved.learnerMaxTokens
-  // ★ 不动 reasoningEffort：**实测它无害** —— 我能正常跑的会话带着 reasoningEffort:"high" 也正常。
-
-  // 诊断用：把**实际会发出去**的路由记进日志
-  // ★ 回退后这两个字段恒有值（守卫先拦没配的情况）；仍保留可选访问，避免守卫被改动时 apply() 抛错而整块不加载
-  //   （2026-10-17 实测：写成 `learnerAgentOptions.provider` 时插件彻底没起来，工具全部 unknown）。
-  const learnerDefaultRoute = learnerAgentOptions?.provider
-    ? `${learnerAgentOptions.provider}/${learnerAgentOptions.model}`
-    : '(未配置外部 API)'
-  const learnerWorkspace = resolveLearnerWorkspace(resolved.learnerWorkspace, {
-    defaultWorkspace: (() => {
-      try { return path.join(os.homedir(), 'Documents', 'deepseek-harness', 'default-workspace') } catch { return null }
-    })(),
-    cwd: process.cwd(),
-    existsSync: (p) => { try { return existsSync(p) } catch { return false } },
-  })
-  // ★★ `agentPreset`：**决定这个 agent 挂哪些子插件 —— 工具集就是从这些插件来的**。
-  //
-  // 实测证据（会话头对照）：
-  //   我这个**能联网**的会话：`"agentPreset":"standard"`（44 个工具，含 web_search / web_fetch）
-  //   learner 会话：**根本没有这个字段** → 只有 18 个工具（记忆 + context7 + 两个宿主只读工具），**没有联网工具**
-  //   （v1.6 后实际是 31 个：19 个 mnemos + context7 + fs/read/write/edit + web；18 是当时基线，别当当前值）
-  // 后果（用户一针见血指出的）：**不能联网的"学习"是跛脚的** —— 原先台账任务的核心步骤
-  //   "用 web_search 找项目 / 用 web_fetch 读 README" 它根本做不到。
-  // 所以：创建/恢复时**必须把这个 preset 带上**（宿主的 agent-preset 机制：preset = 一组子插件）。
-  const learnerAgentPreset = resolved.learnerAgentPreset || DEFAULT_LEARNER_AGENT_PRESET
-  const learnerMeta = (learnerWorkspace || learnerAgentPreset)
-    ? {
-        ...(learnerWorkspace ? { cwd: learnerWorkspace } : {}),
-        ...(learnerAgentPreset ? { agentPreset: learnerAgentPreset } : {}),
-      }
-    : undefined
-
-  // ★ 任务文件：用户在这里写"开放学习任务"；不存在就**自动生成带说明的模板**（绝不覆盖已有文件）。
-  //   内容会被代码读出来**内联进踢的那条消息** —— 因为 learner agent 没有任何文件工具（实测），
-  //   让它"自己去读"在这条链上做不到。
-  const learnerTasksFile = resolved.learnerTasksFile || learnerTasksFileFor(store.dataFile)
-
-  // ★ 外部 API 是否配齐。按规格："**配置项可配置可不配置，不配置也默认不工作**"——
-  //   所以这里不猜任何默认值，缺一个就视为未配置，直接不工作（并在日志里说明原因）。
-  const learnerConfigured = Boolean(resolved.learnerProvider && resolved.learnerModel)
-
-  if (learnerIntervalMs > 0 && resolved.learnerEnabled !== false) {
-    ctx.effect(() => {
-      // ① 任务文件：首次自动生成模板（只在真的不存在时才写）
-      ensureLearnerTasksFile(learnerTasksFile)
-        .then((made) => {
-          if (made) return appendLearnerLog(learnerLogFile, `已生成任务文件模板：${learnerTasksFile}（可自由编辑）`)
-          return null
-        })
-        .catch(() => {})
-      // ★ 注册即写一行：万一后面整块没跑，这行能证明"effect 到底有没有被注册"。
-      //   （本次排错吃了这个亏：日志一个字都没有，无法区分"没注册"和"注册了但没触发"。）
-      appendLearnerLog(
-        learnerLogFile,
-        `已注册 learner 定时器：sessionId=${learnerSessionId} 间隔=${learnerIntervalMs}ms 工作目录=${learnerWorkspace || '(未设)'} 模型=${learnerDefaultRoute}` +
-          ` 模型路由=${learnerConfigured ? '已指定' : '(未配置 → 不会工作)'} 任务文件=${learnerTasksFile}`
-      ).catch(() => {})
-      // ★ "未到点已登记" 用状态收敛式记录：同一个 lastKickAt 只记一次。
-      //   为什么：原来 not-yet 完全不写日志（本意怕每 5 分钟刷屏），结果**"正常等待"和"坏了"
-      //   在用户眼里一模一样** —— 用户为此刻意来问过一次"是不是要等一小时"。
-      //   收敛式记录 = 每次踢周期恰好一行，既不刷屏也不失明。
-      let notYetLoggedFor = null
-      let notConfiguredLogged = false
-      // ★ 2026-10-24：tick 必须串行。setInterval 每 5 分钟触发，而一次踢可能等 waitIdle
-      //   最长 10 分钟；不串行就会有两次 tick 同时读/写 learner 状态，既会互相覆盖
-      //   lastKickAt（导致“没到点又踢”），也会让固定 tmp 名互相踩出 ENOENT。
-      let tickInFlight = false
-      const tick = async () => {
-        if (tickInFlight) return
-        tickInFlight = true
-        try {
-          // ★ 2026-10-18 用户决定回退：**必须配第三方 api**（learnerProvider + learnerModel），
-          //   留空即"不工作"（不再跟随主会话、也不再走宿主派活）。理由：
-          //   ① 后台几乎不存在活着的父会话；② 宿主派活的子会话藏在父会话的智能体下面，人不好看见。
-          if (!learnerConfigured) {
-            if (!notConfiguredLogged) {
-              notConfiguredLogged = true
-              await appendLearnerLog(
-                learnerLogFile,
-                '空闲学习未配置外部 API：需要同时设置 learnerProvider 与 learnerModel（缺一即不工作）。已跳过。'
-              )
-            }
-            return
-          }
-          const agents = ctx.get('agents')
-          if (!agents) {
-            // 宿主可能还没就绪；但**只能记一次**，否则日志会被这行刷爆
-            await appendLearnerLog(learnerLogFile, '跳过：取不到 agents 服务（宿主尚未就绪？）')
-            return
-          }
-          const st = await loadLearnerState(learnerStateFile)
-          // 读任务文件 → 内联进这一脚（剥掉模板注释，只把用户写的内容送过去）
-          const tasksRead = await readLearnerTasks(learnerTasksFile)
-          const kickText = buildLearnerMessage({
-            tasks: tasksRead.tasks,
-            tasksFile: learnerTasksFile,
-            tasksReadFailed: tasksRead.error || '',
-          })
-          const r = await runLearnerKick({
-            agents,
-            sessionId: learnerSessionId,
-            // ★ 会话回收：状态进、nextState 出（判据/换 id 全在 runLearnerKick 里，这里不重复实现）
-            state: st,
-            measureLogBytes: (id) => learnerSessionLogBytes(id, store.dataFile),
-            agentOptions: learnerAgentOptions,
-            meta: learnerMeta,
-            intervalMs: learnerIntervalMs,
-            lastKickAt: st.lastKickAt,
-            text: kickText,
-            removeStale: (id) => removeStaleSessionFiles(id, store.dataFile),
-            // ★ preset 必须**主动 select** 才挂插件（光写 meta 不够）——见 learner-loop.js 里的注释
-            selectPreset: (agent) => ctx.get('agentPresets')?.select(agent, learnerAgentPreset),
-            onInfo: (m) => console.warn('mnemos:', m),
-          })
-          if (r?.recycle) {
-            await appendLearnerLog(
-              learnerLogFile,
-              `会话重建：${r.recycle.text}${r.retiredCleaned ? `；顺手清了 ${r.retiredCleaned} 处旧代会话文件` : ''}`
-            )
-          }
-          // ★ 状态迁移（含回收后的 activeSessionId）统一由 nextState 落盘 —— 这里不再自己算。
-          //   busy/not-yet 没有状态推进，不写盘；只有真的 sent 或发生换代时才落盘，
-          //   避免旧 tick 把新 lastKickAt 覆盖回去（saveLearnerState 还会再做一次单调合并）。
-          if (r?.nextState && (r.sent || r.recycle)) await saveLearnerState(learnerStateFile, r.nextState)
-          if (r?.sent) {
-            notYetLoggedFor = null // 新周期开始，允许再记一次"未到点"
-            // ★ 关键：followup 不抛错 ≠ 那一轮跑成功。把两件事分开记，便于排错。
-            await appendLearnerLog(
-              learnerLogFile,
-              `已入队 sessionId=${r.sessionId}${r.created ? '（本次新建会话）' : ''}${r.resumed ? '（resume 恢复）' : ''}；` +
-                `等待静默 waited=${r.waited}${r.waitReason ? ' 原因=' + r.waitReason : ''}；` +
-                `入队后 status=${r.statusAfter}`
-            )
-          } else if (r?.skipped && r.reason === 'not-yet') {
-            if (notYetLoggedFor !== st.lastKickAt) {
-              notYetLoggedFor = st.lastKickAt
-              await appendLearnerLog(
-                learnerLogFile,
-                `未到点已登记：还差 ${r.minutesUntil} 分钟（到点会自动踢，不用管）`
-              )
-            }
-          } else if (r?.skipped && r.reason) {
-            await appendLearnerLog(learnerLogFile, `跳过：${r.reason}${r.getError ? ' / getError=' + r.getError : ''}`)
-          }
-        } catch (e) {
-          await appendLearnerLog(learnerLogFile, `出错：${e?.stack || e?.message || e}`)
-        } finally {
-          tickInFlight = false
-        }
-      }
-      // 每 5 分钟检查一次"到点没"（真正的间隔由 learnerIntervalMs 控制）
-      const timer = setInterval(tick, Math.min(5 * 60 * 1000, learnerIntervalMs))
-      timer.unref?.()
-      // ★ 启动时立刻踢一次（不等到第一个 5 分钟）：
-      //   既能让"改了代码想立刻验证"变得确定，也能尽早把那个专用会话恢复成活的（GUI 才能打开）。
-      //   到点判定仍在 runLearnerKick 里（未满间隔就跳过），所以不会因为重启就狂踢。
-      Promise.resolve().then(tick).catch(() => {})
-      return () => clearInterval(timer)
-    }, 'dsh-mnemos: learner timer')
-  }
-
   // 启动时加载记忆 + 宪法
   ctx.effect(async () => {
     await Promise.all([
@@ -2428,22 +2055,6 @@ export function apply(ctx, config) {
     makeTaskDoneTool(store),
     makeTaskCiteTool(store),
   ]
-  // ★ 诊断/手动触发：立刻踢一次空闲学习（不等定时器）。只在 learner 启用时注册。
-  //   放在数组之外用 push，是为了让它的仓库源码块保持在**工厂函数里**
-  //   （F15 的静态检查要求每个工具的块内含 execute —— 写进数组项会让块只剩注册那一行）。
-  if (learnerIntervalMs > 0 && resolved.learnerEnabled !== false) {
-    toolDefs.push(makeLearnerKickTool(ctx, {
-      stateFile: learnerStateFile,
-      logFile: learnerLogFile,
-      dataFile: store.dataFile,
-      tasksFile: learnerTasksFile,
-      sessionId: learnerSessionId,
-      agentOptions: learnerAgentOptions,
-      meta: learnerMeta,
-      agentPreset: learnerAgentPreset,
-      intervalMs: learnerIntervalMs,
-    }))
-  }
   for (const tool of toolDefs) registerTool(withToolOutputGate(tool, { onWarn: skillWarn }))
 
   // 工具名未找到时的引导：实测 sensenova 免费模型臆造了 `mnemos_reremember`，

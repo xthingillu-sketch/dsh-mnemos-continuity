@@ -1,6 +1,6 @@
-# Mnemos (v1.7.0)
+# Mnemos (v1.7.1)
 
-> **v1.7 changes:** recall now has three modes — fixed self-narrative injection, task activation (`recall`/`open`), and experimental associative hints. The task graph is a foundational mechanism (address space, working memory, dossier/trace entry, event/decision anchor), not just a delegation tool. Constitution v3 adds the cognitive-body statement; red lines are unchanged.
+> **v1.7.1 focus:** it is not about storing more memory; it is about **which memories the system actually controls**. Self-narrative (experience/decision/event) is most trusted because it is inspectable and correctable; ordinary memory sits in the middle; external information is least trusted because it cannot be confirmed or overturned easily. Constitution v5 adds the trust/control, body-vs-instrument, and context-positioning statements; red lines are unchanged. Idle learning was removed in favor of host automation.
 
 **A DeepSeek Harness (DSH) plugin — not a bigger memory store, but memory that stays usable after you switch sessions, directories, or models.**
 
@@ -63,10 +63,12 @@ Full statement (Chinese): [`README.md`](README.md) → 风险与责任.
 |---|---|
 | What it is, what it costs, should you use it | [`README.md`](README.md) (Chinese) |
 | Install / configure / tools / data location / troubleshooting | [`INSTALL.md`](INSTALL.md) |
-| Architecture, data flow, one task end-to-end | `docs/架构总览.docx` |
-| Every mechanism and its guarantees/limits | `docs/architecture-机制清单.docx` |
+| Architecture, data flow, one task end-to-end | `docs/架构总览.md` |
+| Every mechanism and its guarantees/limits | `docs/architecture-机制清单.md` |
 | **Module-by-module implementation** (appendix: the constitution and the system prompt, verbatim) | [`docs/模块与功能实现.md`](docs/模块与功能实现.md) |
-| Why it is shaped this way | `docs/设计者视角.docx` |
+| Why it is shaped this way | `docs/设计者视角.md` |
+
+> The release ships Markdown docs only; docx/pdf are not bundled.
 
 ## License
 

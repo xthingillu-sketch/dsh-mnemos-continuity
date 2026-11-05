@@ -1,6 +1,6 @@
 {
   "name": "dsh-mnemos-continuity",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Cross-model continuity for DeepSeek Harness: memory, skills and rules live in local files, so judgement survives session and model changes. Not about storing more memory — about using it well after the model changes.",
   "type": "module",
   "main": "./src/index.js",
@@ -11,7 +11,6 @@
   "files": [
     "src",
     "scripts",
-    "docs/*.docx",
     "docs/*.md",
     "examples",
     "cordis.patch.yml",
@@ -52,3 +51,5 @@
     "url": "https://github.com/xthingillu-sketch/dsh-mnemos-continuity/issues"
   }
 }
+
+

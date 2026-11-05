@@ -146,32 +146,6 @@ export const TOOL_OUTPUT_SPECS = {
     required: ['enabled'],
     properties: { enabled: bool() },
   },
-  // ★ 诊断工具：立刻踢一次空闲学习，并如实回报每个分支（到点判定/resume/create/入队）
-  mnemos_learner_kick: {
-    type: 'object',
-    required: ['sessionId', 'skipped'],
-    properties: {
-      sessionId: str(),
-      skipped: bool(),
-      reason: str(),
-      minutesUntil: num(),
-      created: bool(),
-      resumed: bool(),
-      staleRemoved: num(),
-      sent: bool(),
-      waited: bool(),
-      waitReason: str(),
-      statusAfter: str(),
-      getError: str(),
-      error: str(),
-      // ★ 会话重建（2026-10-17 加）：本次是否把会话删掉重建、为什么
-      recycled: bool(),
-      recycleFrom: str(),
-      recycleTo: str(),
-      recycleReason: str(),
-      recycleWhy: str(),
-    },
-  },
   mnemos_propose_skill: {
     // 构造函数 = skill-review.js 的 createSkill（自己已有 omitNulls 与 100~103 节的断言）；
     // tool-results.js 里的 proposeSkillResult 只兜底"必须是个对象"。

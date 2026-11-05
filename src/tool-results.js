@@ -156,40 +156,6 @@ export function toggleResult(enabled) {
 }
 
 /**
- * mnemos_learner_kick（诊断工具）：把 runLearnerKick 的结果折成形状固定的回执。
- * ★ 为什么要有这个构造器：宿主 "value must be an object" 那条错，本项目栽过多次
- *   （mnemos_consolidate 返回 null、mnemos_open id 不存在），所以关键字段必须显式给默认值。
- */
-export function learnerKickResult(r) {
-  const v = r && typeof r === 'object' ? r : {}
-  const out = {
-    sessionId: typeof v.sessionId === 'string' ? v.sessionId : '',
-    skipped: !!v.skipped,
-  }
-  if (typeof v.reason === 'string') out.reason = v.reason
-  if (Number.isFinite(v.minutesUntil)) out.minutesUntil = v.minutesUntil
-  if (typeof v.created === 'boolean') out.created = v.created
-  if (typeof v.resumed === 'boolean') out.resumed = v.resumed
-  if (Number.isFinite(v.staleRemoved)) out.staleRemoved = v.staleRemoved
-  if (v.sent) out.sent = true
-  if (typeof v.waited === 'boolean') out.waited = v.waited
-  if (typeof v.waitReason === 'string') out.waitReason = v.waitReason
-  if (typeof v.statusAfter === 'string') out.statusAfter = v.statusAfter
-  if (typeof v.getError === 'string') out.getError = v.getError
-  if (typeof v.error === 'string') out.error = v.error
-  // ★ 会话重建（2026-10-17 加）：诊断时要能看出"这次是不是把会话删掉重建了、为什么"
-  if (v.recycle && typeof v.recycle === 'object') {
-    out.recycled = true
-    if (typeof v.recycle.from === 'string') out.recycleFrom = v.recycle.from
-    if (typeof v.recycle.to === 'string') out.recycleTo = v.recycle.to
-    if (typeof v.recycle.reason === 'string') out.recycleReason = v.recycle.reason
-    // 人话版本由 learner-loop.js 的 describeLearnerRecycle 生成（措辞只有一处）
-    if (typeof v.recycle.text === 'string') out.recycleWhy = v.recycle.text
-  }
-  return out
-}
-
-/**
  * mnemos_propose_skill：真正的构造函数是 skill-review.js 的 `createSkill`
  * （它自己已有 omitNulls 与 100~103 节的断言）。这里只做**最后一道兜底**：
  * null/undefined 到宿主那里就是 "value must be an object"，所以折成一个形状合法的拒绝回执。
