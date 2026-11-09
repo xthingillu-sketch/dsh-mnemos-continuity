@@ -395,3 +395,227 @@ export class FanSearchState {
     return [s.text, s.userText, argText].filter(Boolean).join('\n').slice(0, 1200)
   }
 }
+
+// ── v1.7.2 联想激活：句子级候选 + 相关3 / 旁支2 ──────────────────────────
+
+/** 拆句：中文句末/分号，英文句末；保留顺序，过滤空句。 */
+export function splitSentences(text) {
+  const raw = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (!raw) return []
+  const parts = raw
+    .split(/(?<=[。！？；!?;])|(?<=\.)\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  return parts.length ? parts : [raw]
+}
+
+function autoOf(m) {
+  return m && m.source === 'autobiography' && m.category !== 'identity' ? m.category || 'other' : null
+}
+
+function sidePriority(m) {
+  const cat = autoOf(m)
+  const catScore = { experience: 3, decision: 2.5, event: 2, other: 1 }[cat] || 0
+  const sal = { high: 3, normal: 2, low: 1 }[m.salience] || 2
+  const rec = Number(m.recency || 0) / 1e13
+  return catScore * 10 + sal + rec
+}
+
+function sentenceHitsMechanical(memory, q, opts) {
+  const sentences = splitSentences(memory.summary)
+  const hits = []
+  for (let i = 0; i < sentences.length; i++) {
+    // 句子级命中只看句子文本；tags 只用于记忆级候选/排序，不能给每句都加一次 tag 分。
+    const scored = scoreMemory({ ...memory, summary: sentences[i], tags: [] }, q)
+    if (scored.raw >= (opts.sentenceMinRaw ?? MIN_RAW_SCORE)) {
+      hits.push({ index: i, sentence: sentences[i], score: scored.score, raw: scored.raw })
+    }
+  }
+  return { sentences, hits }
+}
+
+function vectorCos(a, b) {
+  let s = 0, na = 0, nb = 0
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i++) { s += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+  return s / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12)
+}
+
+async function sentenceHitsEmbedding(memory, q, embedder, opts) {
+  const sentences = splitSentences(memory.summary)
+  if (!sentences.length) return { sentences, hits: [] }
+  const qv = await embedder.embedOne(q.text)
+  const vectors = await embedder.embed(sentences)
+  const threshold = Number(opts.sentenceThreshold ?? 0.35)
+  const hits = []
+  for (let i = 0; i < sentences.length; i++) {
+    const sim = vectorCos(qv, vectors[i])
+    if (sim >= threshold) hits.push({ index: i, sentence: sentences[i], score: sim, raw: sim })
+  }
+  return { sentences, hits }
+}
+
+function fragmentFromHits(hits, maxChars = 240) {
+  if (!hits.length) return ''
+  const ordered = [...hits].sort((a, b) => a.index - b.index)
+  let out = ''
+  for (const h of ordered) {
+    const next = out ? `${out}……${h.sentence}` : h.sentence
+    if (next.length > maxChars) {
+      if (!out) out = h.sentence.slice(0, Math.max(0, maxChars - 1)) + '…'
+      break
+    }
+    out = next
+  }
+  return out
+}
+
+function candidateOf(memory, sentences, hits, autoBonus = 1.5) {
+  if (!hits.length) return null
+  const best = Math.max(...hits.map((h) => h.score))
+  const ratio = hits.length / Math.max(1, sentences.length)
+  const sourceBonus = memory.source === 'autobiography' ? autoBonus : 1
+  return {
+    id: memory.id,
+    score: best * ratio * sourceBonus,
+    source: sourceLabel(memory),
+    category: memory.category || null,
+    fragment: fragmentFromHits(hits),
+    hitRatio: ratio,
+    matchedSentences: hits.length,
+    totalSentences: sentences.length,
+    candidate: true,
+  }
+}
+
+function sideItem(memory) {
+  const sentences = splitSentences(memory.summary)
+  return {
+    id: memory.id,
+    score: sidePriority(memory),
+    source: sourceLabel(memory),
+    category: memory.category || null,
+    fragment: (sentences[0] || String(memory.summary || '')).slice(0, 240),
+    hitRatio: 0,
+    matchedSentences: 0,
+    totalSentences: sentences.length,
+    candidate: false,
+  }
+}
+
+/**
+ * 句子级联想检索：相关3 + 旁支2。
+ * mode=mechanical 或 embedding；embedding 不可用时回退.
+ */
+export async function searchAssociative(memories, queryText, {
+  exclude = new Set(),
+  mode = 'mechanical',
+  embedder = null,
+  relevantTop = 3,
+  sideCount = 2,
+  sentenceMinRaw = MIN_RAW_SCORE,
+  sentenceThreshold = 0.35,
+  maxSnippetChars = 240,
+} = {}) {
+  const q = buildQuery(queryText)
+  const list = (memories || []).filter((m) => m && m.id && !exclude.has(m.id) && m.source !== 'deprecated')
+  const usable = list.filter((m) => String(m.summary || '').length <= 600 &&
+    !(m.source === 'autobiography' && m.category === 'identity'))
+  let useEmbedding = mode === 'embedding' && embedder && typeof embedder.embed === 'function'
+  let qv = null
+  let embMap = null
+  let embeddingError = null
+  const sentenceLists = usable.map((m) => splitSentences(m.summary))
+  if (useEmbedding) {
+    try {
+      const unique = new Set([q.text])
+      for (const list of sentenceLists) for (const s of list) if (s) unique.add(s)
+      const texts = [...unique]
+      const vectors = await embedder.embed(texts)
+      qv = vectors[0]
+      if (!qv) throw new Error('embedding query unavailable')
+      embMap = new Map(texts.map((t, i) => [t, vectors[i]]))
+    } catch (e) {
+      useEmbedding = false
+      embeddingError = String(e?.message || e)
+    }
+  }
+  if (!useEmbedding && mode === 'embedding') mode = 'mechanical'
+  const candidates = []
+  const autoNonCandidates = []
+  for (let mi = 0; mi < usable.length; mi++) {
+    const m = usable[mi]
+    let sentences = [], hits = []
+    try {
+      if (useEmbedding) {
+        sentences = sentenceLists[mi]
+        const threshold = Number(sentenceThreshold ?? 0.35)
+        for (let i = 0; i < sentences.length; i++) {
+          const v = embMap.get(sentences[i])
+          if (!v) continue
+          const sim = vectorCos(qv, v)
+          if (sim >= threshold) hits.push({ index: i, sentence: sentences[i], score: sim, raw: sim })
+        }
+      } else {
+        ({ sentences, hits } = sentenceHitsMechanical(m, q, { sentenceMinRaw }))
+      }
+    } catch {
+      ({ sentences, hits } = sentenceHitsMechanical(m, q, { sentenceMinRaw }))
+    }
+    if (hits.length) {
+      const c = candidateOf(m, sentences, hits)
+      if (c) { c.fragment = fragmentFromHits(hits, maxSnippetChars); candidates.push(c) }
+    } else if (autoOf(m)) {
+      autoNonCandidates.push(sideItem(m))
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
+  const relevant = candidates.slice(0, Math.max(0, Number(relevantTop) || 0)).map((x) => ({ ...x, kind: 'relevant' }))
+  const relevantIds = new Set(relevant.map((x) => x.id))
+  const side = []
+  for (const c of candidates) {
+    if (side.length >= sideCount) break
+    if (relevantIds.has(c.id)) continue
+    if (c.source.startsWith('自传体') && c.category !== 'identity') side.push({ ...c, kind: 'side' })
+  }
+  if (side.length < sideCount) {
+    autoNonCandidates.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
+    for (const c of autoNonCandidates) {
+      if (side.length >= sideCount) break
+      if (relevantIds.has(c.id) || side.some((x) => x.id === c.id)) continue
+      side.push({ ...c, kind: 'side' })
+    }
+  }
+  return {
+    items: [...relevant, ...side],
+    relevantCount: relevant.length,
+    sideCount: side.length,
+    sideShortfall: Math.max(0, sideCount - side.length),
+    mode: useEmbedding ? 'embedding' : 'mechanical',
+    embeddingError,
+  }
+}
+
+/** 强制边界提示：每一条都标“线索不是结论”；未召回 id 不得直接当结论。 */
+export function formatAssociativeHint(result) {
+  const items = Array.isArray(result) ? result : result?.items
+  if (!Array.isArray(items) || items.length === 0) return ''
+  const lines = [
+    '[联想激活 · 线索，不是结论 · 未召回]',
+    '本节由系统在工具执行后附加，不属于工具结果；可能相关，也可能无关。',
+    '没有对应 id 的 mnemos_recall / mnemos_open 核对前，不得把它当成结论或事实；要引用或据此判断，先 mnemos_open(id)。',
+    '',
+  ]
+  for (const f of items) {
+    const tag = f.kind === 'side'
+      ? '[联想·旁支·自传体 · 非任务证据]'
+      : '[联想·相关]'
+    const hit = f.matchedSentences ? ` 命中句 ${f.matchedSentences}/${f.totalSentences}` : ''
+    lines.push(`${tag} [id: ${f.id}] [${f.source}]${hit}`)
+    lines.push(`   “${f.fragment}”`)
+  }
+  if (result && !Array.isArray(result) && result.sideShortfall > 0) {
+    lines.push('', `旁支线索不足：应有 2 条，实得 ${result.sideCount} 条；不重复、不硬凑。`)
+  }
+  return lines.join('\n')
+}

@@ -28,7 +28,8 @@ import { buildSelfText } from './self-text.js'
 import { describeResolved, dirUnderProfile, skillsRootFor } from './paths.js'
 import { mnemosSystemPromptLines } from './system-prompt.js'
 import { appendStartupLog, pickLogFile, pickLogger } from './boot-log.js'
-import { FanSearchState, formatFansearchHint } from './fansearch.js'
+import { FanSearchState, formatAssociativeHint } from './fansearch.js'
+import { createEmbeddingClient } from './embedding.js'
 import { evaluateCurationDue } from './curation-trigger.js'
 import { makeSkillUsageRecorder, usageFileFor } from './skill-usage.js'
 import {
@@ -95,6 +96,13 @@ export const Config = Schema.object({
   curationEnabled: Schema.boolean().default(true).description(
     '自动身份/经验整理：默认开启；只在到期条件满足时跑独立 curator，不每轮跑'
   ),
+  fansearchMode: Schema.string().default('mechanical').description(
+    '联想激活模式：mechanical=关键词/标签；embedding=句子向量（需配置，失败回退 mechanical）；shadow=embedding 注入 + mechanical 后台记录；off=关闭'
+  ),
+  fansearchEmbeddingUrl: Schema.string().default('').description('embedding 端点（OpenAI-compatible /embeddings）；留空用 MNEMOS_EMBEDDING_URL'),
+  fansearchEmbeddingModel: Schema.string().default('').description('embedding 模型；留空用 MNEMOS_EMBEDDING_MODEL'),
+  fansearchEmbeddingKeyFile: Schema.string().default('').description('可选：从已有 credentials YAML 读取 NBU_API_KEY 的路径；key 不写进 profile'),
+  fansearchEmbeddingCacheFile: Schema.string().default('').description('可选：embedding 向量缓存文件；留空则只在本进程缓存'),
   identityCandidateTrigger: Schema.number().default(5).description('身份候选达到多少条触发整理（默认 5）'),
   identityFallbackDays: Schema.number().default(30).description('身份候选不足 5 条时的 30 天兜底（天）'),
   experienceIntervalDays: Schema.number().default(7).description('经验整理周期（天）；默认每周一次，不按条数触发'),
@@ -183,7 +191,9 @@ function makeRememberTool(store) {
           type: 'string',
           enum: ['identity', 'decision', 'experience', 'event', 'other'],
           description:
-            '仅 source=autobiography 时使用：identity=身份、decision=决策、experience=经验、event=事件、other=兜底。' +
+            '仅 source=autobiography 时使用：identity=身份、decision=决策、experience=经验、event=事件、' +
+            'other=兜底/身份备用详情。身份中不需固定注入的细节可存 other（tags 加 identity-backup），' +
+            'identity 只留一条 pointer（tags 加 identity-pointer，summary 写明 open:<detailId>；指针不计入身份字数预算）；other 不固定注入，需时 recall category=other 或 open(id)。' +
             '未填时按 tags 兼容推断。',
         },
         identityStatus: {
@@ -307,7 +317,7 @@ function makeRecallTool(store, fanState = null) {
         category: {
           type: 'string',
           enum: ['identity', 'decision', 'experience', 'event', 'other'],
-          description: '仅 source=autobiography 时按主类目过滤。',
+          description: '仅 source=autobiography 时按主类目过滤；other 也用于身份备用详情（不固定注入，需时用 open(id) 读全文）。',
         },
         offset: {
           type: 'integer',
@@ -388,11 +398,13 @@ function buildCurationPrompt(action) {
       ? "- 身份审阅材料：mnemos_recall({ tags: ['identity-revision'], limit: 50 })，再 open 读 before/after 全文；历史只作审阅材料，不自动恢复。"
       : "- 经验审阅材料：mnemos_recall({ tags: ['experience-revision'], limit: 50 })，再 open 读 before/after 全文；历史只作审阅材料，不自动恢复。",
     '- 也读取与判断相关的 decision/event，但提案只针对目标类目。',
+    '- identity 中 tags=identity-pointer 的条目是身份详情指针：不要合并/删除，保留 summary 里的 open:<id>。',
     '',
     '判断要求：',
     '- 身份：自我模型、偏好/好恶、目标、做事倾向、边界；稳定、第一人称、可合并。',
-    '- 经验：最多 5 条；按跨任务复用、改变过判断、有证据、仍有效排序；允许合并同类。',
-    '- 如果当前 active experience >5：keep/replace/add 选满 5 后，remove 必须显式列出所有未入选的 active experience id；否则 apply 会因超上限拒绝。',
+    '- 经验：不强制压到 5 条；按跨任务复用、改变过判断、有证据、仍有效排序；允许合并同类。',
+    '- 只有真正重复/已被取代的经验才 remove；筛选不把经验降级为普通记忆，remove 只做历史保留；合并时才降级旧条。',
+    '- 固定注入最多选 5 条，但“注入少”不等于“删除多”；不要为了压数量删掉仍有价值的经验。',
     '- 用户影响通过长期证据/说服，不把单次用户指定当身份。',
     '- 不覆盖宪法红线；没有证据的偏好/目标不要编造。',
     '',
@@ -1616,7 +1628,19 @@ export function apply(ctx, config) {
     resolved.constitutionFile || (profileDataDir ? path.join(profileDataDir, 'constitution.json') : undefined)
   const store = new MemoryStore(dataFileResolved || undefined)
   const fanState = new FanSearchState()
-  const fansearchEnabled = resolved.fansearchEnabled === true
+  const fansearchMode = ['mechanical', 'embedding', 'shadow', 'off'].includes(resolved.fansearchMode)
+    ? resolved.fansearchMode
+    : 'mechanical'
+  const fansearchEnabled = resolved.fansearchEnabled === true && fansearchMode !== 'off'
+  const fanEmbedder = (fansearchMode === 'embedding' || fansearchMode === 'shadow')
+    ? createEmbeddingClient({
+        url: process.env.MNEMOS_EMBEDDING_URL || resolved.fansearchEmbeddingUrl || '',
+        model: process.env.MNEMOS_EMBEDDING_MODEL || resolved.fansearchEmbeddingModel || '',
+        apiKey: process.env.MNEMOS_EMBEDDING_API_KEY || '',
+        apiKeyFile: resolved.fansearchEmbeddingKeyFile || '',
+        cacheFile: resolved.fansearchEmbeddingCacheFile || path.join(path.dirname(store.dataFile), 'embedding-cache.json'),
+      })
+    : null
   const constitution = new ConstitutionStore(constitutionFileResolved || undefined)
   let subagents
   try { subagents = ctx.subagents ?? ctx.get('subagents') } catch { subagents = undefined }
@@ -1785,6 +1809,38 @@ export function apply(ctx, config) {
     if (event && event.type === 'turn/start' && heartbeatAllowAutoEnable) heartbeatEnabled = true
   })
 
+  // 影子模式：embedding 负责实际注入，mechanical 只做后台对照记录。
+  async function appendShadowLog(store, { sessionId, query, primary, shadow, elapsedMs = null }) {
+    try {
+      const slim = (r) => ({
+        mode: r?.mode || null,
+        relevantCount: r?.relevantCount ?? 0,
+        sideCount: r?.sideCount ?? 0,
+        sideShortfall: r?.sideShortfall ?? 0,
+        items: (r?.items || []).map((x) => ({
+          id: x.id, kind: x.kind, source: x.source, category: x.category,
+          score: x.score, hitRatio: x.hitRatio,
+          matchedSentences: x.matchedSentences, totalSentences: x.totalSentences,
+          fragment: x.fragment,
+        })),
+      })
+      const line = JSON.stringify({
+        at: Date.now(),
+        sessionId: sessionId || '',
+        query: String(query || '').slice(0, 1000),
+        primary: slim(primary),
+        mechanical: slim(shadow),
+        primaryHint: formatAssociativeHint(primary),
+        mechanicalHint: formatAssociativeHint(shadow),
+        retrievalMs: elapsedMs,
+        embeddingFallback: primary?.mode !== 'embedding',
+        embeddingError: primary?.embeddingError || null,
+      })
+      const file = path.join(path.dirname(store.dataFile), 'fansearch-shadow.jsonl')
+      await fsp.appendFile(file, line + '\n', 'utf8')
+    } catch { /* 影子记录失败不影响注入 */ }
+  }
+
   // 范检索：旁路搭车。只在任务模式启用；不新增 user/message，线索追加到 tool result 附注。
   if (fansearchEnabled) {
     const textOf = (content) => (Array.isArray(content) ? content : [])
@@ -1819,6 +1875,59 @@ export function apply(ctx, config) {
       }
     })
 
+    // 预取与工具执行并行：pre-execute 只启动 Promise，不 await；post-execute 再取结果。
+    // 这样 embedding 的秒级耗时被工具调用本身掩盖，而不是工具结束后才开始。
+    const prefetch = new Map()
+    const prefetchKey = (sid, exec) => {
+      const cid = exec?.callId || exec?.rootCallId
+      return `${sid}:${cid || `${exec?.name || ''}:${JSON.stringify(exec?.arguments || {})}`}`
+    }
+    const runFansearch = async (sid, query, exclude) => {
+      const startedAt = Date.now()
+      let fragments
+      let primary = null
+      let mechanical = null
+      if (fansearchMode === 'shadow') {
+        ;[primary, mechanical] = await Promise.all([
+          store.fanSearchAssociative(query, {
+            exclude, mode: 'embedding', embedder: fanEmbedder, relevantTop: 3, sideCount: 2,
+          }),
+          store.fanSearchAssociative(query, {
+            exclude, mode: 'mechanical', embedder: null, relevantTop: 3, sideCount: 2,
+          }),
+        ])
+        fragments = primary
+        await appendShadowLog(store, { sessionId: sid, query, primary, shadow: mechanical, elapsedMs: Date.now() - startedAt })
+      } else {
+        fragments = await store.fanSearchAssociative(query, {
+          exclude,
+          mode: fansearchMode,
+          embedder: fanEmbedder,
+          relevantTop: 3,
+          sideCount: 2,
+        })
+      }
+      return { fragments, elapsedMs: Date.now() - startedAt, error: null }
+    }
+
+    ctx.on('tools/pre-execute', (exec, next) => {
+      const sid = exec?.agent?.session?.id
+      if (!sid || !exec) return next()
+      const name = String(exec.name || '')
+      if (name.startsWith('mnemos_')) return next()
+      if (!fanState.shouldScan(sid, { args: exec.arguments })) return next()
+      const key = prefetchKey(sid, exec)
+      if (!prefetch.has(key)) {
+        const query = fanState.queryFor(sid, exec.arguments)
+        const exclude = fanState.seenFor(sid)
+        const p = runFansearch(sid, query, exclude).catch((e) => ({
+          fragments: { items: [] }, elapsedMs: 0, error: String(e?.message || e),
+        }))
+        prefetch.set(key, p)
+      }
+      return next()
+    })
+
     ctx.on('tools/post-execute', async (exec, result, next) => {
       const decision = await next()
       if (!decision || decision.kind !== 'accept' || result?.isError) return decision
@@ -1826,25 +1935,33 @@ export function apply(ctx, config) {
       if (!sid) return decision
       const name = String(exec.name || '')
       if (name.startsWith('mnemos_')) return decision
-      if (!fanState.shouldScan(sid, { args: exec.arguments })) return decision
-
-      const query = fanState.queryFor(sid, exec.arguments)
-      const fragments = store.fanSearch(query, {
-        exclude: fanState.seenFor(sid),
-        limit: 30,
-        top: 3,
-      })
+      const key = prefetchKey(sid, exec)
+      let job = prefetch.get(key)
+      prefetch.delete(key)
+      if (!job) {
+        // 没有 pre-execute 预取（例如钩子顺序/宿主路径不同）时，退回工具结束后再跑。
+        if (!fanState.shouldScan(sid, { args: exec.arguments })) return decision
+        const query = fanState.queryFor(sid, exec.arguments)
+        job = runFansearch(sid, query, fanState.seenFor(sid)).catch((e) => ({
+          fragments: { items: [] }, elapsedMs: 0, error: String(e?.message || e),
+        }))
+      }
+      const out = await job
       fanState.markScanned(sid)
-      if (!fragments.length) return decision
+      if (out.error) return decision
+      const fragments = out.fragments
+      const nowSeen = fanState.seenFor(sid)
+      fragments.items = fragments.items.filter((f) => !nowSeen.has(f.id))
+      if (!fragments.items.length) return decision
 
-      fanState.markSeen(sid, fragments.map((f) => f.id), 'fansearch')
+      fanState.markSeen(sid, fragments.items.map((f) => f.id), 'fansearch')
       const content = Array.isArray(decision.content)
         ? decision.content
         : Array.isArray(result.content) ? result.content : []
       if (!content.length) return decision
       return {
         ...decision,
-        content: [...content, { type: 'text', text: formatFansearchHint(fragments) }],
+        content: [...content, { type: 'text', text: formatAssociativeHint(fragments) }],
       }
     })
   }

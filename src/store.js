@@ -7,7 +7,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { findSecrets, describeHits } from './secret-patterns.js'
 import { defaultDataFile } from './paths.js'
-import { searchMemories } from './fansearch.js'
+import { searchMemories, searchAssociative } from './fansearch.js'
 import {
   acquireLock, releaseLock, mergeMemories, atomicWriteFile,
   readTombstones, mergeTombstones, capTombstones, writeTombstones,
@@ -80,6 +80,12 @@ export function autobiographyCategoryOf(m) {
 /** 是否身份候选（candidate 不注入、不召回；只给 curation 用）。 */
 export function isIdentityCandidate(m) {
   return m && m.source === 'autobiography' && m.identityStatus === 'candidate'
+}
+
+/** 身份指针：只指向 other 中的详情，不占 identity 内容预算。 */
+export function isIdentityPointer(m) {
+  return m && m.source === 'autobiography' && autobiographyCategoryOf(m) === 'identity' &&
+    (m.tags || []).includes('identity-pointer')
 }
 
 /** 任务图的标签前缀（`task:<taskId>`）。**与归档闸门共用这一处**，别在别处硬编码字符串。 */
@@ -602,13 +608,15 @@ export class MemoryStore {
         .filter((m) => m.source === 'autobiography' &&
           m.identityStatus !== 'candidate' &&
           autobiographyCategoryOf(m) === 'identity' &&
+          !isIdentityPointer(m) &&
           !supersededIds.has(m.id))
         .reduce((sum, m) => sum + String(m.summary || '').length, 0)
       const newChars = String(summary || '').length
       const forceCandidate = identityStatus === 'candidate'
-      identityStatusFinal = forceCandidate || currentIdentityChars + newChars > DEFAULT_IDENTITY_BUDGET
+      const forceCore = recTags.includes('identity-pointer')
+      identityStatusFinal = forceCandidate
         ? 'candidate'
-        : 'core'
+        : (forceCore || currentIdentityChars + newChars <= DEFAULT_IDENTITY_BUDGET ? 'core' : 'candidate')
     }
     const occurredAtMs = occurredAt == null
       ? null
@@ -970,6 +978,12 @@ export class MemoryStore {
     return searchMemories(list, query, { exclude, limit, top })
   }
 
+  /** 句子级联想：相关3 + 旁支2；mode=mechanical|embedding。 */
+  async fanSearchAssociative(query, opts = {}) {
+    const list = [...this.memories.values()].filter((m) => !this.isArchiveLike(m))
+    return await searchAssociative(list, query, opts)
+  }
+
   async open(id) {
     const m = this.memories.get(id)
     if (!m) return null
@@ -1137,7 +1151,8 @@ export class MemoryStore {
     const taskTags = originGraph ? [`${TASK_TAG_PREFIX}${taskId}`, 'task'] : []
     const active = (cat) => [...this.memories.values()].filter((m) =>
       m.source === 'autobiography' && autobiographyCategoryOf(m) === cat &&
-      m.identityStatus !== 'candidate' && m.identityStatus !== 'archived'
+      m.identityStatus !== 'candidate' && m.identityStatus !== 'archived' &&
+      !(cat === 'identity' && (m.tags || []).includes('identity-pointer'))
     )
     const old = new Map(active(action).map((m) => [m.id, m]))
     const snapshotOf = (m) => ({
@@ -1195,16 +1210,17 @@ export class MemoryStore {
         return { ok: false, reason: `identity 预算超限：${chars} > ${DEFAULT_IDENTITY_BUDGET}` }
       }
     }
-    if (action === 'experience' && finalCount > DEFAULT_IMPORTANT_EXPERIENCE_COUNT) {
-      return { ok: false, reason: `experience 超过上限：${finalCount} > ${DEFAULT_IMPORTANT_EXPERIENCE_COUNT}` }
-    }
+    // 经验数量上限不再在 apply 强制降级/拒绝；筛选不改变其它经验的身份，
+    // 旧经验只在 merge 时降级为普通记忆。上限只用于紧凑注入选择。
     const retire = (m, newId = null, asOrdinary = false) => {
       if (!m) return
       retired.add(m.id)
       m.version = (m.version || 1) + 1
       m.recency = now
       if (asOrdinary) {
+        // 只有 merge 会走到这里：旧经验被合并进新经验，降级为普通记忆并保留 supersededBy
         m.source = 'internal'
+        if (newId) m.supersededBy = newId
         delete m.category
         delete m.identityStatus
         delete m.pinned
@@ -1212,6 +1228,7 @@ export class MemoryStore {
         m.tags = (m.tags || []).filter((t) => !['identity', 'experience', 'important-experience', 'important'].includes(t))
         if (!m.tags.includes(`${action}-history`)) m.tags.push(`${action}-history`)
       } else {
+        // remove/replace：只做 soft delete，不改 source=internal，避免筛选把重要经验降成普通记忆
         m.source = 'deprecated'
         if (newId) m.supersededBy = newId
         if (!m.tags.includes(`${action}-history`)) m.tags.push(`${action}-history`)
@@ -1226,14 +1243,14 @@ export class MemoryStore {
     for (const x of data.merge || []) {
       if (!x) continue
       const rec = makeRecord(x.summary, x.why, [])
-      for (const id of x.from || []) retire(old.get(String(id)), rec.id)
+      for (const id of x.from || []) retire(old.get(String(id)), rec.id, true)
     }
     for (const x of data.add || []) {
       if (!x) continue
       makeRecord(x.summary, x.why, x.evidenceIds)
     }
     for (const id of data.remove || []) {
-      retire(old.get(String(id)), null, action === 'experience')
+      retire(old.get(String(id)), null, false)
     }
     const revision = {
       id: randomUUID(),
@@ -1458,7 +1475,14 @@ export class MemoryStore {
 
     const identity = all.filter((m) => catOf(m) === 'identity')
       .sort((a, b) => ((b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)) || ((a.createdAt || 0) - (b.createdAt || 0)))
+    // 指针不占身份内容预算，但仍进入固定注入；内容条目可用满 identityCap。
     for (const m of identity) {
+      if (!isIdentityPointer(m)) continue
+      entries.push({ category: 'identity', label: labelOf.identity, summary: String(m.summary || ''), id: m.id })
+      selected.add(m.id)
+    }
+    for (const m of identity) {
+      if (isIdentityPointer(m)) continue
       const text = String(m.summary || '')
       if (identityUsed + text.length > identityCap) continue
       identityUsed += text.length

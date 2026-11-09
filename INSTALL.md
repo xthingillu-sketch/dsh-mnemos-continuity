@@ -1,4 +1,4 @@
-# 安装与配置 Mnemos（v1.7.1）
+# 安装与配置 Mnemos（v1.7.2）
 
 > 这份文件只写**你要做的事**：装、配、验证、排错、数据放哪。
 > 它是什么、值不值得用 → `docs/简介`；有什么机制 → `docs/architecture-机制清单`；为什么这样设计 → `docs/设计者视角`。
@@ -260,8 +260,15 @@ v1.7.1 已移除空闲学习：`learner-loop`、`mnemos_learner_kick`、learner 
     experienceIntervalDays: 7      # 经验整理周期（天）；不按条数触发
     archiveMinAgeMs: 86400000      # 归档时间阈值（默认 24 小时）
     archiveMaxShort: 50            # 短时记忆数量阈值
-    # 联想激活（实验性；当前代码读取 fansearchEnabled，但尚未正式写入 Config schema）
-    # fansearchEnabled: true       # 工具执行后附注候选 id + 摘要片段；默认关
+    # 联想激活（实验性；默认关）
+    # fansearchEnabled: true        # 工具执行后附注线索；默认关
+    # fansearchMode: mechanical     # mechanical | embedding | shadow | off
+    # fansearchEmbeddingUrl: ""     # OpenAI-compatible /embeddings；留空用 MNEMOS_EMBEDDING_URL
+    # fansearchEmbeddingModel: ""   # 留空用 MNEMOS_EMBEDDING_MODEL
+    # fansearchEmbeddingKeyFile: "" # 可选：从已有 credentials YAML 读取 NBU_API_KEY（不把 key 写进 profile）
+    # fansearchEmbeddingCacheFile: "" # 可选：向量缓存；留空用数据目录 embedding-cache.json
+    # shadow = embedding 实际注入 + mechanical 后台对照写入 fansearch-shadow.jsonl
+    # embedding 不可用时自动回退 mechanical，不影响插件启动
     # —— 辅助路由（validation 兜底；自动 curation 已改为空闲会话注入，不用这里）——
     auxProvider: ""                # 留空 = 走父会话/主模型
     auxModel: ""                   # 留空 = 走父会话/主模型

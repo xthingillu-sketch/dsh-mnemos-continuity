@@ -1,6 +1,8 @@
-# Mnemos (v1.7.1)
+# Mnemos (v1.7.2)
 
-> **v1.7.1 focus:** it is not about storing more memory; it is about **which memories the system actually controls**. Self-narrative (experience/decision/event) is most trusted because it is inspectable and correctable; ordinary memory sits in the middle; external information is least trusted because it cannot be confirmed or overturned easily. Constitution v5 adds the trust/control, body-vs-instrument, and context-positioning statements; red lines are unchanged. Idle learning was removed in favor of host automation.
+[![dshbase verified](https://dshbase.com/badges/dsh-mnemos-continuity.svg)](https://dshbase.com/zh/plugins/dsh-mnemos-continuity/)
+
+> **v1.7.2 focus:** control still comes first; this release adds sentence-level associative hints with 3+2 budgets and a shadow mode (embedding injects, mechanical runs in the background for comparison), plus identity backup storage: identity keeps a small pointer, `other` keeps the full detail, and the pointer does not consume the identity character budget. Self-narrative remains most trusted because it is inspectable and correctable; external information remains least trusted because it cannot be confirmed or overturned easily.
 
 **A DeepSeek Harness (DSH) plugin — not a bigger memory store, but memory that stays usable after you switch sessions, directories, or models.**
 

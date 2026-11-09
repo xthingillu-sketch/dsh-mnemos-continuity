@@ -1,18 +1,16 @@
-# 版本标识 · Mnemos v1.7.1
+# 版本标识 · Mnemos v1.7.2
 
 | 项 | 值 |
 |---|---|
-| **版本** | **v1.7.1**（`package.json` 的 `version`） |
-| 日期 | 2026-11-05 |
-| 本目录 | 当前 v1.7.1；npm 已发布；GitHub tag 随本次推送 |
-| 规模 | `src` **29 个模块**；工具 **19** 个；心跳维护 **9** 项；测试 **1275 / 0** |
+| **版本** | **v1.7.2**（`package.json` 的 `version`） |
+| 日期 | 2026-11-09 |
+| 本目录 | 当前 v1.7.2；npm 已发布；GitHub tag 随本次推送 |
+| 规模 | `src` **30 个模块**；工具 **19** 个；心跳维护 **9** 项；测试 **1315 / 0** |
 | 提示词 | 25 条 / 7 节 / **3799 字符** |
 | 宪法 | **v5（认知体）**，**1708 字符**；红线 1–4 与 5.x 未动 |
 | 当前 DSH | 0.2.1-rc.5 已实测；0.2.2-alpha.2 的插件 API 迁移项未适配 |
 
-## 本版核心：记忆的价值不在存量，在掌控权
-
-这次更新不是“再存更多记忆”，而是把记忆的**实际掌控权**写进认知结构：
+## 本版核心：掌控权 + 两条执行面
 
 1. **信任 = 实际掌控权**  
    自传体（经验/决策/事件）可检查、可追溯、可修正，因此信任最高、更正成本最低；普通记忆居中；外部信息通常只有文本/来源，难以确认和推翻，因此信任最低、更正成本最高。信任不等于不会错；跨层更正必须留痕，不自动覆盖。
@@ -22,10 +20,12 @@
    上下文是“当下的激活场”，由场景 + 被激活的自我切片 + 工作集构成；它不是身份、记忆仓库、判断权威或权限来源。
 4. **召回提醒**  
    经验/决策/事件在召回时标明“实际掌控权高/可修正、不是普通背景”；外部记忆标明“非自己掌握/未验证”。身份固定注入，不参与常规召回提醒。
-5. **移除空闲学习**  
-   删除 learner-loop、`mnemos_learner_kick`、learner 配置与 preset；该功能由宿主自动化任务替代。`learning-protocol.js` / 技能评审 / curation / validation 保留。
-6. **自动 curation 改为空闲会话注入**  
-   不再依赖 `auxProvider/auxModel` 或新建 curator provider；找空闲会话，注入“调用一次 `mnemos_curate`”。没有空闲会话则跳过。
+5. **联想激活：句子级 + 3+2 + shadow**  
+   摘要拆句；相关 3 条（不足不补）+ 自传体旁支 2 条；多句命中按句序以 `……` 连成一条；自传体权重 ×1.5；所有线索强制标“线索，不是结论 · 未召回”。`shadow` 模式下 embedding 实际注入，mechanical 后台对照，两者写入 `fansearch-shadow.jsonl`；检索在 `tools/pre-execute` 启动，与工具执行并行。
+6. **身份备用存储**  
+   身份中需要固定注入的内容留在 `identity`；不需要固定注入的细节存 `category=other`、`tags=['identity-backup']`；identity 只留 `tags=['identity-pointer']` 的短指针，summary 写 `open:<detailId>`。指针不占身份字数预算、强制 core，curation 不能合并/删除它；`other` 详情不进入固定注入，需时 `recall category=other` 或 `open(id)`。
+7. ** curation 降级修复**  
+   experience 的 remove/replace 只做 `deprecated` 历史保留；只有 merge 才把旧经验降为普通记忆并写 `supersededBy`。经验数量上限不再参与 apply 拒绝/降级。
 
 ## 文档
 
@@ -36,13 +36,14 @@
 - `docs/04-模块与功能实现.md`（附录含宪法 v5 原文与系统提示原文）
 - `README.md` / `README.en.md` / `INSTALL.md`
 
-> 文档源目录：`对外文档-v1.7/`；事实表：`对外文档-v1.7/00-事实表-v1.7.1.md`。
+> 文档源目录：`对外文档-v1.7/`；事实表：`对外文档-v1.7/00-事实表-v1.7.2.md`。
 
 ## 怎么确认
 
-1. `package.json` 的 `version` 应为 **1.7.1**；
-2. `npm test` 应为 **1275 通过 / 0 失败**；
+1. `package.json` 的 `version` 应为 **1.7.2**；
+2. `npm test` 应为 **1315 通过 / 0 失败**；
 3. 维护列表应为 **9 项**（不含 learner）；
 4. 工具数应为 **19 个**（无 `mnemos_learner_kick`）；
-5. 启动日志的 `dataFile` / `constitutionFile` 指向当前 profile；
-6. 宪法 `version=5`，`mnemos_constitution` 应返回 v5 认知体声明（含上下文定位、身体/来源边界、信任=实际掌控权）。
+5. `src` 应为 **30 个模块**（含 `embedding.js`）；
+6. 启动日志的 `dataFile` / `constitutionFile` 指向当前 profile；
+7. 宪法 `version=5`，`mnemos_constitution` 应返回 v5 认知体声明（含上下文定位、身体/来源边界、信任=实际掌控权）。

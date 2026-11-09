@@ -13,7 +13,7 @@ import { createHeartbeat } from '../src/heartbeat.js'
 import { parseSkillFile, listSkills, createSkillProvider } from '../src/skill-provider.js'
 import { skillsRootFor, resolveConstitutionFileForCli, defaultDataFile, defaultConstitutionFile, mnemosDataDir, describeResolved } from '../src/paths.js'
 import { buildSelfText, constitutionMissingWarning } from '../src/self-text.js'
-import { searchMemories, formatFansearchHint, FanSearchState } from '../src/fansearch.js'
+import { searchMemories, formatFansearchHint, FanSearchState, searchAssociative, splitSentences, formatAssociativeHint } from '../src/fansearch.js'
 import { evaluateCurationDue } from '../src/curation-trigger.js'
 import { usageFileFor, revisionOf, appendUsage, readUsages, selfReviewHint, makeSkillUsageRecorder } from '../src/skill-usage.js'
 import { userSignalsFileFor, extractUserText, appendUserSignal, readUserSignals, makeSessionUsageTracker, makeUserSignalRecorder, skillOffersFileFor, sessionTasksFileFor, parseCatalogSkills, taskFingerprint, makeSessionOfferTracker, TASK_FINGERPRINT_CHARS, TASK_MAX_PER_SESSION } from '../src/user-signals.js'
@@ -3907,6 +3907,181 @@ console.log('== 94h. applyCurationProposal：身份应用 + 历史 revision ==')
   assert(revData.before.some((x) => x.summary === '旧身份待替换' && x.detail === 'old'), '★★ revision 保存旧身份全文，供审阅读取')
   const active = [...ta.memories.values()].filter((m) => m.source === 'autobiography' && m.category === 'identity')
   assert(active.length === 2 && active.some((m) => m.summary === '新身份'), '★★ 应用后身份为 keep + replace 新条')
+}
+
+console.log('== 94j. curation 经验：只有 merge 降级旧条，remove 不降成普通记忆 ==')
+{
+  const tm = new MemoryStore(path.join(dir, 'x94j', 'memory.json'))
+  await tm.load()
+  const e1 = await tm.remember({ content: '保留', summary: '保留经验', category: 'experience', source: 'autobiography' })
+  const e2 = await tm.remember({ content: '待合并', summary: '待合并经验', category: 'experience', source: 'autobiography' })
+  const e3 = await tm.remember({ content: '待筛选', summary: '待筛选经验', category: 'experience', source: 'autobiography' })
+  const proposal = await tm.remember({
+    content: JSON.stringify({
+      action: 'experience', keep: [e1.id],
+      merge: [{ from: [e2.id], summary: '合并后的经验', why: '同类合并', evidenceIds: [e2.id] }],
+      remove: [e3.id], replace: [], add: [],
+    }),
+    summary: '经验测试提案', tags: ['curation-proposal', 'curation:experience'], source: 'internal',
+  })
+  const applied = await tm.applyCurationProposal(proposal.id)
+  assert(applied.ok === true, '★★ 经验提案应用成功')
+  assert(tm.memories.get(e1.id).source === 'autobiography', '★★ keep 的经验保持 autobiography（筛选不降级）')
+  assert(tm.memories.get(e2.id).source === 'internal', '★★ merge 的旧经验降为普通记忆（source=internal）')
+  assert(tm.memories.get(e2.id).supersededBy, '★★ merge 的旧经验带 supersededBy，能追溯新条')
+  assert(tm.memories.get(e3.id).source === 'deprecated', '★★ remove 的经验只做 deprecated，不降成 internal')
+  const merged = [...tm.memories.values()].find((m) => m.summary === '合并后的经验')
+  assert(merged && merged.source === 'autobiography' && merged.category === 'experience', '★★ 合并后的新经验仍是自传体经验')
+}
+
+console.log('== 94k. curation 经验不再因数量上限拒绝（上限只用于紧凑注入）==')
+{
+  const tm = new MemoryStore(path.join(dir, 'x94k', 'memory.json'))
+  await tm.load()
+  for (let i = 0; i < 6; i++) {
+    await tm.remember({ content: `e${i}`, summary: `经验 ${i}`, category: 'experience', source: 'autobiography' })
+  }
+  const proposal = await tm.remember({
+    content: JSON.stringify({ action: 'experience', keep: [], merge: [], remove: [], replace: [], add: [{ summary: '第七条经验', why: '测试上限' }] }),
+    summary: '经验上限测试', tags: ['curation-proposal', 'curation:experience'], source: 'internal',
+  })
+  const applied = await tm.applyCurationProposal(proposal.id)
+  assert(applied.ok === true, '★★ 超过 5 条不再被 apply 拒绝；上限不参与筛选降级')
+  const active = [...tm.memories.values()].filter((m) => m.source === 'autobiography' && m.category === 'experience')
+  assert(active.length >= 7, '★★ 原有经验未被数量上限删除/降级')
+}
+
+console.log('== 94l. 句子级联想：3+2 预算 / 多句连接 / seen / 线索警告 ==')
+{
+  const mems = [
+    {
+      id: 'e1', source: 'autobiography', category: 'experience', salience: 'high', tags: ['deploy'], recency: 1,
+      summary: 'deploy 部署脚本要把 TEMP 重定向到用户目录。上传锁失败时要检查 TEMP 和 lock 文件。不要直接改系统目录。',
+    },
+    {
+      id: 'e2', source: 'autobiography', category: 'decision', salience: 'normal', tags: ['mind'], recency: 2,
+      summary: '保持冷静，先写清楚边界。',
+    },
+    {
+      id: 'e3', source: 'autobiography', category: 'event', salience: 'low', tags: ['custody'], recency: 3,
+      summary: '先确认保管权，再行动。',
+    },
+    {
+      id: 'n1', source: 'internal', salience: 'normal', tags: ['ops'], recency: 4,
+      summary: 'TEMP upload lock 处理记录。',
+    },
+    {
+      id: 'n2', source: 'internal', salience: 'normal', tags: ['ops'], recency: 5,
+      summary: 'upload lock 处理记录。',
+    },
+  ]
+  assert(splitSentences(mems[0].summary).length === 3, '摘要按句号拆成 3 句')
+  const r = await searchAssociative(mems, 'deploy TEMP upload lock', { relevantTop: 3, sideCount: 2 })
+  assert(r.relevantCount === 3, '相关预算取满 3 条')
+  assert(r.sideCount === 2, '旁支预算从自传体补满 2 条')
+  const e1 = r.items.find((x) => x.id === 'e1')
+  assert(e1 && e1.fragment.includes('……'), '多条达标句按句序用省略号连成一条')
+  assert(e1.fragment.includes('TEMP 重定向') && e1.fragment.includes('上传锁'), '不是只取最高分句')
+  assert(!r.items.filter((x) => x.kind === 'relevant').some((x) => x.id === 'e2'), '相关条只按综合分取，不让旁支挤进相关')
+  assert(r.items.filter((x) => x.kind === 'side').every((x) => x.source.startsWith('自传体')), '旁支只取自传体')
+  assert(r.sideShortfall === 0, '旁支足够时不报不足')
+
+  const excluded = await searchAssociative(mems, 'deploy TEMP upload lock', {
+    relevantTop: 3, sideCount: 2, exclude: new Set(['e1']),
+  })
+  assert(!excluded.items.some((x) => x.id === 'e1'), '已召回/seen 的记忆不再进入联想')
+
+  const onlyTwo = await searchAssociative([mems[0], mems[3]], 'deploy TEMP upload lock', { relevantTop: 3, sideCount: 2 })
+  assert(onlyTwo.relevantCount === 2, '相关不足 3 条不补')
+  assert(onlyTwo.sideCount === 0 && onlyTwo.sideShortfall === 2, '旁支不足 2 条如实报告，不硬凑')
+
+  const warning = formatAssociativeHint(r)
+  assert(warning.includes('线索，不是结论') && warning.includes('未召回'), '每条线索引带“线索不是结论/未召回”边界')
+  assert(warning.includes('不得把它当成结论或事实') && warning.includes('mnemos_open'), '明确要求先 open/recall 核对')
+  assert(warning.includes('非任务证据'), '旁支明确标非任务证据')
+}
+
+console.log('== 94m. 联想 embedding 模式与回退 ==')
+{
+  const fake = {
+    async embed(texts) {
+      return texts.map((t) => (String(t).includes('alpha') ? [1, 0] : [0, 1]))
+    },
+    async embedOne(text) {
+      return String(text).includes('alpha') ? [1, 0] : [0, 1]
+    },
+  }
+  const mems = [{
+    id: 'emb1', source: 'autobiography', category: 'experience', salience: 'high', recency: 1,
+    summary: 'alpha 方案可用。beta 方案备用。',
+  }]
+  const r = await searchAssociative(mems, 'alpha', {
+    mode: 'embedding', embedder: fake, relevantTop: 3, sideCount: 2, sentenceThreshold: 0.5,
+  })
+  assert(r.mode === 'embedding', 'embedding 可用时走 embedding')
+  assert(r.items.some((x) => x.id === 'emb1' && x.fragment.includes('alpha')), 'embedding 命中句子并注入片段')
+  const fallback = await searchAssociative(mems, 'alpha', { mode: 'embedding', embedder: null, relevantTop: 3, sideCount: 2 })
+  assert(fallback.mode === 'mechanical', 'embedding 不可用时回退 mechanical，不失败')
+}
+
+console.log('== 94n. 自传体 other：身份备用详情 + identity 指针 ==')
+{
+  const tm = new MemoryStore(path.join(dir, 'x94n', 'memory.json'))
+  await tm.load()
+  const detail = await tm.remember({
+    content: '完整条件：若用户要求长期沉默，则只在安全边界被触发时开口；否则保持简短。',
+    summary: '身份备用详情：沉默/简短的条件与例外',
+    category: 'other', source: 'autobiography',
+    tags: ['identity-backup'],
+  })
+  const pointer = await tm.remember({
+    content: `身份详情指针：open:${detail.id}`,
+    summary: `身份细则见 open:${detail.id}（非固定注入）`,
+    category: 'identity', source: 'autobiography',
+    tags: ['identity-pointer'],
+  })
+  assert(pointer.source === 'autobiography' && pointer.category === 'identity', '指针仍是自传体身份')
+  assert(pointer.identityStatus === 'core', '身份指针即使预算满也强制 core，保证可见')
+  assert(detail.source === 'autobiography' && detail.category === 'other', '详情仍是自传体 other，不是普通记忆')
+  const compact = tm.autobiographyCompactV2()
+  assert(compact.entries.some((e) => e.id === pointer.id), '身份指针进入固定注入')
+  assert(!compact.entries.some((e) => e.id === detail.id), 'other 详情不进入固定注入')
+  const found = tm.recall({ source: 'autobiography', category: 'other' })
+  assert(found.some((x) => x.id === detail.id), 'category=other 能召回到身份备用详情')
+  const opened = await tm.open(detail.id)
+  assert(opened && opened.detail.includes('完整条件'), 'open(id) 能拿回全部详情')
+
+  const proposal = await tm.remember({
+    content: JSON.stringify({ action: 'identity', keep: [], merge: [], remove: [pointer.id], replace: [], add: [] }),
+    summary: '身份指针保护测试', tags: ['curation-proposal', 'curation:identity'], source: 'internal',
+  })
+  const applied = await tm.applyCurationProposal(proposal.id)
+  assert(applied.ok === true, '身份整理提案可应用')
+  assert(tm.memories.get(pointer.id).source === 'autobiography', '身份整理不能移除 identity-pointer')
+  assert(tm.memories.get(detail.id).source === 'autobiography', '身份整理不能动 other 详情')
+}
+
+console.log('== 94o. 身份字数预算排除 identity-pointer ==')
+{
+  const tm = new MemoryStore(path.join(dir, 'x94o', 'memory.json'))
+  await tm.load()
+  const big = 'x'.repeat(780)
+  const content = await tm.remember({
+    content: big, summary: big, category: 'identity', source: 'autobiography',
+  })
+  const pointer = await tm.remember({
+    content: 'open:detail', summary: '身份详情见 open:detail', category: 'identity', source: 'autobiography',
+    tags: ['identity-pointer'],
+  })
+  assert(content.identityStatus === 'core', '身份正文在预算内为 core')
+  assert(pointer.identityStatus === 'core', '指针强制 core')
+  const compact = tm.autobiographyCompactV2()
+  assert(compact.identityUsed === 780, '身份预算只算正文，不算指针')
+  assert(compact.entries.some((e) => e.id === pointer.id), '指针仍进入固定注入')
+  const next = await tm.remember({
+    content: 'another', summary: 'another identity content', category: 'identity', source: 'autobiography',
+  })
+  assert(next.identityStatus === 'candidate', '正文预算仍按 800 计算，不被指针挤占')
 }
 
 console.log('== 94i. fansearch：英文查询命中中文摘要 + 来源/ID + seen ==')
