@@ -1,18 +1,20 @@
-# 版本标识 · Mnemos v1.7.3
+# 版本标识 · Mnemos v1.7.4
 
 [![dshbase 实测可装](https://dshbase.com/badges/dsh-mnemos-continuity.svg)](https://dshbase.com/zh/plugins/dsh-mnemos-continuity/)
 
 | 项 | 值 |
 |---|---|
-| **版本** | **v1.7.3**（`package.json` 的 `version`） |
+| **版本** | **v1.7.4**（`package.json` 的 `version`） |
 | 日期 | 2026-11-12 |
-| 本目录 | 当前 v1.7.3；npm 已发布；GitHub tag 随本次推送 |
+| 本目录 | 当前 v1.7.4；npm/GitHub 发布本次兼容更新 |
 | 规模 | `src` **30 个模块**；工具 **20** 个；心跳维护 **9** 项；测试 **1334 / 0** |
 | 提示词 | 25 条 + ⑧.1/㉔.1 子规则 / 7 节 / **4164 字符** |
 | 宪法 | **v5（认知体）**，**1708 字符**；红线 1–4 与 5.x 未动 |
-| 当前 DSH | 0.2.1-rc.5 已实测；0.2.2-alpha.2 的插件 API 迁移项未适配 |
+| 当前 DSH | **0.2.2-rc.1** 已加载；核心工具/隔离验证冒烟通过；`subagents` provider 兼容层随 1.7.4 发布 |
 
-## 本版核心：掌控权 + 长任务评审
+## 本版核心：兼容性更新（无功能变化）
+
+> **v1.7.4 只适配 DSH 0.2.2-rc.1 的 `subagents` provider 选择接口；工具、提示词、schema、数据格式均不变。**
 
 1. **信任 = 实际掌控权**  
    自传体（经验/决策/事件）可检查、可追溯、可修正，因此信任最高、更正成本最低；普通记忆居中；外部信息通常只有文本/来源，难以确认和推翻，因此信任最低、更正成本最高。信任不等于不会错；跨层更正必须留痕，不自动覆盖。
@@ -43,15 +45,17 @@
 - `AI快速入门.md`（给新部署 AI 的用法指南；不进系统提示）
 - `README.md` / `README.en.md` / `INSTALL.md`
 
-> 文档源目录：`对外文档-v1.7/`；事实表：`对外文档-v1.7/00-事实表-v1.7.3.md`。
+> 文档源目录：`对外文档-v1.7/`；事实表：`对外文档-v1.7/00-事实表-v1.7.4.md`。
 
 ## 怎么确认
 
-1. `package.json` 的 `version` 应为 **1.7.3**；
+1. `package.json` 的 `version` 应为 **1.7.4**；
 2. `npm test` 应为 **1334 通过 / 0 失败**；
 3. 维护列表应为 **9 项**（不含 learner）；
 4. 工具数应为 **20 个**（含 `mnemos_task_gate`，无 `mnemos_learner_kick`）；
 5. `src` 应为 **30 个模块**（含 `embedding.js`）；
 6. 启动日志的 `dataFile` / `constitutionFile` 指向当前 profile；
 7. 宪法 `version=5`，`mnemos_constitution` 应返回 v5 认知体声明（含上下文定位、身体/来源边界、信任=实际掌控权）。
+
+
 

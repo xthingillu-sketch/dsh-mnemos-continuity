@@ -455,11 +455,41 @@ const CURATOR_PRESET_ID = 'mnemos-curator'
  * 为什么优先走这条：宿主子代理在 DeepSeek 自家路由上是能跑的（实测 ROUTE-OK），
  * 而 `agents.create` 自建 agent 走同一路由必 TRANSPORT —— 差别在"谁建"，不在 options。
  */
+/**
+ * 兼容 0.2.1 的 subagents.list() 与 0.2.2 的 subagents.getProvider()：
+ * 0.2.2 的 SubagentRuntime 不再暴露 list()，provider 名默认是 spawn/fork。
+ */
+function pickSubagentProvider(subagents) {
+  if (!subagents) return null
+  try {
+    if (typeof subagents.list === 'function') {
+      const list = subagents.list()
+      if (Array.isArray(list) && list.length) {
+        const first = list[0]
+        return typeof first === 'string' ? first : (first && typeof first.name === 'string' ? first.name : null)
+      }
+    }
+  } catch { /* 旧 API 不可用就继续探新 API */ }
+  try {
+    if (typeof subagents.getProvider === 'function') {
+      for (const name of ['spawn', 'fork', 'local']) {
+        if (subagents.getProvider(name)) return name
+      }
+    }
+  } catch { /* 继续回退 */ }
+  try {
+    if (subagents.config && typeof subagents.config.provider === 'string' && subagents.config.provider) {
+      return subagents.config.provider
+    }
+  } catch { /* 忽略 */ }
+  // DSH 0.2.2 的默认 provider 是 spawn；不存在时 startActivation 会失败并被调用方兜底。
+  return 'spawn'
+}
+
 async function startHostValidationChild(subagents, exec, prompt) {
   if (!subagents || typeof subagents.startActivation !== 'function') return null
   if (!exec || !exec.agent) return null
-  const providers = typeof subagents.list === 'function' ? subagents.list() : []
-  const providerName = Array.isArray(providers) && providers.length ? providers[0] : null
+  const providerName = pickSubagentProvider(subagents)
   if (!providerName) return null
   const activation = await subagents.startActivation({
     provider: providerName,
@@ -479,8 +509,7 @@ async function startHostValidationChild(subagents, exec, prompt) {
 async function startHostCurationChild(subagents, exec, prompt) {
   if (!subagents || typeof subagents.startActivation !== 'function') return null
   if (!exec || !exec.agent) return null
-  const providers = typeof subagents.list === 'function' ? subagents.list() : []
-  const providerName = Array.isArray(providers) && providers.length ? providers[0] : null
+  const providerName = pickSubagentProvider(subagents)
   if (!providerName) return null
   const activation = await subagents.startActivation({
     provider: providerName,

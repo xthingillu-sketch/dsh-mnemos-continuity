@@ -1,4 +1,4 @@
-# Mnemos（v1.7.3）
+# Mnemos（v1.7.4）
 
 [English](README.en.md) | 中文
 
@@ -18,6 +18,8 @@
 > 系统提示同时做了整版审阅：删除旧 ability 迁移、把身份两层存移到 ⑧.1、任务图与协作合并，并把评审写成 ㉔.1；任务图明确存“地址”而非正文。  
 > 联想激活的句子级 3+2、shadow 模式，以及 identity 指针 + `other` 身份备份，继续保留。  
 > 记忆的价值不在存量，而在**系统能掌握什么、不能掌握什么**。
+
+> **v1.7.4 是兼容性更新，没有功能变化**：只适配 DSH 0.2.2-rc.1 的 `subagents` provider 选择接口（`list` → `getProvider` → `config.provider` → `spawn`），工具、提示词、schema 和数据格式均不变。
 
 > **DeepSeek Harness（下称 DSH）是什么**：一个在**你自己电脑上**跑 AI 助手的环境 —— 负责会话、工具和插件，
 > 有**桌面客户端**也有**命令行**两种用法。Mnemos 是装进它的一个插件，**不是**独立软件，也**不能**用在网页版或手机 App 上。
@@ -132,7 +134,7 @@
   要看时用 `mnemos_open` 打开存档 id，或显式传 `includeArchives:true`；
 - 一部分可靠性**靠纪律而不是机制**：结论有没有写进记忆、要不要召回到位 —— 所以偶尔自己提醒一句"这个记一下"更稳；
 - **尚未测量**：任务召回质量、联想候选质量、规模延迟、单位成本、学习闭环的长期效果、多机共用、经验可迁移性；
-  当前已实测 DSH **0.2.1-rc.5**；0.2.2-alpha.2 的插件 API 迁移项尚未适配（session projection / Timer / tools.resolve / agent.model）—— 升级前需单独核对。
+  当前已在 DSH **0.2.2-rc.1** 上加载并做核心工具/隔离验证冒烟；0.2.2 的 `tools.resolve` / Session Projection / `agent.model` 迁移项 Mnemos 未使用；`subagents` provider 兼容层已随 1.7.4 发布。
 
 ## 风险与责任
 

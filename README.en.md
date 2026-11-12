@@ -1,6 +1,8 @@
-# Mnemos (v1.7.3)
+# Mnemos (v1.7.4)
 
 [![dshbase verified](https://dshbase.com/badges/dsh-mnemos-continuity.svg)](https://dshbase.com/zh/plugins/dsh-mnemos-continuity/)
+
+> **v1.7.4 is a compatibility update, not a feature release:** it only adapts the DSH 0.2.2-rc.1 `subagents` provider selection (`list` → `getProvider` → `config.provider` → `spawn`). Tools, prompt, schemas and data format are unchanged.
 
 > **v1.7.3 focus:** on top of the control-first model, this release adds stage-gated task review: `reviewGates` are planned up front, an independent reviewer reads the task graph and recalls evidence, and gives pass/rework/escalate; a required gate that has not passed blocks normal `task_close`, and giving up must be explicit via `abandoned`. The system prompt was also reviewed end-to-end (legacy ability migration removed, identity layers moved to ⑧.1, task graph and collaboration merged, review added as ㉔.1), and the task graph now explicitly stores addresses instead of full text. Sentence-level associative hints with 3+2 budgets, shadow mode, identity pointers and `other` identity backups remain.
 
