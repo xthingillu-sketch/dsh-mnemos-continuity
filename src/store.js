@@ -27,6 +27,17 @@ export const SALIENCES = ['low', 'normal', 'high']
 /* ───────── V6-29：自传体五类 / 身份两段（草案落地的第一切片） ───────── */
 
 export const AUTOBIOGRAPHY_CATEGORIES = ['identity', 'decision', 'experience', 'event', 'other']
+/**
+ * 身份注入预算（**质量闸门，不是成本闸门** —— 2026-11-10 用户明确）。
+ *
+ * 它存在的目的：防止"什么都往身份里写"（低价值条目占位、身份被稀释），
+ * **不是**为了省 token —— 身份段是每轮固定的前缀，基本走缓存命中，实际增量成本很低。
+ *
+ * 因此使用原则：
+ *   · 被挡住时，先问"这条是不是必须每轮注入"；不是 → 留在记忆里按需召回即可（更该这样）。
+ *   · 是 → **不要自己硬挤**，如实上报"必须注入但进不来"，由用户决定扩容。
+ *   · 800 是当时估计值，可按实际调整；调大不会破坏语义（它本来就只是防滥用）。
+ */
 export const DEFAULT_IDENTITY_BUDGET = 800
 export const DEFAULT_RECENT_DECISION_COUNT = 3
 export const DEFAULT_IMPORTANT_EXPERIENCE_COUNT = 5
@@ -136,12 +147,88 @@ export const TASK_CONCLUSION_TAG = 'conclusion'
 /** 前序图的关系类型（具体原因放 `why`）。 */
 export const TASK_LINK_RELATIONS = ['continues', 'depends', 'supersedes', 'evidence', 'related']
 
+/* ───────── 评审闸门（review gates）：主模型规划阶段，评审只读验收 ───────── */
+export const REVIEW_PLAN_STATUSES = ['proposed', 'approved', 'rejected', 'changed']
+export const REVIEW_GATE_STATUSES = ['pending', 'submitted', 'passed', 'rework', 'escalated']
+export const REVIEW_VERDICTS = ['pass', 'rework', 'escalate']
+export const REVIEW_GATES_MAX = 12
+export const REVIEW_GATE_ID_MAX = 40
+export const REVIEW_GATE_TEXT_MAX = 500
+export const REVIEW_EVIDENCE_MAX = 20
+export const REVIEW_EVIDENCE_TEXT_MAX = 240
+
 /** 统一裁字：折叠空白、去首尾、超长截断；回执要能看出"截过"。 */
 function clipText(value, max) {
   const s = String(value ?? '').replace(/\s+/g, ' ').trim()
   if (s.length <= max) return { text: s, truncated: false }
   return { text: s.slice(0, max), truncated: true }
 }
+
+/**
+ * 规范化评审阶段定义。空数组 = 不启用评审，返回 null。
+ * 只校验结构；判据质量/是否够覆盖由评审在 approve-plan 时判断。
+ */
+function normalizeReviewGates(input) {
+  if (input == null) return { ok: true, review: null }
+  if (!Array.isArray(input)) return { ok: false, reason: 'reviewGates 必须是数组' }
+  if (input.length === 0) return { ok: true, review: null }
+  if (input.length > REVIEW_GATES_MAX) return { ok: false, reason: `reviewGates 最多 ${REVIEW_GATES_MAX} 个` }
+  const gates = []
+  const ids = new Set()
+  for (const raw of input) {
+    const id = String(raw?.id || '').trim()
+    if (!id) return { ok: false, reason: '每个 review gate 都要有 id' }
+    if (id.length > REVIEW_GATE_ID_MAX) return { ok: false, reason: `gate id 最长 ${REVIEW_GATE_ID_MAX} 字` }
+    if (ids.has(id)) return { ok: false, reason: `gate id 重复：${id}` }
+    ids.add(id)
+    const stage = String(raw?.stage || '').trim()
+    const criteria = clipText(raw?.criteria, REVIEW_GATE_TEXT_MAX)
+    if (!stage) return { ok: false, reason: `gate ${id} 缺 stage` }
+    if (!criteria.text) return { ok: false, reason: `gate ${id} 缺 criteria` }
+    const evidence = []
+    for (const e of Array.isArray(raw?.requiredEvidence) ? raw.requiredEvidence : []) {
+      const t = clipText(e, REVIEW_EVIDENCE_TEXT_MAX).text
+      if (t && !evidence.includes(t)) evidence.push(t)
+      if (evidence.length >= REVIEW_EVIDENCE_MAX) break
+    }
+    gates.push({
+      id,
+      stage,
+      criteria: criteria.text,
+      criteriaTruncated: criteria.truncated,
+      requiredEvidence: evidence,
+      required: raw?.required !== false,
+      status: 'pending',
+      evidenceIds: [],
+      claims: '',
+      knownGaps: [],
+      verdict: null,
+      failedCriteria: [],
+      missingEvidence: [],
+      note: '',
+      reworkCount: 0,
+      submittedAt: null,
+      reviewedAt: null,
+    })
+  }
+  return { ok: true, review: { planStatus: 'proposed', approvedAt: null, rejectedAt: null, gates } }
+}
+
+function reviewGateLine(g) {
+  return `- ${g.id}［${g.status}］${g.stage}` +
+    (g.required ? '' : '（可选）') +
+    (g.reworkCount ? ` ×返工${g.reworkCount}` : '') +
+    (g.verdict ? ` → ${g.verdict}` : '')
+}
+
+function reviewBlockedGates(task) {
+  const gates = task?.review?.gates
+  if (!Array.isArray(gates)) return []
+  return gates.filter((g) => g.required && g.status !== 'passed').map((g) => ({
+    id: g.id, stage: g.stage, status: g.status,
+  }))
+}
+
 
 /** 任务依赖边的来源类型；旧边没有 kind 时从目标记忆/技能前缀推断。 */
 export function taskUseKindOf(use, target = null) {
@@ -681,7 +768,47 @@ export class MemoryStore {
     // event 写入后刷新派生时间索引（同一个 save 落盘；事件是真相，索引可重建）
     if (wantAuto && autoCategory === 'event') this.rebuildSelfTimeline()
     await this.save()
+    // ★ 写入即校验（用户 2026-11-10 要求）：自传体条目必须**当场**知道
+    //   "这条到底会不会被注入"。以前只回一句"已写入"：身份预算满被静默降级成
+    //   candidate 时，调用方会以为写成功了 —— 实测因此丢掉过一条用户定的交流风格规则
+    //   （11-09 写入落成 candidate，同时写了"已写入 core"的决策，直到 11-10 才被发现）。
+    if (wantAuto) {
+      rec.inject = this.injectStatus(rec, { requestedCandidate: identityStatus === 'candidate' })
+    }
     return rec
+
+  }
+
+  /**
+   * 写入后校验：**只有身份**需要"会不会被注入"（用户 2026-11-10 定）。
+   *
+   * 为什么只查身份：身份是 core 条目、每轮固定注入；预算满被降级成 candidate 时
+   * 它**不注入也不召回**，等于写丢。其它三类（决策/经验/事件）本来就不靠固定注入，
+   * 而是按需召回 + 紧凑版展示 —— 它们只要求"真的落盘了"，不该在这里报注入失败。
+   *
+   * @param {object} rec 刚写入的记录
+   * @param {{requestedCandidate?:boolean}} [o] 调用方是否**显式**要求 candidate
+   * @returns {{required:boolean, injected?:boolean, reason?:string|null,
+   *            usedChars?:number, budget?:number, incomingChars?:number}}
+   */
+  injectStatus(rec, { requestedCandidate = false } = {}) {
+    if (rec.category !== 'identity') return { required: false }
+    const budget = DEFAULT_IDENTITY_BUDGET
+    const used = [...this.memories.values()]
+      .filter((m) => m.source === 'autobiography' &&
+        m.identityStatus !== 'candidate' &&
+        autobiographyCategoryOf(m) === 'identity' &&
+        !isIdentityPointer(m))
+      .reduce((sum, m) => sum + String(m.summary || '').length, 0)
+    const injected = rec.identityStatus === 'core'
+    return {
+      required: true,
+      injected,
+      reason: injected ? null : (requestedCandidate ? 'requested-candidate' : 'identity-budget-full'),
+      usedChars: used,
+      budget,
+      incomingChars: String(rec.summary || '').length,
+    }
   }
 
   /**
@@ -1767,6 +1894,10 @@ export class MemoryStore {
           (a.note ? `（${a.note}）` : '')
       )
     }
+    if (task.review?.gates?.length) {
+      lines.push(`评审计划：${task.review.planStatus}`)
+      for (const gate of task.review.gates) lines.push(reviewGateLine(gate))
+    }
     if (task.links?.length) lines.push(`前序：${task.links.map((l) => `${l.taskId}（${l.relation}）`).join('、')}`)
     if (task.done?.length) lines.push(`已完成：${task.done.length} 条`)
     if (task.uses?.length) lines.push(`依赖：${task.uses.length} 条`)
@@ -1779,10 +1910,12 @@ export class MemoryStore {
    * 开一张任务图。**只该由主模型调用。**
    * @returns `{ok:true, taskId, graphId, assignments}` 或 `{ok:false, reason}`
    */
-  async openTask({ goal, assignments = [], notes = '', links = [], sessionId = null } = {}) {
+  async openTask({ goal, assignments = [], reviewGates = [], notes = '', links = [], sessionId = null } = {}) {
     await this.ensureLoaded()
     const g = String(goal || '').trim()
     if (!g) return { ok: false, reason: 'goal 不能为空' }
+    const normalizedReview = normalizeReviewGates(reviewGates)
+    if (!normalizedReview.ok) return normalizedReview
     const cleaned = []
     for (const a of Array.isArray(assignments) ? assignments : []) {
       const id = String(a?.id || '').trim()
@@ -1831,6 +1964,7 @@ export class MemoryStore {
       done: [],
       uses: [],
       links: cleanedLinks,
+      review: normalizedReview.review,
       openedAt: now,
       lastActivityAt: now,
     }
@@ -1858,6 +1992,9 @@ export class MemoryStore {
       assignments: cleaned.map((a) => a.id),
       links: cleanedLinks.map((x) => x.taskId),
       linkTruncated,
+      review: normalizedReview.review
+        ? { planStatus: normalizedReview.review.planStatus, gates: normalizedReview.review.gates.map((x) => x.id) }
+        : null,
       ownerSession: rec.sessionId,
     }
   }
@@ -1905,6 +2042,131 @@ export class MemoryStore {
     graph.detail = this.renderTaskGraph(graph.task)
     await this.save()
     return { ok: true, taskId, assign: a.id, status: a.status, handoffId: a.handoffId, graphVersion: graph.version }
+  }
+
+  /**
+   * 评审闸门：主模型 submit 证据，评审 approve-plan / verdict，主模型可 revise-plan。
+   * 评审动作必须来自非创建者会话；submit/revise 必须来自创建者会话。
+   */
+  async taskGate({
+    taskId, gateId = null, action, claims = '', evidenceIds = [], knownGaps = [],
+    verdict = null, failedCriteria = [], missingEvidence = [], note = '',
+    reviewGates = undefined, sessionId = null,
+  } = {}) {
+    await this.ensureLoaded()
+    const graph = this.findOpenTask(taskId)
+    if (!graph) return { ok: false, reason: `找不到未收尾的任务 ${taskId}（可能已收尾或不存在）` }
+    const act = String(action || '').trim()
+    const reviewerAction = ['approve-plan', 'reject-plan', 'verdict'].includes(act)
+    const ownerAction = ['submit', 'revise-plan'].includes(act)
+    if (!reviewerAction && !ownerAction) {
+      return { ok: false, reason: 'action 只能是 approve-plan / reject-plan / submit / verdict / revise-plan' }
+    }
+    const owner = graph.sessionId || null
+    if (ownerAction && owner && sessionId && owner !== sessionId) {
+      return { ok: false, reason: 'submit/revise-plan 只能由创建这张任务图的会话调用' }
+    }
+    if (reviewerAction && owner && sessionId === owner) {
+      return { ok: false, reason: '评审动作必须来自创建者会话之外（不能自己批准自己）' }
+    }
+    const now = Date.now()
+    if (act === 'revise-plan') {
+      if (!Array.isArray(reviewGates) || reviewGates.length === 0) {
+        return { ok: false, reason: 'revise-plan 必须提供非空 reviewGates；要放弃任务用 task_close abandoned' }
+      }
+      const normalized = normalizeReviewGates(reviewGates)
+      if (!normalized.ok) return normalized
+      graph.task.review = normalized.review
+      graph.task.lastActivityAt = now
+      graph.version += 1
+      graph.recency = now
+      graph.detail = this.renderTaskGraph(graph.task)
+      await this.save()
+      return {
+        ok: true, taskId, action: act,
+        planStatus: graph.task.review?.planStatus || null,
+        gates: graph.task.review?.gates?.map((g) => ({ id: g.id, status: g.status })) || [],
+      }
+    }
+    const review = graph.task.review
+    if (!review || !Array.isArray(review.gates) || review.gates.length === 0) {
+      return { ok: false, reason: '这张任务图没有评审计划（reviewGates）；先 revise-plan 或重开图' }
+    }
+    if (act === 'approve-plan' || act === 'reject-plan') {
+      if (review.planStatus === 'approved' && act === 'approve-plan') {
+        return { ok: true, taskId, action: act, planStatus: 'approved', already: true }
+      }
+      if (review.planStatus === 'rejected' && act === 'approve-plan') {
+        return { ok: false, reason: '评审计划已被拒绝；主模型先 revise-plan 再重新批准' }
+      }
+      review.planStatus = act === 'approve-plan' ? 'approved' : 'rejected'
+      review.approvedAt = act === 'approve-plan' ? now : review.approvedAt
+      review.rejectedAt = act === 'reject-plan' ? now : review.rejectedAt
+      review.note = clipText(note, REVIEW_GATE_TEXT_MAX).text
+      graph.task.lastActivityAt = now
+      graph.version += 1
+      graph.recency = now
+      graph.detail = this.renderTaskGraph(graph.task)
+      await this.save()
+      return { ok: true, taskId, action: act, planStatus: review.planStatus }
+    }
+    const gate = review.gates.find((g) => g.id === String(gateId || '').trim())
+    if (!gate) return { ok: false, reason: `评审计划里没有 gate ${gateId}` }
+    if (act === 'submit') {
+      if (review.planStatus !== 'approved') {
+        return { ok: false, reason: `评审计划尚未批准（当前 ${review.planStatus}）` }
+      }
+      if (gate.status === 'passed') return { ok: false, reason: `gate ${gate.id} 已通过，不能重复提交` }
+      const evidence = [...new Set((Array.isArray(evidenceIds) ? evidenceIds : [])
+        .map((x) => clipText(x, REVIEW_EVIDENCE_TEXT_MAX).text).filter(Boolean))]
+      if (evidence.length > REVIEW_EVIDENCE_MAX) return { ok: false, reason: `evidenceIds 最多 ${REVIEW_EVIDENCE_MAX} 条` }
+      const gaps = (Array.isArray(knownGaps) ? knownGaps : [])
+        .map((x) => clipText(x, REVIEW_GATE_TEXT_MAX).text).filter(Boolean).slice(0, 10)
+      const c = clipText(claims, 2000)
+      if (!c.text && !evidence.length) return { ok: false, reason: 'submit 至少要给 claims 或 evidenceIds' }
+      gate.status = 'submitted'
+      gate.claims = c.text
+      gate.knownGaps = gaps
+      gate.evidenceIds = evidence
+      gate.verdict = null
+      gate.failedCriteria = []
+      gate.missingEvidence = []
+      gate.note = ''
+      gate.submittedAt = now
+      gate.reviewedAt = null
+    } else {
+      if (gate.status !== 'submitted') {
+        return { ok: false, reason: `gate ${gate.id} 当前是 ${gate.status}，只有 submitted 才能 verdict` }
+      }
+      const v = String(verdict || '').trim()
+      if (!REVIEW_VERDICTS.includes(v)) return { ok: false, reason: `verdict 只能是 ${REVIEW_VERDICTS.join(' / ')}` }
+      const failed = (Array.isArray(failedCriteria) ? failedCriteria : [])
+        .map((x) => clipText(x, REVIEW_GATE_TEXT_MAX).text).filter(Boolean).slice(0, 10)
+      const missing = (Array.isArray(missingEvidence) ? missingEvidence : [])
+        .map((x) => clipText(x, REVIEW_GATE_TEXT_MAX).text).filter(Boolean).slice(0, 10)
+      if (v === 'rework' && !failed.length && !missing.length) {
+        return { ok: false, reason: 'rework 必须说明 failedCriteria 或 missingEvidence' }
+      }
+      gate.verdict = v
+      gate.failedCriteria = failed
+      gate.missingEvidence = missing
+      gate.note = clipText(note, REVIEW_GATE_TEXT_MAX).text
+      gate.reviewedAt = now
+      if (v === 'pass') gate.status = 'passed'
+      else if (v === 'rework') { gate.status = 'rework'; gate.reworkCount += 1 }
+      else gate.status = 'escalated'
+    }
+    graph.task.lastActivityAt = now
+    graph.version += 1
+    graph.recency = now
+    graph.detail = this.renderTaskGraph(graph.task)
+    await this.save()
+    return {
+      ok: true, taskId, action: act, gateId: gate.id,
+      gateStatus: gate.status, planStatus: review.planStatus,
+      reworkCount: gate.reworkCount,
+      blockedGates: reviewBlockedGates(graph.task),
+    }
   }
 
   /**
@@ -2091,6 +2353,13 @@ export class MemoryStore {
         )
       }
     }
+    if (task.review?.gates?.length) {
+      lines.push('', `评审计划：${task.review.planStatus}`)
+      for (const g of task.review.gates) {
+        lines.push(reviewGateLine(g) + (g.criteria ? ` — ${g.criteria}` : ''))
+      }
+      if (task.review.note) lines.push(`评审备注：${task.review.note}`)
+    }
     if (task.notes) lines.push('', `备注：${task.notes}`)
     return lines.join('\n')
   }
@@ -2109,16 +2378,36 @@ export class MemoryStore {
    *   · `expire` —— 超时强制归档：**跳过所有者校验**（它不是"谁在收尾"，而是机制在回收孤儿图），
    *     并在长期结论里明确写清"超时未收尾"，绝不假装它完成了。
    */
-  async _archiveTask({ taskId, conclusion = '', newSummary = '', sessionId = null, mode = 'close', eventId = null } = {}) {
+  async _archiveTask({ taskId, conclusion = '', newSummary = '', sessionId = null, mode = 'close', eventId = null, abandoned = false } = {}) {
     await this.ensureLoaded()
     const graph = this.findOpenTask(taskId)
     if (!graph) return { ok: false, reason: `找不到未收尾的任务 ${taskId}（可能已收尾或不存在）` }
     if (mode !== 'expire' && graph.sessionId && sessionId && graph.sessionId !== sessionId) {
       return { ok: false, reason: '只有创建这张任务图的会话能收尾它（单写者）' }
     }
+    const task = graph.task
+    const review = task?.review
+    if (mode !== 'expire' && !abandoned && review) {
+      if (review.planStatus !== 'approved') {
+        return {
+          ok: false,
+          reason: `评审计划尚未批准（当前 ${review.planStatus}）；先 approve-plan，或用 abandoned 明确放弃`,
+          reviewPlanStatus: review.planStatus,
+          blockedGates: reviewBlockedGates(task),
+        }
+      }
+      const blocked = reviewBlockedGates(task)
+      if (blocked.length) {
+        return {
+          ok: false,
+          reason: `评审 gate 未通过：${blocked.map((g) => `${g.id}［${g.status}］`).join('、')}；先返工或用 abandoned 明确放弃`,
+          reviewPlanStatus: review.planStatus,
+          blockedGates: blocked,
+        }
+      }
+    }
     const expired = mode === 'expire'
     const now = Date.now()
-    const task = graph.task
     const tag = `${TASK_TAG_PREFIX}${taskId}`
     // 任务收尾优先挂在任务已有的事件下；没有事件才新建。
     const isTaskEvent = (m) =>
@@ -2182,6 +2471,8 @@ export class MemoryStore {
       `目标：${task.goal}`,
       `任务图：${graph.id}`,
       `已完成 ${(task.done || []).length} 条 / 依赖 ${(task.uses || []).length} 条 / 链接 ${(task.links || []).length} 条`,
+      ...(review ? [`评审：${review.planStatus}；${review.gates.map((g) => `${g.id}［${g.status}］`).join('、')}`] : []),
+      ...(abandoned ? ['■ 收尾方式：abandoned（主模型明确放弃，不代表评审通过）'] : []),
       ...(missing.length ? [`未完成（${missing.length}）：${missing.map((m) => m.id).join(', ')}`] : ['每个分工都有回执']),
       ...(unlabeledHandoffs.length
         ? [`交接缺 assign 标签（${unlabeledHandoffs.length}）：${unlabeledHandoffs.map((x) => x.id).join(', ')}`]
@@ -2246,6 +2537,8 @@ export class MemoryStore {
     // 图收尾：open→closed；成员转冷（permanent 除外）；closedAt 记录真实关闭时间。
     graph.tags = (graph.tags || []).map((t) => (t === TASK_OPEN_TAG ? TASK_CLOSED_TAG : t))
     if (expired && !graph.tags.includes(TASK_EXPIRED_TAG)) graph.tags.push(TASK_EXPIRED_TAG)
+    if (abandoned) graph.task.abandoned = true
+    graph.task.review = review
     graph.version += 1
     graph.recency = now
     if (graph.task) graph.task.closedAt = now
@@ -2274,6 +2567,8 @@ export class MemoryStore {
       doneCount: (task.done || []).length,
       usesCount: (task.uses || []).length,
       linksCount: (task.links || []).length,
+      review: review ? { planStatus: review.planStatus, gates: review.gates.map((g) => ({ id: g.id, status: g.status, verdict: g.verdict, reworkCount: g.reworkCount })) } : null,
+      abandoned: abandoned === true,
       ...(expired ? { expired: true, idleHours } : {}),
     }
   }

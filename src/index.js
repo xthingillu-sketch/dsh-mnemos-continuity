@@ -71,7 +71,7 @@ import {
   rememberResult, recallResult, validateResult, curationResult, constitutionResult, deleteResult,
   deprecateResult, dormantResult, openResult, consolidateResult, heartbeatResult,
   maintenanceListResult, toggleResult, proposeSkillResult,
-  taskOpenResult, taskUpdateResult, taskCloseResult, taskDoneResult, taskCiteResult,
+  taskOpenResult, taskGateResult, taskUpdateResult, taskCloseResult, taskDoneResult, taskCiteResult,
 } from './tool-results.js'
 
 export const name = 'dsh-mnemos'
@@ -222,8 +222,25 @@ function makeRememberTool(store) {
       // ★ F-15：schema 必须由形状表生成（单测有静态断言盯住每条都是 buildOutputSchema('<name>')）
       schema: buildOutputSchema('mnemos_remember'),
       render: (_args, value) => {
-        const lines = [`已写入记忆 ${value.id}`, `摘要：${value.summary}`]
-        if (value.identityStatus === 'candidate') {
+        const lines = []
+        // ★ 写入即校验（用户 2026-11-10 要求）：自传体是重要信息，
+        //   没进注入集必须**当场显式报错**，不能混在"已写入"后面当小字。
+        const inj = value.inject
+        const failed = inj && inj.required === true && inj.injected === false && inj.reason !== 'requested-candidate'
+        if (failed) {
+          const why = inj.reason === 'identity-budget-full'
+            ? `身份 core 预算已满（本轮占用 ${inj.usedChars}/${inj.budget} 字符，本条需 ${inj.incomingChars} 字符），被降级为 candidate —— 不注入、不召回`
+            : `未进入注入集（${inj.reason}）`
+          lines.push('❌ 写入未生效：本条不会被注入上下文，也不参与召回。')
+          lines.push(`   原因：${why}。`)
+          lines.push('   处理：先 mnemos_curate identity 腾出预算（或合并/删减现有 core 条目），然后重写本条。')
+          lines.push('   注意：身份预算是**防滥用的闸门，不是成本限制**。若这条确实"必须每轮注入"，')
+          lines.push('        不要自己硬挤——直接告诉用户"必须注入但进不来"，由用户决定扩容。')
+          lines.push('')
+        }
+        lines.push(`已写入记忆 ${value.id}`)
+        lines.push(`摘要：${value.summary}`)
+        if (value.identityStatus === 'candidate' && !failed) {
           lines.push('身份候选：不注入、不召回；等身份整理（预算已满/用户重要信息触发）再裁决。')
         }
         // ★ F-5：dormant 无 sessionId 时**必须明说**（最隐蔽的一处谎报：
@@ -1348,6 +1365,27 @@ function makeTaskOpenTool(store) {
           },
         },
         notes: { type: 'string', description: '可选备注（约束、边界、只读范围等）' },
+        reviewGates: {
+          type: 'array',
+          description:
+            '可选：主模型预先规划评审闸门。每项 {id, stage, criteria, requiredEvidence?, required?}。' +
+            '有 reviewGates 时，评审必须先 approve-plan；每个 required gate 未 pass 前不能正常 task_close。',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              id: { type: 'string', description: 'gate id（短、唯一，如 G1）' },
+              stage: { type: 'string', description: '阶段：plan / milestone / pre-irreversible / final 等' },
+              criteria: { type: 'string', description: '可观察的验收判据（不要写“完成”）' },
+              requiredEvidence: {
+                type: 'array', items: { type: 'string' },
+                description: '要求主模型提交的证据类型/名称（命令输出、测试、diff、影响清单等）',
+              },
+              required: { type: 'boolean', description: '是否必过；默认 true' },
+            },
+            required: ['id', 'stage', 'criteria'],
+          },
+        },
         links: {
           type: 'array',
           description:
@@ -1381,6 +1419,7 @@ function makeTaskOpenTool(store) {
             text:
               `已开图：taskId=${v.taskId}\n记忆 id（派活时把它交给子代理）：${v.graphId}` +
               `\n分工：${(v.assignments || []).join(', ') || '（无）'}` +
+              (v.review ? `\n评审计划：${v.review.planStatus}（${(v.review.gates || []).join(', ')}）` : '') +
               ((v.links || []).length ? `\n前序图：${v.links.join(', ')}` : '') +
               `\n子代理写回时 tags 必须含 task=${v.taskId} 与 assign=<分工id>，并把 handoffId 回报给你。`,
           },
@@ -1396,9 +1435,77 @@ function makeTaskOpenTool(store) {
           assignments: args?.assignments,
           notes: args?.notes,
           links: args?.links,
+          reviewGates: args?.reviewGates,
           sessionId,
         })
       )
+    },
+  }
+}
+
+function makeTaskGateTool(store) {
+  return {
+    name: 'mnemos_task_gate',
+    description:
+      '评审闸门：主模型 submit 证据，评审 approve-plan/reject-plan/verdict，主模型可 revise-plan。' +
+      '评审动作必须来自非创建者会话；submit/revise 必须来自创建者会话。' +
+      'verdict: pass | rework | escalate；rework 必须给 failedCriteria 或 missingEvidence。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        taskId: { type: 'string', description: '任务 id' },
+        gateId: { type: 'string', description: 'gate id；approve-plan/reject-plan/revise-plan 可省略' },
+        action: {
+          type: 'string',
+          enum: ['approve-plan', 'reject-plan', 'submit', 'verdict', 'revise-plan'],
+          description: '评审动作',
+        },
+        claims: { type: 'string', description: 'submit：主模型声称完成了什么' },
+        evidenceIds: {
+          type: 'array', items: { type: 'string' },
+          description: 'submit：证据 id（记忆 id / 命令输出 id / 文件路径等）',
+        },
+        knownGaps: { type: 'array', items: { type: 'string' }, description: 'submit：已知缺口' },
+        verdict: { type: 'string', enum: ['pass', 'rework', 'escalate'], description: 'verdict：评审结论' },
+        failedCriteria: { type: 'array', items: { type: 'string' }, description: 'rework：未达标判据' },
+        missingEvidence: { type: 'array', items: { type: 'string' }, description: 'rework：缺失证据' },
+        note: { type: 'string', description: '评审备注' },
+        reviewGates: {
+          type: 'array',
+          description: 'revise-plan：替换评审计划（同 task_open.reviewGates）',
+          items: {
+            type: 'object', additionalProperties: false,
+            properties: {
+              id: { type: 'string' }, stage: { type: 'string' }, criteria: { type: 'string' },
+              requiredEvidence: { type: 'array', items: { type: 'string' } },
+              required: { type: 'boolean' },
+            },
+            required: ['id', 'stage', 'criteria'],
+          },
+        },
+      },
+      required: ['taskId', 'action'],
+    },
+    output: {
+      schema: buildOutputSchema('mnemos_task_gate'),
+      render: (_args, v) => {
+        if (!v || v.ok === false) return [{ type: 'text', text: `评审闸门失败：${v?.reason || '未知原因'}` }]
+        const bits = [`已记录评审动作：${v.action}（taskId=${v.taskId}）`]
+        if (v.planStatus) bits.push(`计划状态：${v.planStatus}`)
+        if (v.gateId) bits.push(`gate：${v.gateId}［${v.gateStatus}］`)
+        if (v.verdict) bits.push(`评审结论：${v.verdict}`)
+        if (v.reworkCount) bits.push(`返工次数：${v.reworkCount}`)
+        if ((v.blockedGates || []).length) {
+          bits.push(`未过 gate：${v.blockedGates.map((g) => `${g.id}［${g.status}］`).join('、')}`)
+        }
+        return [{ type: 'text', text: bits.join('\n') }]
+      },
+    },
+    timeoutMs: 15000,
+    async execute(args, exec) {
+      const sessionId = exec?.agent?.session?.id ?? null
+      return taskGateResult(await store.taskGate({ ...args, sessionId }))
     },
   }
 }
@@ -1461,6 +1568,7 @@ function makeTaskCloseTool(store) {
     description:
       '收尾一张任务图：优先把结论补进本任务已有事件（有始有终），没有事件才新建一条自传体 event；' +
       '图标记为 closed。临时中间结果（tags 含 `scratch`）默认丢弃；要留就加 `keep`。' +
+      '有评审计划时，plan 未批准或 required gate 未通过会拒绝正常收尾；abandoned=true 表示明确放弃（会记入结论）。' +
       '注意交付物（子代理 handoff）不要同时打 `scratch`：带 `assign:` 标签的记录不会被当 scratch 丢弃。',
     parameters: {
       type: 'object',
@@ -1470,13 +1578,20 @@ function makeTaskCloseTool(store) {
         conclusion: { type: 'string', description: '这个任务最终得出的结论（一两句，能独立看懂）' },
         newSummary: { type: 'string', description: '可选：覆盖长期记忆的摘要（默认取结论）' },
         eventId: { type: 'string', description: '可选：指定本任务已有的自传体 event 作为收尾载体；不填则自动选最新事件，没有就新建。' },
+        abandoned: { type: 'boolean', description: '明确放弃：跳过评审闸门，并在结论里写清不代表评审通过。默认 false。' },
       },
       required: ['taskId', 'conclusion'],
     },
     output: {
       schema: buildOutputSchema('mnemos_task_close'),
       render: (_args, v) => {
-        if (!v || v.ok === false) return [{ type: 'text', text: `收尾失败：${v?.reason || '未知原因'}` }]
+        if (!v || v.ok === false) {
+          const msg = [`收尾失败：${v?.reason || '未知原因'}`]
+          if ((v?.blockedGates || []).length) {
+            msg.push(`未过 gate：${v.blockedGates.map((g) => `${g.id}［${g.status}］`).join('、')}`)
+          }
+          return [{ type: 'text', text: msg.join('\n') }]
+        }
         const lines = [`已收尾 taskId=${v.taskId} → 长期摘要 ${v.longTermId}` + (v.graphId ? `（graphId=${v.graphId}）` : '')]
         for (const r of v.rolled || []) {
           lines.push(`- ${r.assign}［${r.status}］${r.handoffId ? `handoff ${r.handoffId}` : '无 handoff'}${r.note ? `（${r.note}）` : ''}`)
@@ -1496,6 +1611,10 @@ function makeTaskCloseTool(store) {
         if (v.doneCount || v.usesCount || v.linksCount) {
           lines.push(`档案：已完成 ${v.doneCount || 0} 条 ｜ 依赖 ${v.usesCount || 0} 条 ｜ 前序 ${v.linksCount || 0} 条`)
         }
+        if (v.review) {
+          lines.push(`评审：${v.review.planStatus}；${(v.review.gates || []).map((g) => `${g.id}［${g.status}］`).join('、')}`)
+        }
+        if (v.abandoned) lines.push('收尾方式：abandoned（明确放弃，不代表评审通过）')
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
@@ -1508,6 +1627,7 @@ function makeTaskCloseTool(store) {
           conclusion: args?.conclusion,
           newSummary: args?.newSummary,
           eventId: args?.eventId,
+          abandoned: args?.abandoned === true,
           sessionId,
         })
       )
@@ -2167,6 +2287,7 @@ export function apply(ctx, config) {
     makeProposeSkillTool(store, skillRoot, llm, resolved),
     // ★ 任务图三件套（多 agent 协作）：数据语义在 store，这里只做参数/回执/渲染
     makeTaskOpenTool(store),
+    makeTaskGateTool(store),
     makeTaskUpdateTool(store),
     makeTaskCloseTool(store),
     makeTaskDoneTool(store),

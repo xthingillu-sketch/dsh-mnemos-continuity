@@ -1,8 +1,8 @@
-# Mnemos (v1.7.2)
+# Mnemos (v1.7.3)
 
 [![dshbase verified](https://dshbase.com/badges/dsh-mnemos-continuity.svg)](https://dshbase.com/zh/plugins/dsh-mnemos-continuity/)
 
-> **v1.7.2 focus:** control still comes first; this release adds sentence-level associative hints with 3+2 budgets and a shadow mode (embedding injects, mechanical runs in the background for comparison), plus identity backup storage: identity keeps a small pointer, `other` keeps the full detail, and the pointer does not consume the identity character budget. Self-narrative remains most trusted because it is inspectable and correctable; external information remains least trusted because it cannot be confirmed or overturned easily.
+> **v1.7.3 focus:** on top of the control-first model, this release adds stage-gated task review: `reviewGates` are planned up front, an independent reviewer reads the task graph and recalls evidence, and gives pass/rework/escalate; a required gate that has not passed blocks normal `task_close`, and giving up must be explicit via `abandoned`. The system prompt was also reviewed end-to-end (legacy ability migration removed, identity layers moved to ⑧.1, task graph and collaboration merged, review added as ㉔.1), and the task graph now explicitly stores addresses instead of full text. Sentence-level associative hints with 3+2 budgets, shadow mode, identity pointers and `other` identity backups remain.
 
 **A DeepSeek Harness (DSH) plugin — not a bigger memory store, but memory that stays usable after you switch sessions, directories, or models.**
 
@@ -65,13 +65,15 @@ Full statement (Chinese): [`README.md`](README.md) → 风险与责任.
 |---|---|
 | What it is, what it costs, should you use it | [`README.md`](README.md) (Chinese) |
 | Install / configure / tools / data location / troubleshooting | [`INSTALL.md`](INSTALL.md) |
-| Architecture, data flow, one task end-to-end | `docs/架构总览.md` |
-| Every mechanism and its guarantees/limits | `docs/architecture-机制清单.md` |
+| **New AI handoff: quick start for using the tools** | [`AI快速入门.md`](AI快速入门.md) |
+| Architecture, data flow, one task end-to-end | `docs/00-架构总览.md` |
+| Every mechanism and its guarantees/limits | `docs/02-architecture-机制清单.md` |
 | **Module-by-module implementation** (appendix: the constitution and the system prompt, verbatim) | [`docs/04-模块与功能实现.md`](docs/04-模块与功能实现.md) |
-| Why it is shaped this way | `docs/设计者视角.md` |
+| Why it is shaped this way | `docs/03-设计者视角.md` |
 
 > The release ships Markdown docs only; docx/pdf are not bundled.
 
 ## License
 
 MIT © 2026 七月流火
+

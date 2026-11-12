@@ -31,6 +31,9 @@ export function summarize(rec) {
     if (rec.category) out.category = rec.category
     if (rec.identityStatus) out.identityStatus = rec.identityStatus
     if (rec.occurredAt) out.occurredAt = rec.occurredAt
+    // ★ 写入即校验：自传体必须让调用方当场知道"会不会被注入"
+    //   （以前只有 identityStatus，candidate 也可能被误读成"写好了"）。
+    if (rec.inject) out.inject = rec.inject
   }
   return out
 }
@@ -182,6 +185,37 @@ export function taskOpenResult(r) {
   if (Array.isArray(v.assignments)) out.assignments = v.assignments.filter((x) => typeof x === 'string')
   if (Array.isArray(v.links)) out.links = v.links.filter((x) => typeof x === 'string')
   if (v.linkTruncated === true) out.linkTruncated = true
+  if (v.review && typeof v.review === 'object') {
+    out.review = {
+      planStatus: typeof v.review.planStatus === 'string' ? v.review.planStatus : '',
+      gates: Array.isArray(v.review.gates) ? v.review.gates.filter((x) => typeof x === 'string') : [],
+    }
+  }
+  return out
+}
+
+/** mnemos_task_gate：评审闸门回执。 */
+export function taskGateResult(r) {
+  const v = r && typeof r === 'object' ? r : {}
+  const out = { ok: v.ok === true }
+  if (typeof v.reason === 'string') out.reason = v.reason
+  if (typeof v.taskId === 'string') out.taskId = v.taskId
+  if (typeof v.action === 'string') out.action = v.action
+  if (typeof v.planStatus === 'string') out.planStatus = v.planStatus
+  if (typeof v.gateId === 'string') out.gateId = v.gateId
+  if (typeof v.gateStatus === 'string') out.gateStatus = v.gateStatus
+  if (typeof v.verdict === 'string') out.verdict = v.verdict
+  if (Number.isFinite(v.reworkCount)) out.reworkCount = v.reworkCount
+  if (v.already === true) out.already = true
+  if (Array.isArray(v.blockedGates)) {
+    out.blockedGates = v.blockedGates
+      .filter((x) => x && typeof x === 'object')
+      .map((x) => ({
+        id: typeof x.id === 'string' ? x.id : '',
+        stage: typeof x.stage === 'string' ? x.stage : '',
+        status: typeof x.status === 'string' ? x.status : '',
+      }))
+  }
   return out
 }
 
@@ -251,6 +285,29 @@ export function taskCloseResult(r) {
   if (Number.isFinite(v.doneCount)) out.doneCount = v.doneCount
   if (Number.isFinite(v.usesCount)) out.usesCount = v.usesCount
   if (Number.isFinite(v.linksCount)) out.linksCount = v.linksCount
+  if (v.review && typeof v.review === 'object') {
+    out.review = {
+      planStatus: typeof v.review.planStatus === 'string' ? v.review.planStatus : '',
+      gates: Array.isArray(v.review.gates)
+        ? v.review.gates.filter((x) => x && typeof x === 'object').map((x) => ({
+            id: typeof x.id === 'string' ? x.id : '',
+            status: typeof x.status === 'string' ? x.status : '',
+            ...(typeof x.verdict === 'string' ? { verdict: x.verdict } : {}),
+            ...(Number.isFinite(x.reworkCount) ? { reworkCount: x.reworkCount } : {}),
+          }))
+        : [],
+    }
+  }
+  if (v.abandoned === true) out.abandoned = true
+  if (Array.isArray(v.blockedGates)) {
+    out.blockedGates = v.blockedGates
+      .filter((x) => x && typeof x === 'object')
+      .map((x) => ({
+        id: typeof x.id === 'string' ? x.id : '',
+        stage: typeof x.stage === 'string' ? x.stage : '',
+        status: typeof x.status === 'string' ? x.status : '',
+      }))
+  }
   return out
 }
 

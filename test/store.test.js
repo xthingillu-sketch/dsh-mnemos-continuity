@@ -49,7 +49,7 @@ import {
   rememberResult, recallResult, validateResult, curationResult, constitutionResult, deleteResult,
   deprecateResult, dormantResult, openResult, consolidateResult, heartbeatResult,
   maintenanceListResult, toggleResult, proposeSkillResult,
-  taskOpenResult, taskUpdateResult, taskCloseResult, taskDoneResult, taskCiteResult,
+  taskOpenResult, taskGateResult, taskUpdateResult, taskCloseResult, taskDoneResult, taskCiteResult,
 } from '../src/tool-results.js'
 import { promises as fs, existsSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -4084,6 +4084,77 @@ console.log('== 94o. 身份字数预算排除 identity-pointer ==')
   assert(next.identityStatus === 'candidate', '正文预算仍按 800 计算，不被指针挤占')
 }
 
+console.log('== 94p. 任务图评审闸门：计划批准 / 证据 / 返工 / 收尾闸门 ==')
+{
+  const tm = new MemoryStore(path.join(dir, 'x94p', 'memory.json'))
+  await tm.load()
+  const opened = await tm.openTask({
+    goal: '带评审闸门的任务',
+    assignments: [{ id: 'a', task: '执行' }],
+    reviewGates: [
+      { id: 'G1', stage: 'milestone', criteria: '测试通过', requiredEvidence: ['测试结果'] },
+      { id: 'G2', stage: 'pre-irreversible', criteria: '回滚方案', required: false },
+    ],
+    sessionId: 'main',
+  })
+  assert(opened.ok === true && opened.review.planStatus === 'proposed', '开图时评审计划为 proposed')
+  const closeBeforePlan = await tm.closeTask({ taskId: opened.taskId, conclusion: '未批计划', sessionId: 'main' })
+  assert(closeBeforePlan.ok === false && closeBeforePlan.reviewPlanStatus === 'proposed', '计划未批准不能正常收尾')
+  const submitBeforePlan = await tm.taskGate({
+    taskId: opened.taskId, gateId: 'G1', action: 'submit', claims: '做完了', sessionId: 'main',
+  })
+  assert(submitBeforePlan.ok === false, '计划未批准不能提交 gate 证据')
+  const selfApprove = await tm.taskGate({
+    taskId: opened.taskId, action: 'approve-plan', sessionId: 'main',
+  })
+  assert(selfApprove.ok === false, '主模型不能自己批准评审计划')
+  const removeReview = await tm.taskGate({
+    taskId: opened.taskId, action: 'revise-plan', sessionId: 'main',
+  })
+  assert(removeReview.ok === false, 'revise-plan 不能把评审计划删空')
+  const approved = await tm.taskGate({
+    taskId: opened.taskId, action: 'approve-plan', sessionId: 'reviewer',
+  })
+  assert(approved.ok === true && approved.planStatus === 'approved', '评审会话批准计划')
+  const submitted = await tm.taskGate({
+    taskId: opened.taskId, gateId: 'G1', action: 'submit',
+    claims: 'G1 完成', evidenceIds: ['test-1'], sessionId: 'main',
+  })
+  assert(submitted.ok === true && submitted.gateStatus === 'submitted', '主模型提交证据')
+  const selfVerdict = await tm.taskGate({
+    taskId: opened.taskId, gateId: 'G1', action: 'verdict', verdict: 'pass', sessionId: 'main',
+  })
+  assert(selfVerdict.ok === false, '主模型不能自己下 verdict')
+  const badRework = await tm.taskGate({
+    taskId: opened.taskId, gateId: 'G1', action: 'verdict', verdict: 'rework', sessionId: 'reviewer',
+  })
+  assert(badRework.ok === false, 'rework 必须说明 failedCriteria/missingEvidence')
+  const rework = await tm.taskGate({
+    taskId: opened.taskId, gateId: 'G1', action: 'verdict', verdict: 'rework',
+    missingEvidence: ['失败路径日志'], sessionId: 'reviewer',
+  })
+  assert(rework.ok === true && rework.gateStatus === 'rework' && rework.reworkCount === 1, '评审可要求返工并计数')
+  await tm.taskGate({
+    taskId: opened.taskId, gateId: 'G1', action: 'submit',
+    claims: '补了日志', evidenceIds: ['test-1', 'log-2'], sessionId: 'main',
+  })
+  const pass = await tm.taskGate({
+    taskId: opened.taskId, gateId: 'G1', action: 'verdict', verdict: 'pass', sessionId: 'reviewer',
+  })
+  assert(pass.ok === true && pass.blockedGates.length === 0, 'G1 通过后无未过必过 gate')
+  const closed = await tm.closeTask({ taskId: opened.taskId, conclusion: '评审通过', sessionId: 'main' })
+  assert(closed.ok === true && closed.review.planStatus === 'approved', '所有必过 gate 通过后可收尾')
+
+  const abandonedTask = await tm.openTask({
+    goal: '放弃的评审任务', assignments: [], reviewGates: [{ id: 'G1', stage: 'final', criteria: 'x' }], sessionId: 'main',
+  })
+  const abandoned = await tm.closeTask({
+    taskId: abandonedTask.taskId, conclusion: '明确放弃', abandoned: true, sessionId: 'main',
+  })
+  assert(abandoned.ok === true && abandoned.abandoned === true, 'abandoned=true 可显式放弃，不被评审闸门卡死')
+  assert(abandoned.review.planStatus === 'proposed', '放弃时如实保留评审未批准状态')
+}
+
 console.log('== 94i. fansearch：英文查询命中中文摘要 + 来源/ID + seen ==')
 {
   const mems = [
@@ -4340,15 +4411,23 @@ console.log('== 97. ★ F-4 规则⑧补全三类 + 全部提示行不含字面�
     idxSrc.includes('mnemosSystemPromptLines()'),
     '★★ F-4 前置：src/index.js 真的消费了这份提示正文（不是"改了没人用"）'
   )
-  const rule8 = lines97.filter((l) => l.startsWith('⑧'))
+  const rule8 = lines97.filter((l) => l.startsWith('⑧ '))
   assert(rule8.length === 1, `★ F-4 前置：规则 ⑧ 唯一可定位（实测 ${rule8.length} 行）`)
   const t8 = rule8[0] || ''
   assert(t8.includes('decision'), '★ F-4：规则 ⑧ 仍说明 decision（原有语义没被弄坏）')
   assert(t8.includes('identity') && t8.includes('experience'), '★★ F-4：规则 ⑧ 含新五类 identity/experience')
-  assert(t8.includes('ability'), '★★ F-4：规则 ⑧ 兼容旧 ability 标签（迁移不丢）')
+  assert(!t8.includes('ability'), '★★ F-4：旧 ability 迁移说明已从规则 ⑧ 移除，不再误导')
   assert(t8.includes('event'), '★★ F-4：规则 ⑧ 含 event（值得记的事件）')
   assert(t8.includes('其他'), '★★ F-4：规则 ⑧ 说明未分类会进「其他」类目（兜底口径写进提示词）')
   assert(t8.indexOf('**') === -1, '★ F-4：⑧ 这一条里没有字面星号')
+  const identityLayer = lines97.filter((l) => l.startsWith('⑧.1'))
+  assert(identityLayer.length === 1 &&
+    identityLayer[0].includes('identity-pointer') &&
+    identityLayer[0].includes('identity-backup') &&
+    identityLayer[0].includes('不计预算'),
+    '★★ ⑧.1 身份两层存必须紧跟在 ⑧ 后，含 identity-pointer / identity-backup / 不计预算')
+  assert(one.indexOf('⑧.1') < one.indexOf('⑨ ') && !one.includes('㉖'),
+    '★★ 原 ㉖ 已改号 ⑧.1 并移到身份标记之后（不再挂在末尾）')
   // 编号 ①..㉕ 必须恰好各一条（①-⑰ 原 17 条；⑱-㉓ 多 agent 协作；㉔ 任务档案；㉕ 技能与经验）
   const nums = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱', '⑲', '⑳', '㉑', '㉒', '㉓', '㉔', '㉕']
   const missing = nums.filter((n) => !one.includes(n))
@@ -4356,11 +4435,11 @@ console.log('== 97. ★ F-4 规则⑧补全三类 + 全部提示行不含字面�
   const starIdx = one.indexOf('**')
   assert(starIdx === -1, `★★ F-4：系统提示全部 25 条里不含字面星号（实测 indexOf('**')=${starIdx}）`)
 
-  // ★ 2026-10-21：任务图独立成节；㉔ 第一条，协作规则并入同节（不再另立"多 agent"节）
-  assert(one.includes('【六、任务图】'), '★★ F-4：第六节「任务图」独立成节（自己的任务也要读得到）')
+  // ★ 2026-11-12：任务图与协作合并为一节；㉔ 第一条，㉔.1 评审，协作规则在其后
+  assert(one.includes('【六、任务图与协作】'), '★★ F-4：第六节「任务图与协作」独立成节（自己的任务也要读得到）')
   assert(!one.includes('【七、多 agent 协作】'), '★★ 不再把协作单独成节（否则自己的任务读不到开图）')
   assert(one.includes('【七、技能与经验】'), '★★ F-4：第七节「技能与经验」存在')
-  const sec6 = one.slice(one.indexOf('【六、任务图】'), one.indexOf('【七、技能与经验】'))
+  const sec6 = one.slice(one.indexOf('【六、任务图与协作】'), one.indexOf('【七、技能与经验】'))
   assert(sec6.indexOf('㉔') >= 0 && sec6.indexOf('㉔') < sec6.indexOf('⑱'),
     '★★ ㉔ 是任务图节下的第一条（协作规则不许挡在它前面）')
   assert(sec6.includes('⑲') && sec6.includes('㉓'),
@@ -4407,6 +4486,7 @@ console.log('== 97. ★ F-4 规则⑧补全三类 + 全部提示行不含字面�
   assert(rule24.includes('宿主 todo') && rule24.includes('必须同时开图') && rule24.includes('开图不亏'),
     '★★ 用到宿主 todo 就必须同时开任务图；能用 todo 的场景开图不亏')
   assert(rule24.includes('conclusion') && rule24.includes('不复制'), '★★ ㉔ 重要结论用标签标注，正文不复制进图')
+  assert(rule24.includes('地址'), '★★ ㉔ 图里要存产物/证据/引用的地址，而不是正文')
   assert(rule24.includes('links') && rule24.includes('不改旧图'), '★★ ㉔ 跨会话开新图 + links，不改旧图')
   assert(rule24.includes('单步小事') && rule24.includes('别开'),
     '★★ V6-22：㉔ 必须写清"单步小事直接 remember，别开"（否则小任务也会开图）')
@@ -4434,19 +4514,31 @@ console.log('== 97. ★ F-4 规则⑧补全三类 + 全部提示行不含字面�
   //     workflow 子代理 handoff 与 null 判定；同时保留短时层/自传体/不许默认成功等旧约束。实测 3559。
   //   ★ 2026-10-24 抬到 3800：自传体改为五类（identity/decision/experience/event/other），
   //     ⑧ 补 identity/experience/occurredAt；不再为旧四类口径硬压字数。实测 3638。
-  assert(one.length < 3800, `★ 提示词预算（实测 ${one.length} 字符 / 上限 3800；去重前 3062）`)
+  //   ★ 2026-11-10 抬到 4200：⑧ 拆出 ⑧.1「身份分两层存」——固定注入只放"我是什么样的人/我会什么"，
+  //     能力做法走 identity-pointer + other/identity-backup（用户定：这是改动小但影响极大的纪律，
+  //     且原纪律已足够精简，不为凑字数去砍别处）。实测 4152（2026-11-12 整版审阅后）。
+  assert(one.length < 4200, `★ 提示词预算（实测 ${one.length} 字符 / 上限 4200；去重前 3062）`)
   {
     const summaryRule = lines97.find((l) => l.startsWith('⑤'))
     assert(summaryRule.includes('中文（english）') && summaryRule.includes('不整句翻译'),
       '★★ ⑤ 要求摘要关键词附英文检索锚点，但不整句翻译')
   }
-  const taskRule = lines97.filter((l) => l.startsWith('㉔'))
+  const taskRule = lines97.filter((l) => l.startsWith('㉔ '))
   assert(taskRule.length === 1 &&
     taskRule[0].includes('多个模型或子代理协作') &&
     taskRule[0].includes('单步小事') &&
     taskRule[0].includes('task_done') &&
     taskRule[0].includes('task_cite'),
     '★★ 任务图章节必须同时写清：多模型协作必须开图、单步小事不开、自己干的 done/cite')
+  const reviewRule = lines97.filter((l) => l.startsWith('㉔.1'))
+  assert(reviewRule.length === 1 &&
+    reviewRule[0].includes('reviewGates') &&
+    reviewRule[0].includes('task_gate') &&
+    reviewRule[0].includes('approve-plan') &&
+    reviewRule[0].includes('rework') &&
+    reviewRule[0].includes('abandoned') &&
+    reviewRule[0].includes('不能自批自评'),
+    '★★ ㉔.1 必须写清评审闸门：reviewGates、task_gate、approve-plan、rework、abandoned、不能自批自评')
   const assignPromptRule = lines97.filter((l) => l.startsWith('⑲'))
   assert(assignPromptRule.length === 1 && assignPromptRule[0].includes('graphId') && assignPromptRule[0].includes('mnemos_open') && assignPromptRule[0].includes('不要把') && assignPromptRule[0].includes('抄进 prompt'),
     '★★ 派活标准流程：只给 graphId/assignId，让子代理自己 open，不抄背景')
@@ -4458,12 +4550,11 @@ console.log('== 97. ★ F-4 规则⑧补全三类 + 全部提示行不含字面�
     '★★ 边界：workflow 的 agent() 同样适用 handoff；null/缺 handoffId = 未完成')
   // 反例核对：plain() 确实能去掉星号（这条断言本身有判别力，不是恒真）
   assert(plain('**加粗**') === '加粗', '★ F-4 反例核对：plain() 确实会去掉星号')
-  // 与旧文本的对照：改之前 ⑧ 里没有 ability/event —— 用一条**结构**断言替代文本比对，
-  // 确认这两个词只出现在 ⑧ 附近，而不是被别处顺手带进来的噪声。
+  // 2026-11-12：旧 ability 迁移说明已删除；提示词不应再出现 ability 旧口径。
   const withAbility = lines97.filter((l) => l.includes('ability'))
   assert(
-    withAbility.length === 1 && withAbility[0].startsWith('⑧'),
-    `★ F-4：ability/event 的说明**只在规则 ⑧**（实测含 ability 的行数=${withAbility.length}）`
+    withAbility.length === 0,
+    `★ F-4：旧 ability 迁移说明已从提示词移除（实测含 ability 的行数=${withAbility.length}）`
   )
   // ⚠️ 工具回执那两条路径（F-5 的 render）住在 index.js 里且需要宿主 Schema —— 单测 import 不到，
   //    所以这里**不假装测过**它（本项目栽过"装饰性断言"）。它们的判别力放在 98 的扰动自证里。
@@ -5217,9 +5308,9 @@ console.log('== 104. ★ F-15 结构性修复：20 个工具的"声明 vs 实际
     // ★★ 顺序必须与 **index.js 里工厂函数的源码顺序**一致 —— F-15 的静态切片按相邻工具的
     //    `name: 'xxx'` 字面量切块，顺序错了会把下一个工具的回执字段算到上一个头上
     //    （实测：工具顺序放错时，前一个工具的块会吞掉后一个工具的 render）。
-    'mnemos_task_open', 'mnemos_task_update', 'mnemos_task_close', 'mnemos_task_done', 'mnemos_task_cite',
+    'mnemos_task_open', 'mnemos_task_gate', 'mnemos_task_update', 'mnemos_task_close', 'mnemos_task_done', 'mnemos_task_cite',
   ]
-  assert(TOOL_NAMES.length === 19, `★★ [F15] 形状表覆盖 19 个工具（实测 ${TOOL_NAMES.length}：${TOOL_NAMES.join(',')}）`)
+  assert(TOOL_NAMES.length === 20, `★★ [F15] 形状表覆盖 20 个工具（实测 ${TOOL_NAMES.length}：${TOOL_NAMES.join(',')}）`)
   assert(
     EXPECTED_TOOLS.every((t) => TOOL_NAMES.includes(t)) && TOOL_NAMES.every((t) => EXPECTED_TOOLS.includes(t)),
     '★★ [F15] 表的键集合 == 实际注册的工具集合（多一个/少一个都挂 —— 新增工具必须同时声明形状）'
@@ -5298,6 +5389,22 @@ console.log('== 104. ★ F-15 结构性修复：20 个工具的"声明 vs 实际
     sessionId: 'sid-task-104',
   })
 
+  const taskGateSt104 = new MemoryStore(path.join(d104, 'task-gate104.json'))
+  const taskGateOpened104 = await taskGateSt104.openTask({
+    goal: 'F-15 真值：评审闸门',
+    reviewGates: [{ id: 'G1', stage: 'milestone', criteria: '可复核', requiredEvidence: ['测试结果'] }],
+    sessionId: 'sid-task-104',
+  })
+  await taskGateSt104.taskGate({ taskId: taskGateOpened104.taskId, action: 'approve-plan', sessionId: 'sid-review-104' })
+  await taskGateSt104.taskGate({
+    taskId: taskGateOpened104.taskId, gateId: 'G1', action: 'submit',
+    claims: '完成', evidenceIds: ['ev-1'], sessionId: 'sid-task-104',
+  })
+  const taskGate104 = await taskGateSt104.taskGate({
+    taskId: taskGateOpened104.taskId, gateId: 'G1', action: 'verdict', verdict: 'pass',
+    sessionId: 'sid-review-104',
+  })
+
   const REAL_VALUES = {
     mnemos_remember: rememberResult(rA, { superseded: [{ id: 'x', ok: true }], possibleSupersedes: [] }),
     mnemos_recall: recallResult(recalled),
@@ -5315,6 +5422,7 @@ console.log('== 104. ★ F-15 结构性修复：20 个工具的"声明 vs 实际
     mnemos_propose_skill: proposeSkillResult(proposeRes),
     // ★ 任务图三件套：真值同样来自真 store（开→填→收都跑过一遍）
     mnemos_task_open: taskOpenResult(taskOpened104),
+    mnemos_task_gate: taskGateResult(taskGate104),
     mnemos_task_update: taskUpdateResult(taskUpdated104),
     mnemos_task_close: taskCloseResult(taskClosed104),
     mnemos_task_done: taskDoneResult(taskDone104),
@@ -5675,3 +5783,4 @@ console.log(`\n结果：${pass} 通过，${fail} 失败`)
 await writeReport(fail)
 await fs.rm(dir, { recursive: true, force: true })
 process.exit(fail === 0 ? 0 : 1)
+

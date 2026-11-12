@@ -46,6 +46,8 @@ export const TOOL_OUTPUT_SPECS = {
       id: str(), summary: str(), tags: arr({ type: 'string' }), layer: str(), salience: str(),
       superseded: arr(), possibleSupersedes: arr(), dormantUnscoped: bool(), scope: str(),
       category: str(), identityStatus: str(), occurredAt: num(),
+      // ★ 写入即校验：自传体回执必须带"会不会被注入"（injected/reason/预算实数）
+      inject: { type: 'object', additionalProperties: true },
     },
   },
   mnemos_recall: {
@@ -172,6 +174,19 @@ export const TOOL_OUTPUT_SPECS = {
       assignments: arr({ type: 'string' }),
       links: arr({ type: 'string' }),
       linkTruncated: bool(),
+      review: {
+        type: 'object',
+        properties: { planStatus: str(), gates: arr({ type: 'string' }) },
+      },
+    },
+  },
+  mnemos_task_gate: {
+    type: 'object',
+    required: ['ok'],
+    properties: {
+      ok: bool(), reason: str(), taskId: str(), action: str(), planStatus: str(),
+      gateId: str(), gateStatus: str(), verdict: str(), reworkCount: num(), already: bool(),
+      blockedGates: arr({ type: 'object', properties: { id: str(), stage: str(), status: str() } }),
     },
   },
   mnemos_task_update: {
@@ -196,6 +211,15 @@ export const TOOL_OUTPUT_SPECS = {
       },
       keptScratch: num(),
       doneCount: num(), usesCount: num(), linksCount: num(),
+      review: {
+        type: 'object',
+        properties: {
+          planStatus: str(),
+          gates: arr({ type: 'object', properties: { id: str(), status: str(), verdict: str(), reworkCount: num() } }),
+        },
+      },
+      abandoned: bool(),
+      blockedGates: arr({ type: 'object', properties: { id: str(), stage: str(), status: str() } }),
     },
   },
   mnemos_task_done: {
