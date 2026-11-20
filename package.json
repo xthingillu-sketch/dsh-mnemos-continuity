@@ -1,6 +1,6 @@
 {
   "name": "dsh-mnemos-continuity",
-  "version": "1.7.4",
+  "version": "1.7.6",
   "description": "Cross-model continuity for DeepSeek Harness: memory, skills and rules live in local files, so judgement survives session and model changes. Not about storing more memory — about using it well after the model changes.",
   "type": "module",
   "main": "./src/index.js",
@@ -20,7 +20,7 @@
     "AI快速入门.md"
   ],
   "scripts": {
-    "test": "node test/store.test.js"
+    "test": "node test/store.test.js && node test/fansearch-delivery.test.js && node test/embedding-index.test.js"
   },
   "dsh": {
     "bundle": {

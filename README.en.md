@@ -1,6 +1,8 @@
-# Mnemos (v1.7.4)
+# Mnemos (v1.7.6)
 
 [![dshbase verified](https://dshbase.com/badges/dsh-mnemos-continuity.svg)](https://dshbase.com/zh/plugins/dsh-mnemos-continuity/)
+
+> **v1.7.6 fixes associative retrieval blocking tool results.** Hints ride later tool results without waiting. Persistent sentence vectors are warmed in the background; online embedding only sends the query.
 
 > **v1.7.4 is a compatibility update, not a feature release:** it only adapts the DSH 0.2.2-rc.1 `subagents` provider selection (`list` → `getProvider` → `config.provider` → `spawn`). Tools, prompt, schemas and data format are unchanged.
 

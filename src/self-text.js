@@ -10,6 +10,9 @@
  *      于是模型**完全不知道**身份/红线不存在（静默失效）。至少要说出来。
  *   ② 说的时候要给**真实解析到的绝对路径**（不是占位符、不是猜的），
  *      持有者才知道该把宪法初始化到哪里。
+ *
+ * ★ 2026-11-16 分层：身份区拆成两段、两层独立预算（自我画像 / 行为约束），
+ *   互不侵占；某层装不下时必须报出**是哪一层**，并指向该层可单独扩容的配置项。
  */
 import { plain } from './plain-text.js'
 
@@ -39,21 +42,46 @@ export function constitutionMissingWarning(constitutionFile) {
 }
 
 /**
+ * 身份两层各自的预算说明行（只在某层被截断时出现）。
+ *
+ * @param {{portraitUsed:number, portraitBudget:number, ruleUsed:number, ruleBudget:number,
+ *          unselectedByIdentityKind?:{portrait:number, rule:number}}} auto
+ */
+function budgetNote(auto) {
+  const u = auto.unselectedByIdentityKind || {}
+  const parts = []
+  if ((u.portrait || 0) > 0) {
+    parts.push(
+      `自我画像层 ${u.portrait} 条未注入（${auto.portraitUsed}/${auto.portraitBudget} 已满，` +
+        '可单独扩容 identityPortraitBudget，另一层不受影响）'
+    )
+  }
+  if ((u.rule || 0) > 0) {
+    parts.push(
+      `行为约束层 ${u.rule} 条未注入（${auto.ruleUsed}/${auto.ruleBudget} 已满，` +
+        '可单独扩容 identityRuleBudget，另一层不受影响）'
+    )
+  }
+  return parts
+}
+
+/**
  * 组装注入给模型的自传体文本。
  *
  * 宪法段：已初始化 → 注入正文；未初始化 → 注入**可见警告**（绝不静默变空）。
- * 自传体段：照旧，为空则不注入。
- * ★ F-12：自传体段被预算截断时，末尾**多一行**说清"另有 N 条没进来"，
+ * 自传体段：分两层输出（自我画像 / 行为约束），为空则不注入。
+ * ★ F-12：被预算截断时，末尾**多一行**说清"另有 N 条没进来"，
  *   并指路 mnemos_recall —— 口径由持有者定死：既要让它知道有内容未注入，
  *   又要提醒它按需召回（不许凭印象认为没记过）。N 是**实数**（来自 store），不是"可能还有"。
+ * ★ 2026-11-16：截断还要分层说明——是哪一层满了、该调哪个配置项。
  *
  * @param {{read:()=>string|null, dataFile?:string}} constitution ConstitutionStore 或同形对象
- * @param {{autobiographyCompact:(o:{budget:number})=>{
- *   entries:{label:string,summary:string}[],
- *   unselected?:number, budget?:number}}} store
- * @param {number} budget 自传体紧凑版字符预算
+ * @param {{autobiographyCompact?:(o:{budget:number})=>{entries:{label:string,summary:string}[],
+ *   unselected?:number}, autobiographyCompactV2?:Function}} store
+ * @param {number} budget 自传体紧凑版字符预算（旧的总段预算，V2 下只作为兜底）
+ * @param {{portraitBudget?:number, ruleBudget?:number}} [identityBudgets] 身份两层预算
  */
-export function buildSelfText(constitution, store, budget) {
+export function buildSelfText(constitution, store, budget, identityBudgets = {}) {
   const parts = []
   const con = constitution.read()
   if (con) {
@@ -62,13 +90,22 @@ export function buildSelfText(constitution, store, budget) {
     // 未初始化（或文件存在但正文为空）→ 必须说出去，不能整段消失
     parts.push(constitutionMissingWarning(constitution.dataFile || ''))
   }
-  // V6-29：固定注入切到 V2（identity 全部 + 最近 3 决策 + 最多 5 重要经验）。
+  // V6-29 + 2026-11-16 分层：identity 拆两层各占预算；决策/经验照旧。
   // fake store / 旧同形对象没有 V2 时退回旧 compact，单测仍可用。
   const auto = typeof store.autobiographyCompactV2 === 'function'
-    ? store.autobiographyCompactV2()
+    ? store.autobiographyCompactV2({
+        portraitBudget: identityBudgets.portraitBudget,
+        ruleBudget: identityBudgets.ruleBudget,
+      })
     : store.autobiographyCompact({ budget })
   if (auto.entries.length) {
-    const lines = auto.entries.map((e) => `[${e.label}] ${e.summary}`)
+    const portrait = auto.entries.filter((e) => e.kind === 'portrait')
+    const others = auto.entries.filter((e) => e.kind !== 'portrait')
+    // 自我画像：整段呈现，不加 [身份] 这类条目标签（它就是一段话）
+    if (portrait.length) {
+      parts.push('【自传体 · 自我画像】\n' + portrait.map((e) => e.summary).join('\n'))
+    }
+    const lines = others.map((e) => `[${e.kind === 'rule' ? '约束' : e.label}] ${e.summary}`)
     // 实数（store 如实统计；缺省视为 0 —— 同形 stub 也不该凭空吓人）
     const n = Number(auto.unselected) || 0
     if (n > 0) {
@@ -77,7 +114,11 @@ export function buildSelfText(constitution, store, budget) {
           `需要时用 mnemos_recall 检索（不要凭印象认为没记过）。`
       )
     }
-    parts.push('【自传体 · 自我历史（紧凑版，按需召回详情）】\n' + lines.join('\n'))
+    const notes = budgetNote(auto)
+    if (notes.length) {
+      lines.push('【自传体 · 预算】' + notes.join('；'))
+    }
+    parts.push('【自传体 · 行为约束（每轮必读）】\n' + lines.join('\n'))
   }
   return parts.join('\n\n')
 }

@@ -7,7 +7,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { findSecrets, describeHits } from './secret-patterns.js'
 import { defaultDataFile } from './paths.js'
-import { searchMemories, searchAssociative } from './fansearch.js'
+import { searchMemories, searchAssociative, collectAssociativeSentences } from './fansearch.js'
 import {
   acquireLock, releaseLock, mergeMemories, atomicWriteFile,
   readTombstones, mergeTombstones, capTombstones, writeTombstones,
@@ -41,6 +41,50 @@ export const AUTOBIOGRAPHY_CATEGORIES = ['identity', 'decision', 'experience', '
 export const DEFAULT_IDENTITY_BUDGET = 800
 export const DEFAULT_RECENT_DECISION_COUNT = 3
 export const DEFAULT_IMPORTANT_EXPERIENCE_COUNT = 5
+
+/**
+ * 身份区两层预算（2026-11-16 用户定）：**自我画像 / 行为约束各自独立预算，互不侵占**。
+ *
+ * 背景：原来身份只有**一个** 800 字池子，画像与约束同池竞争 —— 写一条画像就挤掉一条
+ * 约束，反之亦然，而且被挤掉时不报是哪一层不够。现在拆成两池：
+ *   · portrait（自我画像）：整段描述"我是什么样的存在"，用 tag identity-portrait 标记
+ *   · rule（行为约束）：一条条的动作/纪律，用 tag identity-rule 或**缺省**归入
+ * 能力指针（identity-pointer）不占任何池子。
+ *
+ * 超限语义：写不进对应池时，回执必须指明**是哪一层**不够，且该层的预算可**单独**扩容
+ * （identityPortraitBudget / identityRuleBudget 两个配置项互不影响）。
+ */
+export const DEFAULT_IDENTITY_PORTRAIT_BUDGET = 600
+export const DEFAULT_IDENTITY_RULE_BUDGET = 600
+export const IDENTITY_KIND_PORTRAIT = 'portrait'
+export const IDENTITY_KIND_RULE = 'rule'
+export const IDENTITY_KIND_TAG = {
+  [IDENTITY_KIND_PORTRAIT]: 'identity-portrait',
+  [IDENTITY_KIND_RULE]: 'identity-rule',
+}
+export const IDENTITY_KIND_LABEL = {
+  [IDENTITY_KIND_PORTRAIT]: '自我画像',
+  [IDENTITY_KIND_RULE]: '行为约束',
+}
+
+/**
+ * 身份条目属于哪一层。缺省 = rule —— 兼容 2026-11-16 之前写入的全部身份条（它们全是约束）。
+ * 指针条不参与分层（不占预算）。
+ */
+export function identityKindOf(m) {
+  const tags = (m && m.tags) || []
+  return tags.includes(IDENTITY_KIND_TAG[IDENTITY_KIND_PORTRAIT]) ? IDENTITY_KIND_PORTRAIT : IDENTITY_KIND_RULE
+}
+
+/** 某层的默认预算。 */
+export function identityBudgetOf(kind) {
+  return kind === IDENTITY_KIND_PORTRAIT ? DEFAULT_IDENTITY_PORTRAIT_BUDGET : DEFAULT_IDENTITY_RULE_BUDGET
+}
+
+/** 某层扩容要改的配置项名（回执里要原样报给用户）。 */
+export function identityBudgetConfigKey(kind) {
+  return kind === IDENTITY_KIND_PORTRAIT ? 'identityPortraitBudget' : 'identityRuleBudget'
+}
 
 /**
  * tag 匹配：兼容两种写法，且不改变系统协议 tag 的精确语义。
@@ -689,13 +733,18 @@ export class MemoryStore {
     // 身份两段：core 预算满 → candidate；user-important 必须先走 candidate + 独立验证，
     // 即使预算未满也不能直接写 core。
     let identityStatusFinal
+    let identityKindFinal
     if (wantIdentity) {
       const supersededIds = new Set(Array.isArray(supersedes) ? supersedes.map(String) : [])
+      const kind = identityKindOf({ tags: recTags })
+      const cap = identityBudgetOf(kind)
+      identityKindFinal = kind
       const currentIdentityChars = [...this.memories.values()]
         .filter((m) => m.source === 'autobiography' &&
           m.identityStatus !== 'candidate' &&
           autobiographyCategoryOf(m) === 'identity' &&
           !isIdentityPointer(m) &&
+          identityKindOf(m) === kind &&
           !supersededIds.has(m.id))
         .reduce((sum, m) => sum + String(m.summary || '').length, 0)
       const newChars = String(summary || '').length
@@ -703,7 +752,7 @@ export class MemoryStore {
       const forceCore = recTags.includes('identity-pointer')
       identityStatusFinal = forceCandidate
         ? 'candidate'
-        : (forceCore || currentIdentityChars + newChars <= DEFAULT_IDENTITY_BUDGET ? 'core' : 'candidate')
+        : (forceCore || currentIdentityChars + newChars <= cap ? 'core' : 'candidate')
     }
     const occurredAtMs = occurredAt == null
       ? null
@@ -738,7 +787,10 @@ export class MemoryStore {
     }
     if (wantAuto) {
       rec.category = autoCategory
-      if (autoCategory === 'identity') rec.identityStatus = identityStatusFinal
+      if (autoCategory === 'identity') {
+        rec.identityStatus = identityStatusFinal
+        rec.identityKind = identityKindFinal || identityKindOf(rec)
+      }
       if (occurredAtMs !== null) rec.occurredAt = occurredAtMs
       if (autoCategory === 'event') {
         rec.ref = taskId && this.findTaskGraph(taskId) ? taskId : id
@@ -793,17 +845,24 @@ export class MemoryStore {
    */
   injectStatus(rec, { requestedCandidate = false } = {}) {
     if (rec.category !== 'identity') return { required: false }
-    const budget = DEFAULT_IDENTITY_BUDGET
+    // 分层预算（2026-11-16）：只用**同层**的字数去比同层的预算——两层互不侵占，
+    // 被挡时也必须报出是哪一层不够。
+    const kind = rec.identityKind || identityKindOf(rec)
+    const budget = identityBudgetOf(kind)
     const used = [...this.memories.values()]
       .filter((m) => m.source === 'autobiography' &&
         m.identityStatus !== 'candidate' &&
         autobiographyCategoryOf(m) === 'identity' &&
-        !isIdentityPointer(m))
+        !isIdentityPointer(m) &&
+        (m.identityKind || identityKindOf(m)) === kind)
       .reduce((sum, m) => sum + String(m.summary || '').length, 0)
     const injected = rec.identityStatus === 'core'
     return {
       required: true,
       injected,
+      kind,
+      kindLabel: IDENTITY_KIND_LABEL[kind],
+      budgetConfigKey: identityBudgetConfigKey(kind),
       reason: injected ? null : (requestedCandidate ? 'requested-candidate' : 'identity-budget-full'),
       usedChars: used,
       budget,
@@ -1105,10 +1164,17 @@ export class MemoryStore {
     return searchMemories(list, query, { exclude, limit, top })
   }
 
+  fansearchCorpus() {
+    return [...this.memories.values()].filter(m => !this.isArchiveLike(m))
+  }
+
+  fansearchSentences() {
+    return collectAssociativeSentences(this.fansearchCorpus())
+  }
+
   /** 句子级联想：相关3 + 旁支2；mode=mechanical|embedding。 */
   async fanSearchAssociative(query, opts = {}) {
-    const list = [...this.memories.values()].filter((m) => !this.isArchiveLike(m))
-    return await searchAssociative(list, query, opts)
+    return await searchAssociative(this.fansearchCorpus(), query, opts)
   }
 
   async open(id) {
@@ -1291,11 +1357,16 @@ export class MemoryStore {
     const beforeSnapshot = new Map([...old].map(([id, m]) => [id, snapshotOf(m)]))
     const retired = new Set()
     const newRecords = []
-    const makeRecord = (summary, why, evidenceIds = []) => {
+    const makeRecord = (summary, why, evidenceIds = [], kind = null) => {
+      // 身份两层（2026-11-16）：提案必须指明这条进哪一层（portrait/rule），缺省按 rule 处理。
+      const identityKind = action === 'identity'
+        ? (kind === IDENTITY_KIND_PORTRAIT ? IDENTITY_KIND_PORTRAIT : IDENTITY_KIND_RULE)
+        : null
+      const kindTag = identityKind ? [IDENTITY_KIND_TAG[identityKind]] : []
       const rec = {
         id: randomUUID(),
         taskId: originGraph ? taskId : null,
-        tags: [action, 'curated', ...taskTags, ...(action === 'experience' ? ['important-experience'] : [])],
+        tags: [action, 'curated', ...taskTags, ...(action === 'experience' ? ['important-experience'] : []), ...kindTag],
         summary: String(summary || '').trim(),
         detail: `由 curation proposal ${proposalId} 生成。\nwhy：${why || '（未注明）'}\n证据：${(evidenceIds || []).join(', ') || '（未注明）'}`,
         layer: 'permanent',
@@ -1306,6 +1377,7 @@ export class MemoryStore {
         source: 'autobiography',
         category: action,
         identityStatus: action === 'identity' ? 'core' : undefined,
+        identityKind: identityKind || undefined,
         pinned: action === 'experience' ? true : undefined,
         rank: action === 'experience' ? 5 : undefined,
         origin,
@@ -1331,10 +1403,53 @@ export class MemoryStore {
     const unaffected = [...old.values()].filter((m) => !affected.has(m.id) && !removed.has(m.id))
     const finalCount = unaffected.length + planned.length
     if (action === 'identity') {
-      const chars = unaffected.reduce((n, m) => n + String(m.summary || '').length, 0) +
-        planned.reduce((n, s) => n + s.length, 0)
-      if (chars > DEFAULT_IDENTITY_BUDGET) {
-        return { ok: false, reason: `identity 预算超限：${chars} > ${DEFAULT_IDENTITY_BUDGET}` }
+      // 分层预检（2026-11-16）：两层各自独立预算，互不侵占；
+      // 超限时**必须**报出是哪一层不够，并给出该层可单独扩容的配置名。
+      const poolOf = (m) => (m && (m.identityKind || identityKindOf(m))) || IDENTITY_KIND_RULE
+      const pools = {
+        [IDENTITY_KIND_PORTRAIT]: 0,
+        [IDENTITY_KIND_RULE]: 0,
+      }
+      for (const m of unaffected) {
+        if (isIdentityPointer(m)) continue
+        pools[poolOf(m)] += String(m.summary || '').length
+      }
+      for (const x of data.replace || []) {
+        if (!x || !x.id) continue
+        const orig = old.get(String(x.id))
+        const kind = x.kind === IDENTITY_KIND_PORTRAIT || x.kind === IDENTITY_KIND_RULE
+          ? x.kind
+          : poolOf(orig)
+        pools[kind] += String(x.summary || '').trim().length
+      }
+      for (const x of data.merge || []) {
+        const first = (x && x.from || [])[0]
+        const orig = first ? old.get(String(first)) : null
+        const kind = x.kind === IDENTITY_KIND_PORTRAIT || x.kind === IDENTITY_KIND_RULE
+          ? x.kind
+          : poolOf(orig)
+        pools[kind] += String(x && x.summary || '').trim().length
+      }
+      for (const x of data.add || []) {
+        // 提案必须显式带 kind；缺省入约束层（与 identityKindOf 的缺省一致）
+        const kind = x && x.kind === IDENTITY_KIND_PORTRAIT ? IDENTITY_KIND_PORTRAIT : IDENTITY_KIND_RULE
+        pools[kind] += String(x && x.summary || '').trim().length
+      }
+      for (const kind of [IDENTITY_KIND_PORTRAIT, IDENTITY_KIND_RULE]) {
+        const cap = identityBudgetOf(kind)
+        const total = pools[kind]
+        if (total > cap) {
+          return {
+            ok: false,
+            reason: `${IDENTITY_KIND_LABEL[kind]} 层预算不足：${total} > ${cap}` +
+              `（可用 ${identityBudgetConfigKey(kind)} 单独扩容，另一层不受影响）`,
+            layer: kind,
+            layerLabel: IDENTITY_KIND_LABEL[kind],
+            configKey: identityBudgetConfigKey(kind),
+            used: total,
+            budget: cap,
+          }
+        }
       }
     }
     // 经验数量上限不再在 apply 强制降级/拒绝；筛选不改变其它经验的身份，
@@ -1364,17 +1479,23 @@ export class MemoryStore {
     for (const x of data.replace || []) {
       if (!x || !x.id) continue
       const oldRec = old.get(String(x.id))
-      const rec = makeRecord(x.summary, x.why, x.evidenceIds)
+      // 没显式给 kind 时继承原条目所在的层，避免"替换一条约束却掉进画像层"
+      const kind = x.kind || (oldRec && (oldRec.identityKind || identityKindOf(oldRec)))
+      const rec = makeRecord(x.summary, x.why, x.evidenceIds, kind)
       retire(oldRec, rec.id)
     }
     for (const x of data.merge || []) {
       if (!x) continue
-      const rec = makeRecord(x.summary, x.why, [])
+      const first = (x.from || [])[0]
+      const firstRec = first ? old.get(String(first)) : null
+      const kind = x.kind || (firstRec && (firstRec.identityKind || identityKindOf(firstRec)))
+      const rec = makeRecord(x.summary, x.why, [], kind)
       for (const id of x.from || []) retire(old.get(String(id)), rec.id, true)
     }
     for (const x of data.add || []) {
       if (!x) continue
-      makeRecord(x.summary, x.why, x.evidenceIds)
+      // 提案必须带 kind；缺省 rule（与 identityKindOf 一致）
+      makeRecord(x.summary, x.why, x.evidenceIds, x.kind)
     }
     for (const id of data.remove || []) {
       retire(old.get(String(id)), null, false)
@@ -1586,11 +1707,17 @@ export class MemoryStore {
    * - event/other 不固定；unselected 计入全部类目
    */
   autobiographyCompactV2({
-    identityBudget = DEFAULT_IDENTITY_BUDGET,
+    portraitBudget = DEFAULT_IDENTITY_PORTRAIT_BUDGET,
+    ruleBudget = DEFAULT_IDENTITY_RULE_BUDGET,
     recentDecisions = DEFAULT_RECENT_DECISION_COUNT,
     maxExperiences = DEFAULT_IMPORTANT_EXPERIENCE_COUNT,
   } = {}) {
-    const identityCap = Math.max(0, Number(identityBudget) || 0)
+    // 两层各自独立预算（2026-11-16）：画像与约束互不侵占，各自按自己的 cap 截断。
+    const caps = {
+      [IDENTITY_KIND_PORTRAIT]: Math.max(0, Number(portraitBudget) || 0),
+      [IDENTITY_KIND_RULE]: Math.max(0, Number(ruleBudget) || 0),
+    }
+    const usedByKind = { [IDENTITY_KIND_PORTRAIT]: 0, [IDENTITY_KIND_RULE]: 0 }
     const all = this.autobiographyEntries().filter((m) =>
       m.source === 'autobiography' && !isIdentityCandidate(m) && m.source !== 'deprecated'
     )
@@ -1598,22 +1725,23 @@ export class MemoryStore {
     const labelOf = { identity: '身份', decision: '决策', experience: '经验', event: '事件', other: '其他' }
     const entries = []
     const selected = new Set()
-    let identityUsed = 0
 
     const identity = all.filter((m) => catOf(m) === 'identity')
       .sort((a, b) => ((b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)) || ((a.createdAt || 0) - (b.createdAt || 0)))
-    // 指针不占身份内容预算，但仍进入固定注入；内容条目可用满 identityCap。
+    // 指针不占任何池子，但仍进入固定注入。
     for (const m of identity) {
       if (!isIdentityPointer(m)) continue
       entries.push({ category: 'identity', label: labelOf.identity, summary: String(m.summary || ''), id: m.id })
       selected.add(m.id)
     }
+    // 内容条目按层入池：各层只跟自己的 cap 比，装不下就跳过（不跨层借额度）。
     for (const m of identity) {
       if (isIdentityPointer(m)) continue
+      const kind = m.identityKind || identityKindOf(m)
       const text = String(m.summary || '')
-      if (identityUsed + text.length > identityCap) continue
-      identityUsed += text.length
-      entries.push({ category: 'identity', label: labelOf.identity, summary: text, id: m.id })
+      if (usedByKind[kind] + text.length > caps[kind]) continue
+      usedByKind[kind] += text.length
+      entries.push({ category: 'identity', label: labelOf.identity, kind, summary: text, id: m.id })
       selected.add(m.id)
     }
 
@@ -1637,17 +1765,30 @@ export class MemoryStore {
     }
 
     const unselectedByCategory = { identity: 0, decision: 0, experience: 0, event: 0, other: 0 }
+    // 分层统计：某层装不下时，注入侧要能报出"是哪一层不够"，而不是笼统一句"身份超预算"。
+    const unselectedByIdentityKind = { [IDENTITY_KIND_PORTRAIT]: 0, [IDENTITY_KIND_RULE]: 0 }
     for (const m of all) {
-      if (!selected.has(m.id)) unselectedByCategory[catOf(m)] += 1
+      if (!selected.has(m.id)) {
+        unselectedByCategory[catOf(m)] += 1
+        if (catOf(m) === 'identity') {
+          unselectedByIdentityKind[m.identityKind || identityKindOf(m)] += 1
+        }
+      }
     }
     const unselected = Object.values(unselectedByCategory).reduce((a, b) => a + b, 0)
     return {
       entries,
       used: entries.reduce((n, e) => n + e.summary.length, 0),
-      identityUsed,
-      identityBudget: identityCap,
+      // 兼容旧字段（identityUsed/identityBudget 现在表示两层合计），同时给出分层数
+      identityUsed: usedByKind[IDENTITY_KIND_PORTRAIT] + usedByKind[IDENTITY_KIND_RULE],
+      identityBudget: caps[IDENTITY_KIND_PORTRAIT] + caps[IDENTITY_KIND_RULE],
+      portraitUsed: usedByKind[IDENTITY_KIND_PORTRAIT],
+      portraitBudget: caps[IDENTITY_KIND_PORTRAIT],
+      ruleUsed: usedByKind[IDENTITY_KIND_RULE],
+      ruleBudget: caps[IDENTITY_KIND_RULE],
       unselected,
       unselectedByCategory,
+      unselectedByIdentityKind,
       candidates: this.autobiographyEntries().filter((m) => isIdentityCandidate(m)).length,
     }
   }

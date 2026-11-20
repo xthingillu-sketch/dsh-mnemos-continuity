@@ -6,7 +6,11 @@
  * 经验：按时间，距上次整理/首条经验 >= 7 天；不再按条数触发。
  */
 
-import { autobiographyCategoryOf, DEFAULT_IDENTITY_BUDGET } from './store.js'
+import {
+  autobiographyCategoryOf,
+  DEFAULT_IDENTITY_PORTRAIT_BUDGET,
+  DEFAULT_IDENTITY_RULE_BUDGET,
+} from './store.js'
 
 const DAY = 24 * 3600 * 1000
 
@@ -33,7 +37,7 @@ export function evaluateCurationDue(store, {
   identityCandidateTrigger = 5,
   identityFallbackDays = 30,
   experienceIntervalDays = 7,
-  identityBudget = DEFAULT_IDENTITY_BUDGET,
+  identityBudget = DEFAULT_IDENTITY_PORTRAIT_BUDGET + DEFAULT_IDENTITY_RULE_BUDGET,
 } = {}) {
   const auto = activeAuto(store)
   const identity = auto.filter((m) => autobiographyCategoryOf(m) === 'identity')

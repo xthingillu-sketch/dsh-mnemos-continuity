@@ -304,13 +304,13 @@ console.log('== 21c. 自动 curation 到期判据 ==')
   const idDue = evaluateCurationDue(fake([
     rec('i1', 'identity', 'core', 'x'.repeat(801)),
     ...[1, 2, 3, 4, 5].map((n) => rec(`c${n}`, 'identity', 'candidate', `候选${n}`)),
-  ]), { now })
+  ]), { now, identityBudget: 800 })
   assert(idDue.due === true && idDue.action === 'identity', '★★ core 满且候选≥5 → 身份到期')
 
   const fallback = evaluateCurationDue(fake([
     rec('i1', 'identity', 'core', 'x'.repeat(801)),
     rec('c1', 'identity', 'candidate', '候选', now - 31 * 24 * 3600 * 1000),
-  ]), { now })
+  ]), { now, identityBudget: 800 })
   assert(fallback.due === true && fallback.action === 'identity', '★★ 候选不足 5 但最老 >30 天 → 兜底到期')
 
   const expDue = evaluateCurationDue(fake([
@@ -380,18 +380,18 @@ console.log('== 26b. 自传体身份两段 / candidate 隔离 / 事件时间 / r
   await s.load()
   const core = await s.remember({
     content: '身份核心',
-    summary: '身'.repeat(700),
+    summary: '身'.repeat(500),
     category: 'identity',
     source: 'autobiography',
   })
-  assert(core.category === 'identity' && core.identityStatus === 'core', '800 预算内身份直接进 core')
+  assert(core.category === 'identity' && core.identityStatus === 'core', '600 预算内身份直接进 core')
   const candidate = await s.remember({
     content: '身份候选',
     summary: '份'.repeat(150),
     category: 'identity',
     source: 'autobiography',
   })
-  assert(candidate.identityStatus === 'candidate', '超出 800 预算的身份进 candidate')
+  assert(candidate.identityStatus === 'candidate', '超出 600 预算的身份进 candidate')
   const visible = s.recall({ query: '', source: 'autobiography' })
   assert(!visible.some((m) => m.id === candidate.id), 'candidate 不进入普通召回')
   const curation = s.recall({ query: '', source: 'autobiography', includeCandidates: true })
@@ -3274,7 +3274,7 @@ console.log('== 86. ★ 宪法未初始化：注入文本必须**非空**且带�
   // 自传体段照旧：有内容就注入；为空则不注入
   const fakeStore2 = { autobiographyCompact: () => ({ entries: [{ label: '决策', summary: 'F-3 统一路径' }] }) }
   const text86b = buildSelfText(con, fakeStore2, 2000)
-  assert(text86b.includes('【自传体 · 自我历史（紧凑版，按需召回详情）】'), '★ 未初始化时自传体段照旧注入（不是"整段都不给"）')
+  assert(text86b.includes('【自传体 · 行为约束（每轮必读）】'), '★ 未初始化时自传体段照旧注入（不是"整段都不给"）')
   assert(text86b.includes('F-3 统一路径'), '★ 自传体条目内容在（没有被警告挤掉）')
 }
 
@@ -3442,7 +3442,7 @@ console.log('== 93. ★ F-12 V2 自传体段：有未注入 → 一行实数提�
   const con93b = new ConstitutionStore(path.join(dir, 'x93fit-constitution', 'constitution.json'))
   const text93b = buildSelfText(con93b, fit93, budget93)
   assert(
-    text93b.includes('【自传体 · 自我历史（紧凑版，按需召回详情）】'),
+    text93b.includes('【自传体 · 行为约束（每轮必读）】'),
     '★ F-12 前置：全部装得下时自传体段照常注入'
   )
   assert(!text93b.includes(marker93), '★★ F-12：全部注入时**不出现**那一行（不许永远挂着一句吓人的提示）')
@@ -4065,7 +4065,7 @@ console.log('== 94o. 身份字数预算排除 identity-pointer ==')
 {
   const tm = new MemoryStore(path.join(dir, 'x94o', 'memory.json'))
   await tm.load()
-  const big = 'x'.repeat(780)
+  const big = 'x'.repeat(580)
   const content = await tm.remember({
     content: big, summary: big, category: 'identity', source: 'autobiography',
   })
@@ -4076,12 +4076,105 @@ console.log('== 94o. 身份字数预算排除 identity-pointer ==')
   assert(content.identityStatus === 'core', '身份正文在预算内为 core')
   assert(pointer.identityStatus === 'core', '指针强制 core')
   const compact = tm.autobiographyCompactV2()
-  assert(compact.identityUsed === 780, '身份预算只算正文，不算指针')
+  assert(compact.identityUsed === 580, '身份预算只算正文，不算指针')
   assert(compact.entries.some((e) => e.id === pointer.id), '指针仍进入固定注入')
   const next = await tm.remember({
     content: 'another', summary: 'another identity content', category: 'identity', source: 'autobiography',
   })
-  assert(next.identityStatus === 'candidate', '正文预算仍按 800 计算，不被指针挤占')
+  assert(next.identityStatus === 'candidate', '正文预算仍按 600 计算，不被指针挤占')
+}
+
+console.log('== 94o2. 身份两层独立预算：画像 / 约束互不侵占，超限报是哪一层 ==')
+{
+  const tm = new MemoryStore(path.join(dir, 'x94o2', 'memory.json'))
+  await tm.load()
+  const portrait = await tm.remember({
+    content: '画'.repeat(500), summary: '画'.repeat(500), category: 'identity', source: 'autobiography',
+    tags: ['identity-portrait'],
+  })
+  const rule = await tm.remember({
+    content: '约'.repeat(500), summary: '约'.repeat(500), category: 'identity', source: 'autobiography',
+    tags: ['identity-rule'],
+  })
+  assert(portrait.identityStatus === 'core', '画像 500/600 → core')
+  assert(rule.identityStatus === 'core', '约束 500/600 → core（不被画像层挤掉）')
+  const overflow = await tm.remember({
+    content: '画2', summary: '画'.repeat(200), category: 'identity', source: 'autobiography',
+    tags: ['identity-portrait'],
+  })
+  assert(overflow.identityStatus === 'candidate', '画像层 500+200 > 600 → candidate')
+  assert(overflow.inject.kind === 'portrait', '回执指明是「自我画像」层不够')
+  assert(overflow.inject.kindLabel === '自我画像', '回执带层的中文名')
+  assert(overflow.inject.budget === 600, '回执带该层预算 600')
+  assert(overflow.inject.budgetConfigKey === 'identityPortraitBudget', '回执给出该层可单独扩容的配置名')
+  // 约束层仍然可以继续写（证明互不侵占）
+  const rule2 = await tm.remember({
+    content: '约2', summary: '约'.repeat(80), category: 'identity', source: 'autobiography',
+    tags: ['identity-rule'],
+  })
+  assert(rule2.identityStatus === 'core', '画像层满了不影响约束层：500+80 ≤ 600 仍进 core')
+  const compact = tm.autobiographyCompactV2()
+  assert(compact.portraitUsed === 500 && compact.ruleUsed === 580, '两层各自计字：画像 500 / 约束 580')
+  assert(compact.portraitBudget === 600 && compact.ruleBudget === 600, '两层预算各自 600')
+  const con94o2 = new ConstitutionStore(path.join(dir, 'x94o2', 'constitution.json'))
+  const text = buildSelfText(con94o2, tm, 2000)
+  assert(text.includes('【自传体 · 自我画像】'), '注入文本有独立的自我画像段')
+  assert(text.includes('【自传体 · 行为约束（每轮必读）】'), '注入文本有独立的行为约束段')
+  // 把画像层预算调到 300：500 字的 core 画像装不下 → 分层统计与预算提示都必须指名"自我画像层"
+  const tight = tm.autobiographyCompactV2({ portraitBudget: 300, ruleBudget: 600 })
+  assert(tight.portraitUsed === 0, '画像层预算 300 时，500 字的 core 画像装不下')
+  assert(
+    tight.unselectedByIdentityKind && tight.unselectedByIdentityKind.portrait === 1,
+    '分层统计记下"画像层 1 条未注入"'
+  )
+  const textTight = buildSelfText(con94o2, tm, 2000, { portraitBudget: 300, ruleBudget: 600 })
+  assert(textTight.includes('【自传体 · 预算】') && textTight.includes('自我画像层'), '超限时预算提示指名是哪一层')
+  assert(textTight.includes('identityPortraitBudget'), '预算提示给出该层可单独扩容的配置名')
+}
+
+console.log('== 94o3. curation 提案必须分层：kind=portrait/rule 决定条目进哪一层 ==')
+{
+  const tm = new MemoryStore(path.join(dir, 'x94o3', 'memory.json'))
+  await tm.load()
+  const proposal = await tm.remember({
+    content: JSON.stringify({
+      action: 'identity', keep: [], remove: [], replace: [], merge: [],
+      add: [
+        { summary: '画'.repeat(100), why: '画像层测试', kind: 'portrait' },
+        { summary: '约'.repeat(100), why: '约束层测试', kind: 'rule' },
+      ],
+    }),
+    summary: '分层提案', tags: ['curation-proposal', 'curation:identity'], source: 'internal',
+  })
+  const applied = await tm.applyCurationProposal(proposal.id)
+  assert(applied.ok === true, '分层提案可应用')
+  const auto = tm.autobiographyEntries()
+  const portrait = auto.find((m) => String(m.summary || '').startsWith('画'))
+  const rule = auto.find((m) => String(m.summary || '').startsWith('约'))
+  assert(portrait && (portrait.tags || []).includes('identity-portrait'), 'kind=portrait 的条目带 identity-portrait 标签')
+  assert(rule && (rule.tags || []).includes('identity-rule'), 'kind=rule 的条目带 identity-rule 标签')
+  assert(portrait.identityKind === 'portrait' && rule.identityKind === 'rule', 'identityKind 落盘正确')
+  const compact = tm.autobiographyCompactV2()
+  assert(compact.portraitUsed === 100 && compact.ruleUsed === 100, '两层各自计字，互不侵占')
+  // add 不带 kind → 缺省进约束层（与 identityKindOf 一致）
+  const proposal0 = await tm.remember({
+    content: JSON.stringify({ action: 'identity', keep: [], remove: [], replace: [], merge: [],
+      add: [{ summary: '缺省层'.repeat(10), why: '缺省', }] }),
+    summary: '缺省 kind 提案', tags: ['curation-proposal', 'curation:identity'], source: 'internal',
+  })
+  const applied0 = await tm.applyCurationProposal(proposal0.id)
+  assert(applied0.ok === true, '不带 kind 的提案仍可应用')
+  const defaulted = tm.autobiographyEntries().find((m) => String(m.summary || '').startsWith('缺省层'))
+  assert(defaulted && defaulted.identityKind === 'rule', '缺省 kind 落进约束层')
+  // 画像层超限：拒绝并报层 + 给出可扩容配置名
+  const proposal2 = await tm.remember({
+    content: JSON.stringify({ action: 'identity', keep: [], remove: [], replace: [], merge: [],
+      add: [{ summary: '画'.repeat(600), why: '撑爆画像层', kind: 'portrait' }] }),
+    summary: '超限提案', tags: ['curation-proposal', 'curation:identity'], source: 'internal',
+  })
+  const blocked = await tm.applyCurationProposal(proposal2.id)
+  assert(blocked.ok === false && blocked.layer === 'portrait', '画像层超限时拒绝并报 layer=portrait')
+  assert(String(blocked.reason || '').includes('identityPortraitBudget'), '拒绝原因给出该层可扩容的配置名')
 }
 
 console.log('== 94p. 任务图评审闸门：计划批准 / 证据 / 返工 / 收尾闸门 ==')
@@ -4203,6 +4296,14 @@ console.log('== 94i. fansearch：英文查询命中中文摘要 + 来源/ID + se
   assert(st.shouldScan('s1', { toolName: 'read' }) === true, '★★ 3 个工具轮次且内容足够应触发')
   st.markScanned('s1')
   assert(st.shouldScan('s1', { toolName: 'read' }) === false, '★★ 同一 step 不重复扫描')
+  const emptyToolTurns = new FanSearchState()
+  emptyToolTurns.onTurn('s-empty', 1)
+  emptyToolTurns.onAssistant('s-empty', 1, 0, '可见分析文本 '.repeat(30), true)
+  emptyToolTurns.onAssistant('s-empty', 1, 1, '', true)
+  emptyToolTurns.onAssistant('s-empty', 1, 2, '', true)
+  assert(emptyToolTurns.shouldScan('s-empty', { toolName: 'read' }) === true,
+    '★★ 工具轮没有可见文本时，不能把之前的长文本清空（否则永远不触发）')
+  assert(emptyToolTurns.queryFor('s-empty').includes('可见分析文本'), '★★ 无文本工具轮仍保留本 turn 之前的分析文本作为 query')
   const low = new FanSearchState()
   low.onTurn('s2', 1)
   low.onAssistant('s2', 1, 0, 'x'.repeat(90), true)
@@ -5772,10 +5873,18 @@ assert(buildCurationDispatchMessage('experience').includes("mnemos_curate({ acti
   '派发消息明确要求调用 mnemos_curate(experience)')
 const idle = { id: 's1', status: 'idle', followup() {} }
 const busy = { id: 's2', status: 'running', followup() {} }
-const curator = { id: 'mnemos-curation-abc', status: 'idle', followup() {} }
-const validator = { id: 'mnemos-validator-abc', status: 'idle', followup() {} }
+// 真实 id 形状：顶层会话是 session-<uuid>，子代理是裸 uuid —— 旧 fixture 的
+// 'mnemos-curation-abc' 这种形状在真实运行中不存在，等于测试撑着一个假假设。
+const curator = { id: 'b1d6df2d-aebf-4ab9-8d10-929b042a7069', agentPreset: 'mnemos-curator', status: 'idle', followup() {} }
+const validator = { id: '4475ba66-5c00-45af-8d7e-9755581b9d64', label: 'mnemos-validation', status: 'idle', followup() {} }
+const legacyCurator = { id: 'mnemos-curation-abc', status: 'idle', followup() {} }
+const realSession = { id: 'session-4626d2b4-847a-4576-bed3-97e6d56f1d3c', status: 'idle', followup() {} }
 assert(pickIdleCurationAgent([busy, idle]) === idle, '跳过忙会话，选空闲会话')
-assert(pickIdleCurationAgent([curator, validator, busy]) === null, '排除 curation/validator 子会话')
+assert(pickIdleCurationAgent([curator, validator, busy]) === null,
+  '按 preset/label 排除维护子会话（真实 id 形状：裸 uuid）')
+assert(pickIdleCurationAgent([legacyCurator]) === null, '旧的 mnemos-curation-* id 前缀仍排除（向后兼容）')
+assert(pickIdleCurationAgent([realSession]) === realSession,
+  '真实顶层会话 session-<uuid> 不被误排除')
 assert(pickIdleCurationAgent([{ id: 'no-followup', status: 'idle' }]) === null, '没有 followup 的 agent 不可投递')
 assert(pickIdleCurationAgent([]) === null, '没有会话时返回 null，不新建 provider')
 

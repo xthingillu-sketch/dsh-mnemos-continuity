@@ -30,6 +30,9 @@ import { mnemosSystemPromptLines } from './system-prompt.js'
 import { appendStartupLog, pickLogFile, pickLogger } from './boot-log.js'
 import { FanSearchState, formatAssociativeHint } from './fansearch.js'
 import { createEmbeddingClient } from './embedding.js'
+import { startEmbeddingWarmup } from './embedding-index.js'
+import { createFansearchDelivery } from './fansearch-delivery.js'
+import { mountPortableOllama } from './ollama-lifecycle.js'
 import { evaluateCurationDue } from './curation-trigger.js'
 import { makeSkillUsageRecorder, usageFileFor } from './skill-usage.js'
 import {
@@ -96,9 +99,14 @@ export const Config = Schema.object({
   curationEnabled: Schema.boolean().default(true).description(
     '自动身份/经验整理：默认开启；只在到期条件满足时跑独立 curator，不每轮跑'
   ),
+  ollamaPortableDir: Schema.string().default('').description('可选：随宿主启停的 Windows 便携 Ollama 绝对路径；留空不启动'),
+  fansearchEnabled: Schema.boolean().default(false).description(
+    '联想激活总开关：工具执行后附注线索；默认关。此前漏在 Config schema 外，导致 profile 写 true 也被丢弃。'
+  ),
   fansearchMode: Schema.string().default('mechanical').description(
     '联想激活模式：mechanical=关键词/标签；embedding=句子向量（需配置，失败回退 mechanical）；shadow=embedding 注入 + mechanical 后台记录；off=关闭'
   ),
+  fansearchEmbeddingDeadlineMs: Schema.number().default(20000).description('联想激活后台 embedding 整次截止（毫秒）；不增加工具等待'),
   fansearchEmbeddingUrl: Schema.string().default('').description('embedding 端点（OpenAI-compatible /embeddings）；留空用 MNEMOS_EMBEDDING_URL'),
   fansearchEmbeddingModel: Schema.string().default('').description('embedding 模型；留空用 MNEMOS_EMBEDDING_MODEL'),
   fansearchEmbeddingKeyFile: Schema.string().default('').description('可选：从已有 credentials YAML 读取 NBU_API_KEY 的路径；key 不写进 profile'),
@@ -106,6 +114,10 @@ export const Config = Schema.object({
   identityCandidateTrigger: Schema.number().default(5).description('身份候选达到多少条触发整理（默认 5）'),
   identityFallbackDays: Schema.number().default(30).description('身份候选不足 5 条时的 30 天兜底（天）'),
   experienceIntervalDays: Schema.number().default(7).description('经验整理周期（天）；默认每周一次，不按条数触发'),
+  identityCooldownHours: Schema.number().default(24).description(
+    '身份整理冷却（小时）：投递后至少隔这么久才重复投递。以前 identity 没有冷却，' +
+      '目标会话没真跑 mnemos_curate 时会被心跳每 30 分钟重复注入。默认 24'
+  ),
   // 辅助路由：validation 的可选 provider；留空则走父会话/主模型。
   // 自动 curation 不再使用 aux；它把任务注入空闲会话，由该会话调用 mnemos_curate。
   auxProvider: Schema.string().default('').description(
@@ -125,6 +137,14 @@ export const Config = Schema.object({
     '宪法文件路径；留空 = 与 dataFile 同一套解析（$DSH_PROFILE_DIR/mnemos/constitution.json 优先）'
   ),
   autobiographyBudget: Schema.number().default(2000).description('自传体紧凑版字符预算（注入上下文的上限）'),
+  // ★ 2026-11-16 分层：身份区拆成两层、各自独立预算，互不侵占。任一层的字数只跟自己的
+  //   上限比；某层装不下时回执会报出是哪一层，并指向下面这两个配置项之一（可单独扩容）。
+  identityPortraitBudget: Schema.number().default(600).description(
+    '自我画像层字符预算（整段描述"我是什么样的存在"）。与行为约束层独立：调大它不会挤掉约束'
+  ),
+  identityRuleBudget: Schema.number().default(600).description(
+    '行为约束层字符预算（一条条的动作/纪律）。与自我画像层独立：调大它不会挤掉画像'
+  ),
   // ---- 技能评审（阶段 3）----
   reviewEnabled: Schema.boolean().default(true).description('是否启用技能评审心跳'),
   // ★ F-9：这里曾经是**一个**开关（reviewWriteBack）同时管"新建"和"修改"。
@@ -228,12 +248,17 @@ function makeRememberTool(store) {
         const inj = value.inject
         const failed = inj && inj.required === true && inj.injected === false && inj.reason !== 'requested-candidate'
         if (failed) {
+          // ★ 2026-11-16 分层：被挡时必须报出**是哪一层**不够，并给出该层可单独扩容的配置名。
+          const layer = inj.kindLabel || '身份'
           const why = inj.reason === 'identity-budget-full'
-            ? `身份 core 预算已满（本轮占用 ${inj.usedChars}/${inj.budget} 字符，本条需 ${inj.incomingChars} 字符），被降级为 candidate —— 不注入、不召回`
+            ? `${layer}层预算已满（本轮占用 ${inj.usedChars}/${inj.budget} 字符，本条需 ${inj.incomingChars} 字符），被降级为 candidate —— 不注入、不召回`
             : `未进入注入集（${inj.reason}）`
           lines.push('❌ 写入未生效：本条不会被注入上下文，也不参与召回。')
           lines.push(`   原因：${why}。`)
-          lines.push('   处理：先 mnemos_curate identity 腾出预算（或合并/删减现有 core 条目），然后重写本条。')
+          lines.push(`   处理：先 mnemos_curate identity 腾出${layer}层预算（或合并/删减现有 core 条目），然后重写本条。`)
+          if (inj.budgetConfigKey) {
+            lines.push(`   扩容：本层可单独调大 ${inj.budgetConfigKey}（另一层不受影响）。`)
+          }
           lines.push('   注意：身份预算是**防滥用的闸门，不是成本限制**。若这条确实"必须每轮注入"，')
           lines.push('        不要自己硬挤——直接告诉用户"必须注入但进不来"，由用户决定扩容。')
           lines.push('')
@@ -403,6 +428,20 @@ function buildValidationPrompt(info) {
 
 function buildCurationPrompt(action) {
   const label = action === 'identity' ? '身份' : '经验'
+  const identityLayers = action === 'identity'
+    ? [
+      '',
+      '★ 身份两层（2026-11-16 起）：身份区拆成两段，**各自独立预算、互不侵占**。每个候选都必须判断进哪一层：',
+      '  · portrait（自我画像，预算 600 字，配置 identityPortraitBudget）：**一整段自我描述**，叙述性、连贯，不许拆成一条条。写"我是什么样的存在"——来历、位置与关系、长期目标、承认的缺陷、偏好类型。',
+      '  · rule（行为约束，预算 600 字，配置 identityRuleBudget）：**一条条的动作/纪律/判断方式**，每条可执行、可检查。写"遇到什么该怎么做"。',
+      '  判据：这条是"描述我这个人"→ portrait；是"规定动作"→ rule。描述里夹带规则就拆开（规则进 rule、自述进 portrait）；规则里夹带自述同理。',
+      '  · portrait 通常只有 1 条（就是那段画像）。要改就 replace 它，不要 add 出第二条画像。',
+      '  · 能力指针（tags 含 identity-pointer）既不是画像也不是约束：不许改、不许合并、不许删，summary 里的 open:<id> 必须原样保留。',
+      '  · 两层都满时不许跨层借额度、不许为了塞进去丢掉有价值的内容：如实在 notes 里写清哪一层缺多少字。',
+      '  · 写进画像的内容要能被记忆/日志检验；空话、自我美化、无法核查的断言不要写。',
+    ]
+    : []
+
   return [
     `你是 Mnemos 的独立${label}整理模型。你在独立上下文里工作，不继承当前任务上下文，也不应被当前对话情境带偏。`,
     `任务：审阅自传体中的${label}记忆，产出**提案**；不要直接修改身份或经验，不要写身份/经验正文。`,
@@ -416,6 +455,7 @@ function buildCurationPrompt(action) {
       : "- 经验审阅材料：mnemos_recall({ tags: ['experience-revision'], limit: 50 })，再 open 读 before/after 全文；历史只作审阅材料，不自动恢复。",
     '- 也读取与判断相关的 decision/event，但提案只针对目标类目。',
     '- identity 中 tags=identity-pointer 的条目是身份详情指针：不要合并/删除，保留 summary 里的 open:<id>。',
+    ...identityLayers,
     '',
     '判断要求：',
     '- 身份：自我模型、偏好/好恶、目标、做事倾向、边界；稳定、第一人称、可合并。',
@@ -428,7 +468,10 @@ function buildCurationPrompt(action) {
     '完成后只写一条提案记忆：',
     `mnemos_remember({ source:'internal', tags:['curation-proposal','curation:${action}'], summary:'${label}整理提案', content:'JSON...' })`,
     'JSON 至少包含：',
-    `{ action:'${action}', keep:[ids], add:[{summary, why, evidenceIds}], replace:[{id, summary, why, evidenceIds}], remove:[ids], merge:[{from:[ids], summary, why}], notes }`,
+    `{ action:'${action}', keep:[ids], add:[{summary, why, evidenceIds, kind}], replace:[{id, summary, why, evidenceIds, kind}], remove:[ids], merge:[{from:[ids], summary, why, kind}], notes }`,
+    action === 'identity'
+      ? '★ kind 必填：每个 add/replace/merge 条目都要带 kind: "portrait" | "rule"（决定它进哪一层）。replace/merge 缺省会继承原条目所在的层，但**显式写清**才算判断过。'
+      : '（identity 以外的 action 不需要 kind 字段，可以省略。）',
     '',
     '不要写 identity/experience 记忆；不要调用删除工具。写完后回复一行提案摘要。',
   ].join('\n')
@@ -831,7 +874,9 @@ function makeCurateTool(ctx, store) {
     name: 'mnemos_curate',
     description:
       '在独立上下文的子代理中整理身份或经验：读取记忆、产出 curation proposal，并**直接应用**，' +
-      '旧身份/经验保留为历史 revision（不删除）；用于 identity/experience 筛选。',
+      '旧身份/经验保留为历史 revision（不删除）；用于 identity/experience 筛选。' +
+      '身份区是两层（自我画像 portrait / 行为约束 rule），候选条目必须判断进哪一层（提案里 kind 必填）；' +
+      '两层独立预算、互不侵占。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1758,6 +1803,13 @@ function makeTaskCiteTool(store) {
 
 export function apply(ctx, config) {
   const resolved = config || {}
+  if (resolved.ollamaPortableDir) {
+    ctx.plugin({
+      name: 'mnemos-portable-ollama',
+      inject: ['subprocess'],
+      apply: child => mountPortableOllama(child, resolved.ollamaPortableDir),
+    })
+  }
   // ★★ P0（2026-10-18 安装审查）：默认数据目录**先问宿主要 profile 目录**，别靠环境变量猜。
   //   实测证据：桌面端 `mnemos.log` 里 DSH_PROFILE_DIR/DSH_HOME 都是"(未设)"，只有 cwd 对；
   //   从别的会话终端启动会继承上一个 profile 的环境变量 → 直接写进别人数据目录。
@@ -1781,15 +1833,31 @@ export function apply(ctx, config) {
     ? resolved.fansearchMode
     : 'mechanical'
   const fansearchEnabled = resolved.fansearchEnabled === true && fansearchMode !== 'off'
-  const fanEmbedder = (fansearchMode === 'embedding' || fansearchMode === 'shadow')
+  const fanEmbedder = fansearchEnabled && (fansearchMode === 'embedding' || fansearchMode === 'shadow')
     ? createEmbeddingClient({
         url: process.env.MNEMOS_EMBEDDING_URL || resolved.fansearchEmbeddingUrl || '',
         model: process.env.MNEMOS_EMBEDDING_MODEL || resolved.fansearchEmbeddingModel || '',
         apiKey: process.env.MNEMOS_EMBEDDING_API_KEY || '',
         apiKeyFile: resolved.fansearchEmbeddingKeyFile || '',
         cacheFile: resolved.fansearchEmbeddingCacheFile || path.join(path.dirname(store.dataFile), 'embedding-cache.json'),
+        onIndexError: () => ctx.logger.warn('mnemos: skipped invalid embedding index segment'),
       })
     : null
+  if (fanEmbedder) {
+    ctx.effect(() => startEmbeddingWarmup({
+      collect: async signal => {
+        await store.refreshFromDisk()
+        signal.throwIfAborted()
+        return store.fansearchSentences()
+      },
+      warm: (texts, signal) => fanEmbedder.warm(texts, signal),
+      onReady: ({ added, indexed }) => {
+        void appendStartupLog({ text: `mnemos: embedding index ready (added=${added}, indexed=${indexed})`,
+          logFile: pickLogFile(store.dataFile), ctx })
+      },
+      onError: error => ctx.logger.warn(`mnemos: embedding warmup failed (${error?.code || error?.name || 'Error'}); will retry`),
+    }), 'Mnemos background embedding index')
+  }
   const constitution = new ConstitutionStore(constitutionFileResolved || undefined)
   let subagents
   try { subagents = ctx.subagents ?? ctx.get('subagents') } catch { subagents = undefined }
@@ -1832,10 +1900,21 @@ export function apply(ctx, config) {
       })
       if (!due.due) return due
       const now = Date.now()
-      const intervalMs = Math.max(1, Number(resolved.experienceIntervalDays ?? 7)) * 86400000
-      if (due.action === 'experience' && curationLastAttempt.experience &&
-          now - curationLastAttempt.experience < intervalMs) {
-        return { skipped: true, ...due, reason: '本周已尝试过经验整理，等待下一个周期' }
+      // 冷却（2026-11-16 修）：以前只对 experience 查冷却，identity 每到到期就重复投递 ——
+      // 若目标会话没真跑 mnemos_curate（或它拒绝了），due 会一直为真，心跳每轮再注入一次。
+      // 现在两类都冷却：experience 按 experienceIntervalDays（默认 7 天），
+      // identity 按 identityCooldownHours（默认 24 小时，远大于心跳 30 分钟）。
+      const cooldownMs = due.action === 'experience'
+        ? Math.max(1, Number(resolved.experienceIntervalDays ?? 7)) * 86400000
+        : Math.max(1, Number(resolved.identityCooldownHours ?? 24)) * 3600000
+      if (curationLastAttempt[due.action] &&
+          now - curationLastAttempt[due.action] < cooldownMs) {
+        const hours = Math.round(cooldownMs / 3600000)
+        return {
+          skipped: true,
+          ...due,
+          reason: `冷却中（${due.action}）：距上次投递不足 ${hours} 小时`,
+        }
       }
       curationLastAttempt[due.action] = now
       curationAutoRunning = true
@@ -1959,7 +2038,7 @@ export function apply(ctx, config) {
   })
 
   // 影子模式：embedding 负责实际注入，mechanical 只做后台对照记录。
-  async function appendShadowLog(store, { sessionId, query, primary, shadow, elapsedMs = null }) {
+  async function appendShadowLog(store, { sessionId, query, primary, shadow, elapsedMs = null, embeddingError = null }) {
     try {
       const slim = (r) => ({
         mode: r?.mode || null,
@@ -1983,7 +2062,7 @@ export function apply(ctx, config) {
         mechanicalHint: formatAssociativeHint(shadow),
         retrievalMs: elapsedMs,
         embeddingFallback: primary?.mode !== 'embedding',
-        embeddingError: primary?.embeddingError || null,
+        embeddingError: embeddingError || primary?.embeddingError || null,
       })
       const file = path.join(path.dirname(store.dataFile), 'fansearch-shadow.jsonl')
       await fsp.appendFile(file, line + '\n', 'utf8')
@@ -2024,94 +2103,27 @@ export function apply(ctx, config) {
       }
     })
 
-    // 预取与工具执行并行：pre-execute 只启动 Promise，不 await；post-execute 再取结果。
-    // 这样 embedding 的秒级耗时被工具调用本身掩盖，而不是工具结束后才开始。
-    const prefetch = new Map()
-    const prefetchKey = (sid, exec) => {
-      const cid = exec?.callId || exec?.rootCallId
-      return `${sid}:${cid || `${exec?.name || ''}:${JSON.stringify(exec?.arguments || {})}`}`
+    const warnFansearch = () => {
+      try { ctx.logger.warn('mnemos fansearch: optional retrieval or delivery failed') } catch {}
     }
-    const runFansearch = async (sid, query, exclude) => {
-      const startedAt = Date.now()
-      let fragments
-      let primary = null
-      let mechanical = null
-      if (fansearchMode === 'shadow') {
-        ;[primary, mechanical] = await Promise.all([
-          store.fanSearchAssociative(query, {
-            exclude, mode: 'embedding', embedder: fanEmbedder, relevantTop: 3, sideCount: 2,
-          }),
-          store.fanSearchAssociative(query, {
-            exclude, mode: 'mechanical', embedder: null, relevantTop: 3, sideCount: 2,
-          }),
-        ])
-        fragments = primary
-        await appendShadowLog(store, { sessionId: sid, query, primary, shadow: mechanical, elapsedMs: Date.now() - startedAt })
-      } else {
-        fragments = await store.fanSearchAssociative(query, {
-          exclude,
-          mode: fansearchMode,
-          embedder: fanEmbedder,
-          relevantTop: 3,
-          sideCount: 2,
-        })
-      }
-      return { fragments, elapsedMs: Date.now() - startedAt, error: null }
-    }
-
+    const delivery = createFansearchDelivery({
+      mode: fansearchMode,
+      state: fanState,
+      search: (query, opts) => store.fanSearchAssociative(query, opts),
+      embedder: fanEmbedder,
+      timeoutMs: resolved.fansearchEmbeddingDeadlineMs,
+      onShadow: row => appendShadowLog(store, row),
+      onError: warnFansearch,
+    })
+    ctx.effect(() => () => delivery.dispose(), 'Mnemos fansearch delivery')
     ctx.on('tools/pre-execute', (exec, next) => {
-      const sid = exec?.agent?.session?.id
-      if (!sid || !exec) return next()
-      const name = String(exec.name || '')
-      if (name.startsWith('mnemos_')) return next()
-      if (!fanState.shouldScan(sid, { args: exec.arguments })) return next()
-      const key = prefetchKey(sid, exec)
-      if (!prefetch.has(key)) {
-        const query = fanState.queryFor(sid, exec.arguments)
-        const exclude = fanState.seenFor(sid)
-        const p = runFansearch(sid, query, exclude).catch((e) => ({
-          fragments: { items: [] }, elapsedMs: 0, error: String(e?.message || e),
-        }))
-        prefetch.set(key, p)
-      }
+      try { delivery.start(exec) } catch { warnFansearch() }
       return next()
     })
-
     ctx.on('tools/post-execute', async (exec, result, next) => {
       const decision = await next()
-      if (!decision || decision.kind !== 'accept' || result?.isError) return decision
-      const sid = exec?.agent?.session?.id
-      if (!sid) return decision
-      const name = String(exec.name || '')
-      if (name.startsWith('mnemos_')) return decision
-      const key = prefetchKey(sid, exec)
-      let job = prefetch.get(key)
-      prefetch.delete(key)
-      if (!job) {
-        // 没有 pre-execute 预取（例如钩子顺序/宿主路径不同）时，退回工具结束后再跑。
-        if (!fanState.shouldScan(sid, { args: exec.arguments })) return decision
-        const query = fanState.queryFor(sid, exec.arguments)
-        job = runFansearch(sid, query, fanState.seenFor(sid)).catch((e) => ({
-          fragments: { items: [] }, elapsedMs: 0, error: String(e?.message || e),
-        }))
-      }
-      const out = await job
-      fanState.markScanned(sid)
-      if (out.error) return decision
-      const fragments = out.fragments
-      const nowSeen = fanState.seenFor(sid)
-      fragments.items = fragments.items.filter((f) => !nowSeen.has(f.id))
-      if (!fragments.items.length) return decision
-
-      fanState.markSeen(sid, fragments.items.map((f) => f.id), 'fansearch')
-      const content = Array.isArray(decision.content)
-        ? decision.content
-        : Array.isArray(result.content) ? result.content : []
-      if (!content.length) return decision
-      return {
-        ...decision,
-        content: [...content, { type: 'text', text: formatAssociativeHint(fragments) }],
-      }
+      // Await host policy only; never await retrieval or shadow logging here.
+      try { return delivery.attach(exec, result, decision) } catch { warnFansearch(); return decision }
     })
   }
 
@@ -2237,7 +2249,7 @@ export function apply(ctx, config) {
   // 启动时加载记忆 + 宪法
   ctx.effect(async () => {
     await Promise.all([
-      store.load().catch((e) => console.error('mnemos: 加载记忆失败', e)),
+      store.ensureLoaded().catch((e) => console.error('mnemos: 加载记忆失败', e)),
       constitution.load().catch((e) => console.error('mnemos: 加载宪法失败', e)),
     ])
     // ★ 把"本轮到底读的哪个文件"说出来（F-3 的另一半：静默是病根）。
@@ -2245,10 +2257,15 @@ export function apply(ctx, config) {
     //   于是【宪法 · 身份/红线】整段消失且不报错。打印这一行后，这种不一致一眼可见。
     try {
       logResolvedPaths(ctx, {
-    dataFile: store.dataFile,
-    constitutionFile: constitution.dataFile,
-    profileDir,
-  })
+        dataFile: store.dataFile,
+        constitutionFile: constitution.dataFile,
+        profileDir,
+      })
+      void appendStartupLog({
+        text: `mnemos: fansearchEnabled=${fansearchEnabled} fansearchMode=${fansearchMode}`,
+        logFile: pickLogFile(store.dataFile),
+        ctx,
+      })
     } catch (e) {
       // 打日志绝不允许把加载流程带崩（但也不能静默：再喊一次）
       console.error('mnemos: 打印解析路径失败', e)
@@ -2258,7 +2275,15 @@ export function apply(ctx, config) {
   const sys = ctx.get('systemPrompt')
   if (sys !== undefined) {
     ctx.effect(
-      () => sys.variable('self_narrative', () => buildSelfText(constitution, store, resolved.autobiographyBudget ?? 2000)),
+      () => sys.variable('self_narrative', () => buildSelfText(
+        constitution,
+        store,
+        resolved.autobiographyBudget ?? 2000,
+        {
+          portraitBudget: resolved.identityPortraitBudget,
+          ruleBudget: resolved.identityRuleBudget,
+        }
+      )),
       'dsh-mnemos: self_narrative variable'
     )
     ctx.effect(

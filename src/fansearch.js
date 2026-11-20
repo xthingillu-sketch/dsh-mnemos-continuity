@@ -352,7 +352,11 @@ export class FanSearchState {
     const s = this._state(sessionId)
     s.turn = Number(turn) || s.turn
     s.step = Number(step) || s.step
-    s.text = String(text || '')
+    // 工具调用轮常常没有可见文本；不能把上一轮的长文本清空，否则 shouldScan 永远不达标。
+    const next = String(text || '').trim()
+    if (next && !s.text.endsWith(next)) {
+      s.text = (s.text ? `${s.text}\n${next}` : next).slice(0, 1200)
+    }
     if (hasToolCalls) s.toolRounds += 1
   }
 
@@ -503,6 +507,16 @@ function sideItem(memory) {
   }
 }
 
+// Warmup and scan must use the exact same corpus predicate and sentence split.
+function usableAssociativeMemories(memories, exclude = new Set()) {
+  return (memories || []).filter(m => m && m.id && !exclude.has(m.id) && m.source !== 'deprecated' &&
+    String(m.summary || '').length <= 600 && !(m.source === 'autobiography' && m.category === 'identity'))
+}
+
+export function collectAssociativeSentences(memories) {
+  return new Set(usableAssociativeMemories(memories).flatMap(m => splitSentences(m.summary)))
+}
+
 /**
  * 句子级联想检索：相关3 + 旁支2。
  * mode=mechanical 或 embedding；embedding 不可用时回退.
@@ -516,31 +530,44 @@ export async function searchAssociative(memories, queryText, {
   sentenceMinRaw = MIN_RAW_SCORE,
   sentenceThreshold = 0.35,
   maxSnippetChars = 240,
+  signal,
+  fallback = true,
 } = {}) {
+  signal?.throwIfAborted()
   const q = buildQuery(queryText)
-  const list = (memories || []).filter((m) => m && m.id && !exclude.has(m.id) && m.source !== 'deprecated')
-  const usable = list.filter((m) => String(m.summary || '').length <= 600 &&
-    !(m.source === 'autobiography' && m.category === 'identity'))
-  let useEmbedding = mode === 'embedding' && embedder && typeof embedder.embed === 'function'
+  const usable = usableAssociativeMemories(memories, exclude)
+  const indexed = typeof embedder?.corpusVectors === 'function' && typeof embedder?.embedQuery === 'function'
+  let useEmbedding = mode === 'embedding' && (indexed || typeof embedder?.embed === 'function')
   let qv = null
   let embMap = null
   let embeddingError = null
   const sentenceLists = usable.map((m) => splitSentences(m.summary))
   if (useEmbedding) {
     try {
-      const unique = new Set([q.text])
-      for (const list of sentenceLists) for (const s of list) if (s) unique.add(s)
-      const texts = [...unique]
-      const vectors = await embedder.embed(texts)
-      qv = vectors[0]
+      const corpus = new Set(sentenceLists.flat())
+      if (indexed) {
+        // A cold or incomplete index never launches a corpus request online.
+        embMap = embedder.corpusVectors(corpus)
+        qv = await embedder.embedQuery(q.text, { signal })
+      } else {
+        const texts = [...new Set([q.text, ...corpus])]
+        const vectors = await embedder.embed(texts, { signal })
+        qv = vectors[0]
+        embMap = new Map(texts.map((t, i) => [t, vectors[i]]))
+      }
+      signal?.throwIfAborted()
       if (!qv) throw new Error('embedding query unavailable')
-      embMap = new Map(texts.map((t, i) => [t, vectors[i]]))
     } catch (e) {
+      signal?.throwIfAborted()
+      if (!fallback) throw e
       useEmbedding = false
       embeddingError = String(e?.message || e)
     }
   }
-  if (!useEmbedding && mode === 'embedding') mode = 'mechanical'
+  if (!useEmbedding && mode === 'embedding') {
+    if (!fallback) throw new Error('embedding is not configured')
+    mode = 'mechanical'
+  }
   const candidates = []
   const autoNonCandidates = []
   for (let mi = 0; mi < usable.length; mi++) {

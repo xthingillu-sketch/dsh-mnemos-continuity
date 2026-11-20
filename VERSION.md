@@ -1,18 +1,25 @@
-# 版本标识 · Mnemos v1.7.4
+# 版本标识 · Mnemos v1.7.6
 
 [![dshbase 实测可装](https://dshbase.com/badges/dsh-mnemos-continuity.svg)](https://dshbase.com/zh/plugins/dsh-mnemos-continuity/)
 
 | 项 | 值 |
 |---|---|
-| **版本** | **v1.7.4**（`package.json` 的 `version`） |
-| 日期 | 2026-11-12 |
-| 本目录 | 当前 v1.7.4；npm/GitHub 发布本次兼容更新 |
-| 规模 | `src` **30 个模块**；工具 **20** 个；心跳维护 **9** 项；测试 **1334 / 0** |
+| **版本** | **v1.7.6**（`package.json` 的 `version`） |
+| 本次修复验收 | 2026-11-20 |
+| 本目录 | 当前 v1.7.6；工作副本，未发布 npm / GitHub |
+| 规模 | `src` **33 个模块**；工具 **20** 个；心跳维护 **9** 项；测试见下方 |
 | 提示词 | 25 条 + ⑧.1/㉔.1 子规则 / 7 节 / **4164 字符** |
 | 宪法 | **v5（认知体）**，**1708 字符**；红线 1–4 与 5.x 未动 |
 | 当前 DSH | **0.2.2-rc.1** 已加载；核心工具/隔离验证冒烟通过；`subagents` provider 兼容层随 1.7.4 发布 |
 
-## 本版核心：兼容性更新（无功能变化）
+## 本版核心：联想激活零等待与持久向量索引
+
+- 工具结果零等待；附注可跨轮次，只搭同会话工具结果，PTC 只搭外层 `run_code`。
+- 后台 embedding 默认截止 20 秒；普通 embedding 模式临时机械回退，恢复即停；影子模式始终双路后台运行。
+- 持久句向量索引后台增量暖机；热态只嵌入查询，冷态机械回退。桌面 PTC 已验收。索引压缩和孤儿向量回收暂缓。
+- 可选便携 Ollama 由 Windows DSH 宿主管理启停，默认不启动。
+
+## 此前 v1.7 系列变更
 
 > **v1.7.4 只适配 DSH 0.2.2-rc.1 的 `subagents` provider 选择接口；工具、提示词、schema、数据格式均不变。**
 
@@ -25,7 +32,7 @@
 4. **召回提醒**  
    经验/决策/事件在召回时标明“实际掌控权高/可修正、不是普通背景”；外部记忆标明“非自己掌握/未验证”。身份固定注入，不参与常规召回提醒。
 5. **联想激活：句子级 + 3+2 + shadow**  
-   摘要拆句；相关 3 条（不足不补）+ 自传体旁支 2 条；多句命中按句序以 `……` 连成一条；自传体权重 ×1.5；所有线索强制标“线索，不是结论 · 未召回”。`shadow` 模式下 embedding 实际注入，mechanical 后台对照，两者写入 `fansearch-shadow.jsonl`；检索在 `tools/pre-execute` 启动，与工具执行并行。
+   摘要拆句；相关 3 条（不足不补）+ 自传体旁支 2 条；多句命中按句序以 `……` 连成一条；自传体权重 ×1.5；所有线索强制标“线索，不是结论 · 未召回”。`shadow` 模式下两路后台对照，优先采用按时返回的 embedding，否则采用机械结果；工具结果不等待检索或日志。
 6. **身份备用存储**  
    身份中需要固定注入的内容留在 `identity`；不需要固定注入的细节存 `category=other`、`tags=['identity-backup']`；identity 只留 `tags=['identity-pointer']` 的短指针，summary 写 `open:<detailId>`。指针不占身份字数预算、强制 core，curation 不能合并/删除它；`other` 详情不进入固定注入，需时 `recall category=other` 或 `open(id)`。
 7. ** curation 降级修复**  
@@ -49,11 +56,11 @@
 
 ## 怎么确认
 
-1. `package.json` 的 `version` 应为 **1.7.4**；
-2. `npm test` 应为 **1334 通过 / 0 失败**；
+1. `package.json` 的 `version` 应为 **1.7.6**；
+2. `npm test` 应为 **1363 条原有断言、7 项搭车回归和 4 项索引回归均通过**；
 3. 维护列表应为 **9 项**（不含 learner）；
 4. 工具数应为 **20 个**（含 `mnemos_task_gate`，无 `mnemos_learner_kick`）；
-5. `src` 应为 **30 个模块**（含 `embedding.js`）；
+5. `src` 应为 **33 个模块**（含 `embedding-index.js`、`fansearch-delivery.js`、`ollama-lifecycle.js`）；
 6. 启动日志的 `dataFile` / `constitutionFile` 指向当前 profile；
 7. 宪法 `version=5`，`mnemos_constitution` 应返回 v5 认知体声明（含上下文定位、身体/来源边界、信任=实际掌控权）。
 

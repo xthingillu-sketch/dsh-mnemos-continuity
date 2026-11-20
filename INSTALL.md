@@ -1,4 +1,4 @@
-# 安装与配置 Mnemos（v1.7.4）
+# 安装与配置 Mnemos（v1.7.6）
 
 > 这份文件只写**你要做的事**：装、配、验证、排错、数据放哪。
 > 它是什么、值不值得用 → `docs/01-简介.md`；有什么机制 → `docs/02-architecture-机制清单.md`；为什么这样设计 → `docs/03-设计者视角.md`。
@@ -267,9 +267,12 @@ v1.7.1 已移除空闲学习：`learner-loop`、`mnemos_learner_kick`、learner 
     # fansearchEmbeddingUrl: ""     # OpenAI-compatible /embeddings；留空用 MNEMOS_EMBEDDING_URL
     # fansearchEmbeddingModel: ""   # 留空用 MNEMOS_EMBEDDING_MODEL
     # fansearchEmbeddingKeyFile: "" # 可选：从已有 credentials YAML 读取 NBU_API_KEY（不把 key 写进 profile）
-    # fansearchEmbeddingCacheFile: "" # 可选：向量缓存；留空用数据目录 embedding-cache.json
-    # shadow = embedding 实际注入 + mechanical 后台对照写入 fansearch-shadow.jsonl
-    # embedding 不可用时自动回退 mechanical，不影响插件启动
+    # fansearchEmbeddingCacheFile: "" # 向量索引路径前缀；留空用数据目录 embedding-cache.json
+    # 新索引写到 <路径前缀>.vectors-v1/，按端点和模型隔离；旧 JSON 缓存不改
+    # 启动后台建索引，之后定期补新增或修改的句子；暖机未完成时走机械检索
+    # fansearchEmbeddingDeadlineMs: 20000 # 后台检索整次截止；工具结果零等待
+    # embedding 正常时单跑；失败或超时后临时并行机械检索，恢复即停
+    # shadow 始终并行；优先 embedding，失败用机械结果，影子日志在后台写
     # —— 辅助路由（validation 兜底；自动 curation 已改为空闲会话注入，不用这里）——
     auxProvider: ""                # 留空 = 走父会话/主模型
     auxModel: ""                   # 留空 = 走父会话/主模型
